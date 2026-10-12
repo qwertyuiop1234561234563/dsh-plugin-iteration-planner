@@ -1,0 +1,38 @@
+# 依赖
+node_modules/
+python/.venv/
+.venv/
+venv/
+
+# 构建产物
+dist/
+web/dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 环境变量（含密钥，禁止提交）
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+demo-stderr.txt
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 本地数据
+*.sqlite
+pgdata/
+redisdata/

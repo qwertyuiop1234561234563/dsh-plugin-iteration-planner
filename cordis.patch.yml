@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# DSH 组合补丁（bundle patch）
+#
+# package.json 中通过 `"dsh": { "bundle": "./cordis.patch.yml" }` 声明本文件。
+# 当一个 profile 把本包列入 `dsh.profile.bundles` 时，DSH 会在「空根」之上
+# 依次叠加各 bundle 的补丁；本补丁向组合树中 insert 一行插件。
+#
+# 补丁语义（来自 deepseek-harness 架构文档）：
+#   - `- insert: [ <row>, ... ]`  向组合树插入新行；
+#   - `- id: <rowId>\n  config: …` 按 id 命中已有行并「整体替换其 config」。
+# 上层（profile 的 cordis.patch.yml、$DSH_HOME/cordis.patch.yml、--patch）
+# 可以继续按 id 覆盖本行的 config，因此本行 id 必须保持稳定。
+# ---------------------------------------------------------------------------
+
+- insert:
+    - id: iteration-planner
+      # 包名：profile 安装本包后由其 node_modules 解析（等价于 @deepseek-ai/* bundle 的解析方式）
+      name: dsh-plugin-iteration-planner
+      config:
+        # 未配置 llmProvider/llmModel 时不启用 LLM，全程使用规则实现（离线可运行）
+        fallbackToRule: true
+        # 单开发人单日工时（用于人员过载校验，§3.3.2 / §4.2）
+        workHoursPerDay: 8
+        # 过载阈值（小时），默认等于单日工时
+        overloadThreshold: 8
+        # 如需启用 LLM 主路径，解开下面两行（要求 profile 已挂载模型提供方）：
+        # llmProvider: deepseek
+        # llmModel: deepseek-chat

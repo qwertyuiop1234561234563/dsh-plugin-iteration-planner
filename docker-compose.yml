@@ -1,0 +1,121 @@
+services:
+  # --------------------------- 存储：PostgreSQL ---------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: iteration-planner-postgres
+    environment:
+      POSTGRES_USER: planner
+      POSTGRES_PASSWORD: planner
+      POSTGRES_DB: iteration_planner
+      # 中文环境下的排序与编码
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U planner -d iteration_planner']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  # -------------------- 内部算法引擎：TS 插件 + Fastify --------------------
+  # 仅在内网暴露（expose），不映射到宿主机；作为「算法单一事实来源」
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: iteration-planner-engine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8080
+      API_BASE_PATH: /api
+      # 引擎仅在集群内网被 Python 服务调用，不再对外鉴权（由 Python 层统一鉴权）
+      API_CORS_ORIGIN: '*'
+      API_TOKEN: ''
+      STORAGE_DRIVER: postgres
+      DATABASE_URL: postgres://planner:planner@postgres:5432/iteration_planner
+      # 引擎不托管前端（由 Python 容器托管）
+      WEB_STATIC_DIR: ''
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      API_ENABLE_SWAGGER: 'false'
+      PLANNER_FALLBACK_TO_RULE: ${PLANNER_FALLBACK_TO_RULE:-true}
+      # 引擎侧 LLM 拆解主路径（留空则规则拆解，离线可复现）
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+    expose:
+      - '8080'
+    restart: unless-stopped
+
+  # ------------------- 对外服务：Python API + Agent + SPA -------------------
+  python:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: iteration-planner-python
+    depends_on:
+      - engine
+      - postgres
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8080
+      API_BASE_PATH: /api
+      API_WS_PATH: /ws
+      # 同域部署时 CORS 可收紧；此处默认放开，便于前后端分离联调
+      API_CORS_ORIGIN: ${API_CORS_ORIGIN:-*}
+      # 对外统一鉴权（留空表示不鉴权；生产环境务必配置）
+      API_TOKEN: ${API_TOKEN:-}
+      # 内部算法引擎地址（容器名解析）
+      ENGINE_BASE_URL: http://engine:8080
+      ENGINE_TIMEOUT_SECONDS: ${ENGINE_TIMEOUT_SECONDS:-60}
+      ENGINE_CONNECT_TIMEOUT_SECONDS: ${ENGINE_CONNECT_TIMEOUT_SECONDS:-5}
+      ENGINE_RETRY_ATTEMPTS: ${ENGINE_RETRY_ATTEMPTS:-2}
+      ENGINE_BREAKER_THRESHOLD: ${ENGINE_BREAKER_THRESHOLD:-5}
+      ENGINE_BREAKER_RECOVERY_SECONDS: ${ENGINE_BREAKER_RECOVERY_SECONDS:-30}
+      # 同域托管前端 SPA 产物
+      WEB_STATIC_DIR: /app/web/dist
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # 安全 / 可观测 / 运维
+      API_SECURITY_HEADERS: ${API_SECURITY_HEADERS:-true}
+      API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-0}
+      API_RATE_LIMIT_BURST: ${API_RATE_LIMIT_BURST:-0}
+      API_WORKERS: ${API_WORKERS:-1}
+      WS_REPLAY_SIZE: ${WS_REPLAY_SIZE:-20}
+      # Agent 编排（LLM 三项齐全才启用 /api/agent/*）
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-8}
+      AGENT_TEMPERATURE: ${AGENT_TEMPERATURE:-0.2}
+      AGENT_MAX_CONTEXT_CHARS: ${AGENT_MAX_CONTEXT_CHARS:-96000}
+      AGENT_SESSION_TTL_SECONDS: ${AGENT_SESSION_TTL_SECONDS:-3600}
+      # 会话存储：单副本用 memory；多副本/多 worker 改为 redis 并设置 REDIS_URL
+      SESSION_STORE: ${SESSION_STORE:-memory}
+      REDIS_URL: ${REDIS_URL:-}
+    ports:
+      - '${APP_PORT:-8080}:8080'
+    restart: unless-stopped
+
+  # ------------------- 可选：Redis（多副本共享会话时启用） -------------------
+  # 使用方式：设置 SESSION_STORE=redis 与 REDIS_URL=redis://redis:6379/0，并执行
+  #   docker compose --profile redis up -d --build
+  redis:
+    image: redis:7-alpine
+    container_name: iteration-planner-redis
+    profiles: ['redis']
+    command: ['redis-server', '--save', '60', '1', '--loglevel', 'warning']
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

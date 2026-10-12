@@ -1,0 +1,4 @@
+# 开发 / 测试依赖（在 requirements.txt 基础上叠加）
+-r requirements.txt
+pytest>=8.3,<9.0
+pytest-asyncio>=0.24,<1.0

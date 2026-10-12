@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+#
+# 企业级研发迭代规划智能 Agent —— Python 对外服务镜像
+#   阶段一：构建 Vue3 控制台（web/ → web/dist）
+#   阶段二：装配 Python 对外 API + Agent 编排（FastAPI + LLM function calling）
+#
+# 说明：Python 侧不承载任何算法，底层 DAG / AOE / 风险 / 报表计算由独立的
+#       TypeScript 引擎容器（Dockerfile）通过 HTTP 提供，本容器通过
+#       ENGINE_BASE_URL 访问该引擎。
+
+# ----------------------------- 阶段一：前端构建 -----------------------------
+FROM node:22-alpine AS web-builder
+WORKDIR /build/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+# ----------------------------- 阶段二：Python 运行时 -----------------------------
+FROM python:3.11-slim AS runtime
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    API_HOST=0.0.0.0 \
+    API_PORT=8080 \
+    API_BASE_PATH=/api \
+    WEB_STATIC_DIR=/app/web/dist \
+    ENGINE_BASE_URL=http://engine:8080
+
+COPY python/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 可选：多副本 / 多 worker 共享会话时启用 SESSION_STORE=redis（构建参数 INSTALL_REDIS=true）
+ARG INSTALL_REDIS=false
+RUN if [ "$INSTALL_REDIS" = "true" ]; then pip install --no-cache-dir "redis>=5.0,<7.0"; fi
+
+COPY python/app ./app
+COPY python/run.py ./run.py
+
+# 前端产物（同域托管 SPA）
+COPY --from=web-builder /build/web/dist ./web/dist
+
+EXPOSE 8080
+
+# 存活检查：轮询 /healthz（Python 自身状态，免鉴权；不依赖引擎可达）。
+# 就绪检查应由编排层轮询 /readyz（引擎可达且未在关机时才返回 200）。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz').status==200 else 1)"
+
+CMD ["python", "run.py"]

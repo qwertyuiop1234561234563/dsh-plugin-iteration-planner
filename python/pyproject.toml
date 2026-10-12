@@ -1,0 +1,15 @@
+[project]
+name = "iteration-planner-python"
+version = "0.1.0"
+description = "企业级研发迭代规划智能 Agent —— Python 对外 API 服务与 LLM Agent 编排层（复用 TypeScript 算法引擎）"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"

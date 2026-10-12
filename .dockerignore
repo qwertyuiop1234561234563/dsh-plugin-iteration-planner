@@ -1,0 +1,21 @@
+# 构建上下文瘦身：排除本地产物与依赖，交由镜像内安装
+node_modules
+**/node_modules
+web/dist
+dist
+coverage
+# Python 侧产物与虚拟环境
+python/.venv
+**/__pycache__
+**/.pytest_cache
+.git
+.gitignore
+*.log
+.env
+.env.*
+!.env.example
+.vscode
+.idea
+.DS_Store
+*.md
+!README.md

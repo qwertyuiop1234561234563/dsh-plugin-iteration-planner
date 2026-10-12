@@ -1,0 +1,31 @@
+{
+  "name": "iteration-planner-console",
+  "version": "0.1.0",
+  "private": true,
+  "description": "企业级研发迭代规划智能 Agent · 控制台前端（Vue3 + Vite + Element Plus + ECharts + AntV X6）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.app.json"
+  },
+  "dependencies": {
+    "@antv/x6": "^2.18.1",
+    "@element-plus/icons-vue": "^2.3.1",
+    "axios": "^1.7.9",
+    "dsh-plugin-iteration-planner": "file:..",
+    "echarts": "^5.5.1",
+    "element-plus": "^2.9.1",
+    "pinia": "^2.3.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vue-tsc": "^2.1.10"
+  }
+}

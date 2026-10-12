@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# 本地开发 / overlay 补丁示例
+#
+# 用法一（推荐，直接从源码挂载，无需安装到 profile）：
+#   dsh web --patch "<本仓库绝对路径>/cordis.yml"
+#   注意：--patch 的模块说明符按运行时工作目录解析，请把下面的 name
+#   换成 src/index.ts 的绝对路径（Windows 建议使用正斜杠或双反斜杠）。
+#
+# 用法二（作为 profile 的 overlay，覆盖 bundle 已插入行的 config）：
+#   把本文件内容合并进 profile 的 cordis.patch.yml；此时保留下面注释掉的
+#   insert 段、只启用「按 id 覆盖 config」段即可。
+# ---------------------------------------------------------------------------
+
+# --- 形式 A：按 id 命中已有行，整体替换其 config（overlay 覆盖） ---
+- id: iteration-planner
+  config:
+    fallbackToRule: true
+    workHoursPerDay: 8
+    overloadThreshold: 8
+
+# --- 形式 B：从源码直接挂载（把 name 改为本仓库 src/index.ts 的绝对路径） ---
+# - insert:
+#     - id: iteration-planner
+#       name: 'E:/go/dsh-plugin-iteration-planner/src/index.ts'
+#       config:
+#         fallbackToRule: true
+#         workHoursPerDay: 8
+#         overloadThreshold: 8

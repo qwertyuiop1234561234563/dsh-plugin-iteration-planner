@@ -1,0 +1,109 @@
+/* 全局样式与设计令牌（企业控制台统一视觉基线） */
+
+:root {
+  --ip-bg: #f4f6fa;
+  --ip-surface: #ffffff;
+  --ip-border: #e4e7ed;
+  --ip-text: #1f2d3d;
+  --ip-text-secondary: #606266;
+  --ip-brand: #2468f2;
+  --ip-danger: #f04438;
+  --ip-warning: #f79009;
+  --ip-success: #12b76a;
+  --ip-radius: 10px;
+  --ip-shadow: 0 2px 12px rgba(31, 45, 61, 0.06);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--ip-bg);
+  color: var(--ip-text);
+  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 通用卡片面板 */
+.ip-panel {
+  background: var(--ip-surface);
+  border: 1px solid var(--ip-border);
+  border-radius: var(--ip-radius);
+  box-shadow: var(--ip-shadow);
+  padding: 18px 20px;
+}
+
+.ip-panel__title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ip-page {
+  padding: 18px 22px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ip-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.ip-grid--2 {
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+}
+
+.ip-muted {
+  color: var(--ip-text-secondary);
+}
+
+.ip-mono {
+  font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+  font-size: 12px;
+}
+
+.ip-scroll {
+  overflow: auto;
+}
+
+/* 风险高亮 */
+.ip-risk--high {
+  border-left: 4px solid var(--ip-danger);
+}
+.ip-risk--medium {
+  border-left: 4px solid var(--ip-warning);
+}
+.ip-risk--low {
+  border-left: 4px solid var(--ip-border);
+}
+
+/* 报表 Markdown 预览（轻量渲染样式） */
+.ip-markdown {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.7;
+  font-size: 13px;
+  max-height: 520px;
+  overflow: auto;
+  background: #fafbfc;
+  border: 1px solid var(--ip-border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 0;
+  color: var(--ip-text);
+}
