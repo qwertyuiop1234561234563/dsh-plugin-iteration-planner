@@ -72,30 +72,53 @@ const stats = computed(() => {
 }
 
 .ip-kpi__card {
+  position: relative;
   background: var(--ip-surface);
   border: 1px solid var(--ip-border);
   border-radius: var(--ip-radius);
-  box-shadow: var(--ip-shadow);
+  box-shadow: var(--ip-shadow-sm);
   padding: 16px 18px;
+  overflow: hidden;
+}
+
+/* 卡片左上角的制图刻痕 */
+.ip-kpi__card::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 34px;
+  height: 2px;
+  background: var(--ip-brand);
 }
 
 .ip-kpi__card--alert {
-  border-color: rgba(240, 68, 56, 0.45);
-  background: linear-gradient(180deg, #fff5f5 0%, #ffffff 60%);
+  border-color: rgba(214, 69, 69, 0.45);
+  background: linear-gradient(180deg, #fbecec 0%, #ffffff 62%);
+}
+
+.ip-kpi__card--alert::after {
+  background: var(--ip-danger);
 }
 
 .ip-kpi__label {
-  font-size: 12px;
-  color: var(--ip-text-secondary);
-  letter-spacing: 0.4px;
+  font-family: var(--ip-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ip-text-muted);
 }
 
 .ip-kpi__value {
-  margin-top: 6px;
-  font-size: 26px;
+  margin-top: 8px;
+  font-family: var(--ip-font-display);
+  font-size: 28px;
   font-weight: 700;
-  line-height: 1.2;
-  color: var(--ip-text);
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  color: var(--ip-ink-900);
 }
 
 .ip-kpi__value--small {

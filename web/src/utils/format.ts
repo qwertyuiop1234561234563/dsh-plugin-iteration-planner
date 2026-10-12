@@ -20,15 +20,30 @@ export const TASK_TYPE_LABEL: Record<TaskType, string> = {
   DOC: '文档',
 }
 
-/** 任务类型配色（用于 DAG 画布与标签） */
+/** 任务类型配色（用于 DAG 画布与标签；取自蓝晒制图台色系） */
 export const TASK_TYPE_COLOR: Record<TaskType, string> = {
-  DB_DESIGN: '#7c5cff',
-  API_DEV: '#2468f2',
-  BUSINESS_CODE: '#12b76a',
-  DEBUG: '#f79009',
-  TEST: '#0ba5ec',
-  DEPLOY: '#f04438',
-  DOC: '#98a2b3',
+  DB_DESIGN: '#8b5cf6',
+  API_DEV: '#0e6ba8',
+  BUSINESS_CODE: '#2f9e6b',
+  DEBUG: '#e08b1a',
+  TEST: '#17a2b8',
+  DEPLOY: '#d64545',
+  DOC: '#6b8296',
+}
+
+/** 优先级配色（仪表盘图表用） */
+export const PRIORITY_COLOR: Record<Priority, string> = {
+  P0: '#d64545',
+  P1: '#e08b1a',
+  P2: '#0e6ba8',
+  P3: '#98a2b3',
+}
+
+/** 风险等级配色（仪表盘 / 报告用） */
+export const RISK_COLOR: Record<RiskLevel, string> = {
+  HIGH: '#d64545',
+  MEDIUM: '#e08b1a',
+  LOW: '#6b8296',
 }
 
 /** 任务状态文案 */

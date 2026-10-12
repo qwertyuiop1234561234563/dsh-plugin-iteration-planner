@@ -9,11 +9,15 @@
 
 import axios, { type AxiosError } from 'axios'
 import type {
+  AdviceResult,
+  AgentHealth,
   ApiEnvelope,
   ApiErrorBody,
   AuditRecord,
   BurndownItem,
   CreatePlanPayload,
+  CriticalPathResult,
+  DagCheckResult,
   DeleteTaskResult,
   EnumMeta,
   GraphPayload,
@@ -23,6 +27,8 @@ import type {
   ReplanPayload,
   ReportResult,
   RiskItem,
+  ScenarioCompareRequest,
+  ScenarioCompareResult,
   TaskDraftPayload,
   TaskMutationResult,
   TaskUpdatePayload,
@@ -124,6 +130,12 @@ export const api = {
   /** DAG 视图数据 */
   graph: (planId: string) => unwrap<GraphPayload>(http.get(`/plans/${planId}/graph`)),
 
+  /** 关键路径与总工期（AOE 计算结果） */
+  criticalPath: (planId: string) => unwrap<CriticalPathResult>(http.get(`/plans/${planId}/critical-path`)),
+
+  /** 显式执行 Kahn 拓扑校验（存在环时后端返回 409 CYCLE_DEPENDENCY） */
+  dagCheck: (planId: string) => unwrap<DagCheckResult>(http.post(`/plans/${planId}/dag-check`)),
+
   /** 风险清单 */
   risks: (planId: string) => unwrap<RiskItem[]>(http.get(`/plans/${planId}/risks`)),
 
@@ -148,6 +160,16 @@ export const api = {
   /** 审计日志（可按计划过滤） */
   audit: (params: { planId?: string; limit?: number } = {}) =>
     unwrap<AuditRecord[]>(http.get('/audit', { params })),
+
+  /** Agent 可用性（是否已配置 LLM 网关） */
+  agentHealth: () => unwrap<AgentHealth>(http.get('/agent/health')),
+
+  /** 风险缓解建议（LLM 可用时走模型，否则规则聚合降级） */
+  advise: (planId: string) => unwrap<AdviceResult>(http.post('/agent/advise', { planId })),
+
+  /** What-if 情景对比：以同需求 + 情景约束临时生成计划并与基线对比（后端会即时回收临时计划） */
+  scenarioCompare: (payload: ScenarioCompareRequest) =>
+    unwrap<ScenarioCompareResult>(http.post('/scenario/compare', payload)),
 
   /** 导出计划文件（json / md），带令牌下载为本地文件 */
   async download(planId: string, format: 'json' | 'md'): Promise<void> {

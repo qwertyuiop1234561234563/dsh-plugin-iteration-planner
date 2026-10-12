@@ -7,6 +7,7 @@
 import * as echarts from 'echarts'
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { BurndownItem } from '@/api/types'
+import { CHART_AXIS_LINE, CHART_MARK_LINE, CHART_SERIES, CHART_SPLIT_LINE, CHART_TEXT } from '@/utils/palette'
 
 const props = defineProps<{
   data: BurndownItem[]
@@ -29,21 +30,21 @@ function render(): void {
   chart.setOption(
     {
       tooltip: { trigger: 'axis', valueFormatter: (value: unknown) => `${String(value)} h` },
-      legend: { data: ['实际剩余', '理想燃尽'], right: 10, top: 0, itemWidth: 14, itemHeight: 8 },
+      legend: { data: ['实际剩余', '理想燃尽'], right: 10, top: 0, itemWidth: 14, itemHeight: 8, textStyle: CHART_TEXT },
       grid: { left: 48, right: 18, top: 36, bottom: 34 },
       xAxis: {
         type: 'category',
         boundaryGap: false,
         data: labels,
-        axisLine: { lineStyle: { color: '#dcdfe6' } },
-        axisLabel: { color: '#8a94a6', fontSize: 11 },
+        axisLine: CHART_AXIS_LINE,
+        axisLabel: CHART_TEXT,
       },
       yAxis: {
         type: 'value',
         name: '剩余工时(h)',
-        nameTextStyle: { color: '#8a94a6', fontSize: 11 },
-        splitLine: { lineStyle: { color: '#eef1f6' } },
-        axisLabel: { color: '#8a94a6', fontSize: 11 },
+        nameTextStyle: CHART_TEXT,
+        splitLine: CHART_SPLIT_LINE,
+        axisLabel: CHART_TEXT,
       },
       series: [
         {
@@ -52,11 +53,12 @@ function render(): void {
           smooth: true,
           symbolSize: 6,
           data: actual,
-          itemStyle: { color: '#2468f2' },
+          itemStyle: { color: CHART_SERIES },
+          lineStyle: { color: CHART_SERIES, width: 2 },
           areaStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: 'rgba(36,104,242,0.28)' },
-              { offset: 1, color: 'rgba(36,104,242,0.02)' },
+              { offset: 0, color: 'rgba(14,107,168,0.30)' },
+              { offset: 1, color: 'rgba(23,162,184,0.02)' },
             ]),
           },
         },
@@ -66,7 +68,7 @@ function render(): void {
           smooth: false,
           symbol: 'none',
           data: ideal,
-          lineStyle: { type: 'dashed', color: '#98a2b3', width: 1.5 },
+          lineStyle: CHART_MARK_LINE,
         },
       ],
     },

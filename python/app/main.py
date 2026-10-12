@@ -39,6 +39,7 @@ from .metrics import METRICS
 from .resilience import CircuitBreaker, RetryPolicy
 from .routes.agent import build_agent_router
 from .routes.proxy import register_proxy_and_static
+from .routes.scenario import build_scenario_router
 from .routes.system import register_system_routes
 from .security import SECURITY_HEADERS, RateLimiter, client_ip, constant_time_equals
 from .sessions import build_session_store
@@ -170,6 +171,8 @@ def create_app(
 
     register_system_routes(app)
     app.include_router(build_agent_router(settings.api_base_path))
+    # 情景对比必须先于 catch-all 静态/代理路由注册（Starlette 先注册先匹配）
+    app.include_router(build_scenario_router(settings.api_base_path))
     register_proxy_and_static(app)
     return app
 

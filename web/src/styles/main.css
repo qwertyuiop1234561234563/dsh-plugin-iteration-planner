@@ -1,18 +1,74 @@
-/* 全局样式与设计令牌（企业控制台统一视觉基线） */
+/* ============================================================================
+ * 研发迭代规划控制台 · 设计系统
+ *
+ * 视觉方向：「蓝晒制图台 / Cyanotype Drafting Table」
+ *  —— 把工程制图的语汇搬进控制台：蓝晒墨色结构、纸面网格底纹、
+ *     技术制图字体（DIN 血统）、等宽数据排版、角标与刻度装饰。
+ *  —— 刻意避开通用的「浅灰卡片 + 紫色渐变」后台模板观感。
+ *
+ * 组织顺序：
+ *   1. 设计令牌（颜色 / 字体 / 间距 / 阴影）
+ *   2. 基础重置与排版
+ *   3. Element Plus 主题覆写（一次改全局组件观感）
+ *   4. 布局与面板签名件
+ *   5. 通用工具类（保持既有类名兼容）
+ * ========================================================================= */
+
+/* ---------------------------------------------------------------- 1. 令牌 */
 
 :root {
-  --ip-bg: #f4f6fa;
+  /* -- 墨蓝：结构色（侧栏 / 标题 / 强对比文本） */
+  --ip-ink-950: #04121f;
+  --ip-ink-900: #0a2236;
+  --ip-ink-800: #0f2e47;
+  --ip-ink-700: #16405e;
+  --ip-ink-600: #1d5578;
+  --ip-ink-500: #2a6b8f;
+  --ip-ink-300: #7fa6bd;
+  --ip-ink-200: #b3c9d8;
+  --ip-ink-100: #d3e0e9;
+
+  /* -- 纸面：内容色（带冷调的制图纸） */
+  --ip-paper: #eaeff4;
+  --ip-paper-deep: #dfe7ee;
   --ip-surface: #ffffff;
-  --ip-border: #e4e7ed;
-  --ip-text: #1f2d3d;
-  --ip-text-secondary: #606266;
-  --ip-brand: #2468f2;
-  --ip-danger: #f04438;
-  --ip-warning: #f79009;
-  --ip-success: #12b76a;
-  --ip-radius: 10px;
-  --ip-shadow: 0 2px 12px rgba(31, 45, 61, 0.06);
+  --ip-surface-sunk: #f5f8fb;
+
+  /* -- 信号色：青（蓝晒）+ 琥珀（批注） */
+  --ip-brand: #0e6ba8;
+  --ip-brand-strong: #0a5384;
+  --ip-accent: #17a2b8;
+  --ip-signal: #e08b1a;
+
+  --ip-danger: #d64545;
+  --ip-warning: #e08b1a;
+  --ip-success: #2f9e6b;
+  --ip-info: #6b8296;
+
+  /* -- 文本与描边 */
+  --ip-text: #0a2236;
+  --ip-text-secondary: #4d6478;
+  --ip-text-muted: #8397a8;
+  --ip-border: #d5dfe8;
+  --ip-border-strong: #b9c9d6;
+
+  /* -- 形状：接近直角，强调制图的「精度感」 */
+  --ip-radius: 3px;
+  --ip-radius-lg: 6px;
+  --ip-shadow: 0 1px 2px rgba(10, 34, 54, 0.06), 0 14px 32px -20px rgba(10, 34, 54, 0.35);
+  --ip-shadow-sm: 0 1px 0 rgba(10, 34, 54, 0.03), 0 2px 8px -5px rgba(10, 34, 54, 0.22);
+
+  /* -- 字体：Bahnschrift(DIN 血统) 标题 / Cascadia Mono 数据 / Noto Sans SC 正文 */
+  --ip-font-sans: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+  --ip-font-display: 'Bahnschrift', 'Noto Sans SC', 'Segoe UI Semibold', 'Segoe UI', sans-serif;
+  --ip-font-mono: 'Cascadia Mono', 'Cascadia Code', Consolas, 'Courier New', monospace;
+
+  /* -- 制图纸网格（供 body 与画布复用） */
+  --ip-grid-fine: rgba(14, 107, 168, 0.035);
+  --ip-grid-bold: rgba(14, 107, 168, 0.06);
 }
+
+/* ------------------------------------------------------ 2. 基础重置与排版 */
 
 * {
   box-sizing: border-box;
@@ -27,33 +83,263 @@ body,
 }
 
 body {
-  background: var(--ip-bg);
   color: var(--ip-text);
-  font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  font-family: var(--ip-font-sans);
   font-size: 14px;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+
+  /* 制图纸：16px 细网格 + 80px 粗网格 */
+  background-color: var(--ip-paper);
+  background-image:
+    linear-gradient(var(--ip-grid-fine) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ip-grid-fine) 1px, transparent 1px),
+    linear-gradient(var(--ip-grid-bold) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ip-grid-bold) 1px, transparent 1px);
+  background-size: 16px 16px, 16px 16px, 80px 80px, 80px 80px;
+  background-position: -1px -1px;
 }
 
-/* 通用卡片面板 */
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--ip-font-display);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  margin: 0;
+}
+
+/* 细窄墨蓝滚动条，贴合制图台观感 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ip-ink-200);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ip-ink-300);
+  background-clip: content-box;
+}
+
+/* ------------------------------------------- 3. Element Plus 主题覆写 */
+
+:root {
+  /* 主色：普鲁士蓝；浅色档按 Element Plus 混白公式预先算好，保证组件派生色一致 */
+  --el-color-primary: #0e6ba8;
+  --el-color-primary-light-3: #5697c2;
+  --el-color-primary-light-5: #87b5d4;
+  --el-color-primary-light-7: #b7d3e5;
+  --el-color-primary-light-8: #cfe1ee;
+  --el-color-primary-light-9: #e7f0f6;
+  --el-color-primary-dark-2: #0b5686;
+
+  --el-color-success: #2f9e6b;
+  --el-color-success-light-3: #6dbb97;
+  --el-color-success-light-5: #97cfb5;
+  --el-color-success-light-7: #c1e2d3;
+  --el-color-success-light-8: #d5ece1;
+  --el-color-success-light-9: #eaf5f0;
+  --el-color-success-dark-2: #267e56;
+
+  --el-color-warning: #e08b1a;
+  --el-color-warning-light-3: #e9ae5f;
+  --el-color-warning-light-5: #f0c58d;
+  --el-color-warning-light-7: #f6dcba;
+  --el-color-warning-light-8: #f9e8d1;
+  --el-color-warning-light-9: #fcf3e8;
+  --el-color-warning-dark-2: #b36f15;
+
+  --el-color-danger: #d64545;
+  --el-color-danger-light-3: #e27d7d;
+  --el-color-danger-light-5: #eba2a2;
+  --el-color-danger-light-7: #f3c7c7;
+  --el-color-danger-light-8: #f7dada;
+  --el-color-danger-light-9: #fbecec;
+  --el-color-danger-dark-2: #ab3737;
+
+  --el-color-info: #6b8296;
+  --el-color-info-light-3: #98a8b6;
+  --el-color-info-light-5: #b5c1cb;
+  --el-color-info-light-7: #d3dae0;
+  --el-color-info-light-8: #e1e6ea;
+  --el-color-info-light-9: #f0f3f5;
+  --el-color-info-dark-2: #566878;
+
+  --el-text-color-primary: #0a2236;
+  --el-text-color-regular: #35506a;
+  --el-text-color-secondary: #4d6478;
+  --el-text-color-placeholder: #98aab8;
+  --el-text-color-disabled: #adbcc7;
+
+  --el-border-color: #d5dfe8;
+  --el-border-color-light: #dfe7ee;
+  --el-border-color-lighter: #e8eef4;
+  --el-border-color-extra-light: #eff4f8;
+  --el-border-color-dark: #b9c9d6;
+
+  --el-fill-color: #eef3f7;
+  --el-fill-color-light: #f5f8fb;
+  --el-fill-color-lighter: #f8fafc;
+  --el-fill-color-extra-light: #fbfcfe;
+  --el-fill-color-dark: #e2eaf0;
+  --el-fill-color-darker: #d8e2ea;
+  --el-fill-color-blank: #ffffff;
+
+  --el-bg-color: #ffffff;
+  --el-bg-color-page: #eaeff4;
+  --el-bg-color-overlay: #ffffff;
+
+  /* 直角化 + 统一字体 */
+  --el-border-radius-base: 3px;
+  --el-border-radius-small: 2px;
+  --el-border-radius-round: 999px;
+  --el-font-family: var(--ip-font-sans);
+  --el-box-shadow-light: var(--ip-shadow-sm);
+}
+
+/* 按钮：平直描边 + 字距，去掉圆润的默认观感 */
+.el-button {
+  font-family: var(--ip-font-sans);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.el-button--primary {
+  box-shadow: 0 2px 0 0 var(--ip-brand-strong);
+}
+.el-button--primary:active {
+  box-shadow: none;
+  transform: translateY(1px);
+}
+
+/* 标签：等宽小字 + 描边胶囊，作为「标记符号」使用 */
+.el-tag {
+  font-family: var(--ip-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  border-radius: 2px;
+}
+
+/* 表头：墨色细体大写 + 底部实线，读起来像图纸表头 */
+.el-table th.el-table__cell {
+  background: var(--ip-surface-sunk) !important;
+  color: var(--ip-ink-700);
+  font-family: var(--ip-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--ip-border-strong) !important;
+}
+.el-table td.el-table__cell {
+  border-bottom-color: #e8eef4;
+}
+.el-table {
+  --el-table-border-color: #e8eef4;
+  --el-table-header-text-color: var(--ip-ink-700);
+  --el-table-row-hover-bg-color: #f4f8fb;
+}
+.el-table__inner-wrapper::before {
+  background-color: var(--ip-border);
+}
+
+/* 输入类控件：直角 + 内嵌阴影，像制图台上的输入槽 */
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper {
+  border-radius: var(--ip-radius);
+  box-shadow: 0 0 0 1px var(--ip-border) inset;
+}
+.el-date-editor.el-input__wrapper {
+  box-shadow: 0 0 0 1px var(--ip-border) inset;
+}
+
+/* 卡片 / 对话框：直角 + 强调描边 */
+.el-card,
+.el-dialog {
+  border-radius: var(--ip-radius);
+  border: 1px solid var(--ip-border);
+}
+.el-dialog__header {
+  margin-right: 0;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--ip-border);
+}
+.el-dialog__title {
+  font-family: var(--ip-font-display);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ip-ink-900);
+}
+
+/* 进度条 / 分页 / 步骤等细节同步收角 */
+.el-progress-bar__outer,
+.el-progress-bar__inner {
+  border-radius: 2px;
+}
+.el-tooltip__popper,
+.el-popper.is-dark {
+  font-family: var(--ip-font-sans);
+  letter-spacing: 0.02em;
+}
+
+/* ------------------------------------------------ 4. 布局与面板签名件 */
+
+/* 面板：纸面卡片 + 顶部「图签」色轨（品牌蓝 → 青，末端淡出） */
 .ip-panel {
+  position: relative;
   background: var(--ip-surface);
   border: 1px solid var(--ip-border);
   border-radius: var(--ip-radius);
-  box-shadow: var(--ip-shadow);
+  box-shadow: var(--ip-shadow-sm);
   padding: 18px 20px;
+  overflow: hidden;
 }
 
+.ip-panel::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    var(--ip-brand) 0,
+    var(--ip-brand) 52px,
+    var(--ip-accent) 52px,
+    var(--ip-accent) 92px,
+    transparent 92px
+  );
+}
+
+/* 面板标题：左侧刻度标记 + 制图体标题 */
 .ip-panel__title {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   margin-bottom: 14px;
-  font-size: 15px;
+  padding-left: 10px;
+  border-left: 3px solid var(--ip-brand);
+  font-family: var(--ip-font-display);
+  font-size: 14px;
   font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--ip-ink-900);
 }
 
+/* 内容区：承载纸面网格与分栏节奏 */
 .ip-page {
-  padding: 18px 22px 32px;
+  padding: 20px 24px 40px;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -68,20 +354,32 @@ body {
   grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
 }
 
+/* 制图微型标签：等宽 + 大写 + 宽字距，统一注释类文案 */
+.ip-label {
+  font-family: var(--ip-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ip-text-muted);
+}
+
 .ip-muted {
   color: var(--ip-text-secondary);
 }
 
 .ip-mono {
-  font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+  font-family: var(--ip-font-mono);
   font-size: 12px;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
 }
 
 .ip-scroll {
   overflow: auto;
 }
 
-/* 风险高亮 */
+/* 风险等级：左侧信号条 */
 .ip-risk--high {
   border-left: 4px solid var(--ip-danger);
 }
@@ -89,21 +387,22 @@ body {
   border-left: 4px solid var(--ip-warning);
 }
 .ip-risk--low {
-  border-left: 4px solid var(--ip-border);
+  border-left: 4px solid var(--ip-border-strong);
 }
 
-/* 报表 Markdown 预览（轻量渲染样式） */
+/* 报表 Markdown 预览（轻量渲染样式）：纸面凹槽 */
 .ip-markdown {
   white-space: pre-wrap;
   word-break: break-word;
-  line-height: 1.7;
+  line-height: 1.75;
   font-size: 13px;
   max-height: 520px;
   overflow: auto;
-  background: #fafbfc;
+  background: var(--ip-surface-sunk);
   border: 1px solid var(--ip-border);
-  border-radius: 8px;
+  border-radius: var(--ip-radius);
   padding: 14px 16px;
   margin: 0;
   color: var(--ip-text);
+  font-variant-numeric: tabular-nums;
 }

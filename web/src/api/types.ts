@@ -238,3 +238,93 @@ export interface PlanEventMessage {
   reason?: string
   plan?: ProjectPlan
 }
+
+/* ------------------------- 关键路径 / 拓扑校验（引擎） ------------------------- */
+
+export interface CriticalPathResult {
+  criticalPath: string[]
+  totalDurationHours: number
+}
+
+export interface DagCheckResult {
+  hasCycle: boolean
+  topoOrder: string[]
+}
+
+/* ------------------------------- Agent 能力 ------------------------------- */
+
+export interface AgentHealth {
+  enabled: boolean
+  llm: string | null
+  tools: string[]
+}
+
+/** 风险缓解建议来源：llm（模型生成）/ rule（规则聚合，LLM 未配置或调用失败时降级） */
+export type AdviceMode = 'llm' | 'rule'
+
+export interface AdviceItem {
+  riskId: string
+  level: RiskLevel
+  taskIds: string[]
+  description: string
+  /** 引擎给出的原始缓解建议（权威口径） */
+  suggestion: string
+  /** 结构化行动项（模型生成或规则补充） */
+  actions: string[]
+}
+
+export interface AdviceResult {
+  mode: AdviceMode
+  summary: string
+  items: AdviceItem[]
+  /** 生成建议所用模型（rule 模式为 null） */
+  model: string | null
+  /** 降级原因（mode=rule 且因 LLM 异常降级时填充） */
+  degradedReason?: string
+}
+
+/* ------------------------------ What-if 情景 ----------------------------- */
+
+export interface ScenarioConstraints {
+  iterationDeadline?: string
+  iterationStartDate?: string
+  devMemberCount?: number
+}
+
+/** 单次规划的关键指标（全部取自引擎返回值，前端仅做展示换算） */
+export interface ScenarioMetrics {
+  totalDurationHours: number
+  totalEstimatedHours: number
+  taskCount: number
+  criticalTaskCount: number
+  riskCount: number
+  highRiskCount: number
+  /** 引擎燃尽数据推导的计划完成日期（ISO） */
+  plannedEndDate: string | null
+  /** 约束中的迭代截止日期（ISO） */
+  deadline: string | null
+  /** 计划完成日期是否不晚于截止日期（null 表示无法判定） */
+  deadlineMet: boolean | null
+}
+
+export interface ScenarioDelta {
+  totalDurationHours: number
+  totalEstimatedHours: number
+  taskCount: number
+  criticalTaskCount: number
+  riskCount: number
+  highRiskCount: number
+}
+
+export interface ScenarioCompareRequest extends ScenarioConstraints {
+  planId: string
+}
+
+export interface ScenarioCompareResult {
+  planId: string
+  baselineConstraints: Required<ScenarioConstraints>
+  scenarioConstraints: Required<ScenarioConstraints>
+  baseline: ScenarioMetrics
+  scenario: ScenarioMetrics
+  delta: ScenarioDelta
+}

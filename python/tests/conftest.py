@@ -28,6 +28,46 @@ PLAN_JSON: dict[str, Any] = {
     "totalDurationHours": 8,
 }
 
+# 情景对比用的基线与临时计划：工期 / 风险存在差异，便于校验 delta 与截止日期判定
+SCENARIO_BASELINE: dict[str, Any] = {
+    "planId": "base-plan",
+    "rawRequirement": "情景基线需求",
+    "iterationDeadline": "2026-10-30",
+    "iterationStartDate": "2026-10-12",
+    "devMemberCount": 2,
+    "taskList": [{"taskId": f"t{i}"} for i in (1, 2, 3)],
+    "riskList": [
+        {"riskId": "rb1", "level": "HIGH", "taskIds": ["t1"], "description": "关键路径存在延期风险", "suggest": "加人"},
+        {"riskId": "rb2", "level": "MEDIUM", "taskIds": ["t2"], "description": "开发人员「A」存在 2 天单日工时超限", "suggest": "削峰"},
+    ],
+    "criticalPath": ["t1", "t2"],
+    "burndownRawData": [{"time": "2026-10-16", "remainingHours": 60}, {"time": "2026-11-05", "remainingHours": 0}],
+    "totalEstimatedHours": 100,
+    "totalDurationHours": 120,
+}
+
+SCENARIO_TEMP: dict[str, Any] = {
+    "planId": "tmp-1",
+    "rawRequirement": "情景基线需求",
+    "iterationDeadline": "2026-10-30",
+    "iterationStartDate": "2026-10-12",
+    "devMemberCount": 5,
+    "taskList": [{"taskId": f"t{i}"} for i in (1, 2, 3)],
+    "riskList": [
+        {"riskId": "rt1", "level": "MEDIUM", "taskIds": ["t1"], "description": "开发人员「B」存在 1 天单日工时超限", "suggest": "削峰"}
+    ],
+    "criticalPath": ["t1"],
+    "burndownRawData": [{"time": "2026-10-16", "remainingHours": 40}, {"time": "2026-10-28", "remainingHours": 0}],
+    "totalEstimatedHours": 100,
+    "totalDurationHours": 80,
+}
+
+#: 无风险计划（用于建议端点的空态）
+NO_RISK_PLAN: dict[str, Any] = {**PLAN_JSON, "planId": "norisk", "riskList": []}
+
+#: 记录被删除的计划 ID（断言临时情景计划被回收）
+DELETED_PLAN_IDS: list[str] = []
+
 
 def _engine_handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
@@ -38,9 +78,22 @@ def _engine_handler(request: httpx.Request) -> httpx.Response:
     if path == "/api/meta/enums":
         return httpx.Response(200, json={"data": {"taskType": ["DB_DESIGN"], "priority": ["P0"]}})
     if path == "/api/plans" and method == "POST":
+        try:
+            body = json.loads(request.content.decode() or "{}")
+        except ValueError:
+            body = {}
+        if body.get("requirement") == "情景基线需求":
+            return httpx.Response(201, json={"data": SCENARIO_TEMP})
         return httpx.Response(201, json={"data": PLAN_JSON})
     if path == "/api/plans" and method == "GET":
         return httpx.Response(200, json={"data": [{"planId": "p1"}]})
+    if path == "/api/plans/base-plan" and method == "GET":
+        return httpx.Response(200, json={"data": SCENARIO_BASELINE})
+    if path == "/api/plans/norisk" and method == "GET":
+        return httpx.Response(200, json={"data": NO_RISK_PLAN})
+    if path.startswith("/api/plans/") and method == "DELETE":
+        DELETED_PLAN_IDS.append(path.rsplit("/", 1)[-1])
+        return httpx.Response(204)
     if path == "/api/plans/p1" and method == "GET":
         return httpx.Response(200, json={"data": PLAN_JSON})
     if path == "/api/plans/cycle/replan":
@@ -72,6 +125,7 @@ def settings() -> Settings:
 
 @pytest.fixture
 def engine() -> EngineClient:
+    DELETED_PLAN_IDS.clear()
     return EngineClient("http://engine.test", "/api", 5.0, transport=httpx.MockTransport(_engine_handler))
 
 

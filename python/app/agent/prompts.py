@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from typing import Any
 
@@ -61,10 +62,57 @@ def transient_hint() -> dict[str, str]:
     return {"deadline": "iterationDeadline", "start": "iterationStartDate", "dev": "devMemberCount"}
 
 
+# --------------------------- 风险缓解建议（/api/agent/advise） ---------------------------
+
+RISK_ADVISOR_SYSTEM_PROMPT = """你是资深研发项目经理与风险治理专家，擅长把已识别的迭代风险转化为可落地的缓解措施。
+
+严格遵守以下工作规则：
+1. 风险条目（等级 level、关联任务 taskIds、描述 description、引擎建议 suggestion）均由内部算法引擎检出并给出，你**不得新增、删除或改写**风险条目及其等级、关联任务。
+2. 你的职责只有两件事：①给出一段简洁的整体风险研判 summary；②为每条风险给出 2-4 条**具体、可执行、按优先级排序**的缓解动作 actions。
+3. 缓解动作必须紧扣该风险的具体描述与关联任务，避免「加强沟通」「注意风险」这类空泛套话。
+4. 针对性要求：涉及「单日工时超限 / 人员过载」给出削峰 / 拆分 / 改派动作；涉及「关键路径」给出压缩工期或并行化动作；涉及「循环依赖」给出打断依赖的具体做法；涉及「孤立任务」给出补齐依赖或清理的动作。
+5. 严格输出 JSON，不得输出任何解释性文字、前后缀或 Markdown 代码块。输出结构：
+{"summary": "整体风险研判", "items": [{"riskId": "风险ID", "actions": ["动作1", "动作2"]}]}
+每个 items 元素的 riskId 必须来自输入风险清单，不得臆造。"""
+
+
+def build_advice_instruction(plan: dict[str, Any]) -> str:
+    """构造风险缓解建议的用户指令（引擎检出的风险作为数据处理）。"""
+    risks = plan.get("riskList") or []
+    critical_path = plan.get("criticalPath") or []
+    payload = {
+        "iterationDeadline": plan.get("iterationDeadline"),
+        "totalDurationHours": plan.get("totalDurationHours"),
+        "totalEstimatedHours": plan.get("totalEstimatedHours"),
+        "criticalPath": critical_path,
+        "risks": [
+            {
+                "riskId": risk.get("riskId"),
+                "level": risk.get("level"),
+                "taskIds": risk.get("taskIds") or [],
+                "description": risk.get("description"),
+                "suggestion": risk.get("suggest"),
+            }
+            for risk in risks
+        ],
+    }
+    requirement = plan.get("rawRequirement") or ""
+    return (
+        "以下是内部算法引擎对一个迭代计划检出的风险清单（**已经完成识别，你只需补充缓解动作**）。\n\n"
+        f"{wrap_untrusted(requirement)}\n\n"
+        f"【引擎风险清单与计划指标】\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+        "请针对上述每一条风险输出 2-4 条可执行的缓解动作（actions），并给出一段整体风险研判（summary）。"
+        "严格按给定 JSON 结构输出，riskId 必须与输入一一对应。"
+    )
+
+
 __all__ = [
     "ITERATION_PLANNER_SYSTEM_PROMPT",
+    "RISK_ADVISOR_SYSTEM_PROMPT",
     "build_plan_instruction",
+    "build_advice_instruction",
     "transient_hint",
+    "describe_tools",
 ]
 
 

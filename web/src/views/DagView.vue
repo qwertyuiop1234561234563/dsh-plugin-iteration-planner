@@ -14,6 +14,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { GraphNode } from '@/api/types'
 import { usePlanStore } from '@/stores/plan'
 import { STATUS_LABEL, TASK_TYPE_COLOR, TASK_TYPE_LABEL } from '@/utils/format'
+import { GRAPH_CANVAS, TOKEN } from '@/utils/palette'
 
 const store = usePlanStore()
 
@@ -100,7 +101,7 @@ function buildNodeConfigs(nodes: GraphNode[], depths: Map<string, number>): Reco
     ids.forEach((id, index) => {
       const node = byId.get(id)
       if (!node) return
-      const stroke = node.critical ? '#f04438' : node.inCycle ? '#f79009' : TASK_TYPE_COLOR[node.taskType]
+      const stroke = node.critical ? TOKEN.danger : node.inCycle ? TOKEN.warning : TASK_TYPE_COLOR[node.taskType]
       configs.push({
         id: node.id,
         shape: 'rect',
@@ -113,13 +114,13 @@ function buildNodeConfigs(nodes: GraphNode[], depths: Map<string, number>): Reco
             stroke,
             strokeWidth: node.critical ? 2.5 : 1.5,
             strokeDasharray: node.inCycle ? '5 4' : null,
-            fill: node.isolated ? '#f5f6f8' : '#ffffff',
-            rx: 8,
-            ry: 8,
+            fill: node.isolated ? GRAPH_CANVAS.nodeFillMuted : GRAPH_CANVAS.nodeFill,
+            rx: 4,
+            ry: 4,
           },
           label: {
             text: `${node.label}\n${TASK_TYPE_LABEL[node.taskType]} · ${node.estimatedHours}h`,
-            fill: node.inCycle ? '#b54708' : '#1f2d3d',
+            fill: node.inCycle ? GRAPH_CANVAS.nodeTextWarn : GRAPH_CANVAS.nodeText,
             fontSize: 12,
             lineHeight: 17,
           },
@@ -146,7 +147,7 @@ function buildEdgeConfigs(
       source.critical &&
       target.critical &&
       Math.abs(target.es - (source.es + source.estimatedHours)) < 1e-6
-    const stroke = criticalEdge ? '#f04438' : '#c3cad9'
+    const stroke = criticalEdge ? TOKEN.danger : GRAPH_CANVAS.edgeColor
     return {
       source: { cell: edge.source },
       target: { cell: edge.target },
@@ -167,10 +168,26 @@ function buildEdgeConfigs(
 /* ------------------------------- 渲染控制 ------------------------------- */
 
 function disposeGraph(): void {
-  observer?.disconnect()
-  observer = null
   graph?.dispose()
   graph = null
+}
+
+/**
+ * 让画布跟随容器尺寸变化。
+ *
+ * 关键点：观察的容器（.ip-dag-graph）不带边框，`clientWidth/clientHeight` 就是内容盒尺寸，
+ * 与 `graph.resize()` 回写的显式宽高一致，因此不会形成「每帧缩小 2px」的反馈循环。
+ */
+function attachResizeObserver(): void {
+  observer?.disconnect()
+  observer = null
+  const element = container.value
+  if (!element || typeof ResizeObserver === 'undefined') return
+  observer = new ResizeObserver(() => {
+    const el = container.value
+    if (el) graph?.resize(el.clientWidth, el.clientHeight)
+  })
+  observer.observe(element)
 }
 
 function render(): void {
@@ -181,8 +198,8 @@ function render(): void {
 
   graph = new Graph({
     container: element,
-    background: { color: '#ffffff' },
-    grid: { visible: true, type: 'dot', size: 14, args: { color: '#e8ecf3' } },
+    background: { color: GRAPH_CANVAS.background },
+    grid: { visible: true, type: 'dot', size: 14, args: { color: GRAPH_CANVAS.gridColor } },
     panning: { enabled: true, eventTypes: ['leftMouseDown', 'mouseWheel'] },
     mousewheel: { enabled: true, modifiers: ['ctrl', 'meta'], minScale: 0.25, maxScale: 2.5 },
     interacting: { nodeMovable: true, edgeMovable: false },
@@ -201,11 +218,30 @@ function render(): void {
   })
 
   graph.zoomToFit({ padding: 24, maxScale: 1 })
+  attachResizeObserver()
 }
 
-function zoom(factor: number): void {
+/** 缩放上下限（与 mousewheel 配置保持一致） */
+const ZOOM_MIN = 0.25
+const ZOOM_MAX = 2.5
+/** 单次缩放的倍率 */
+const ZOOM_STEP = 1.2
+
+/**
+ * 缩放画布。
+ *
+ * 注意：AntV X6 的 `graph.zoom(factor)` 是**相对增量**语义
+ * （`newScale = 当前 scale + factor`，见 `@antv/x6` 的 `transform.zoom`），
+ * 因此传入 `0.87` 这类正数并不会缩小、反而会放大。这里改用绝对缩放的
+ * `zoomTo(target)`：显式按倍率计算目标 scale 并夹在上下限内，保证放大/缩小方向确定。
+ *
+ * @param direction 1 放大，-1 缩小
+ */
+function zoom(direction: 1 | -1): void {
   if (!graph) return
-  graph.zoom(factor)
+  const current = graph.zoom() as number
+  const target = direction > 0 ? current * ZOOM_STEP : current / ZOOM_STEP
+  graph.zoomTo(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, target)))
 }
 
 function fit(): void {
@@ -232,15 +268,13 @@ const predecessors = computed(() => {
     .map((edge) => store.taskIndex.get(edge.source)?.taskName ?? edge.source)
 })
 
-onMounted(() => {
-  render()
-  if (container.value && typeof ResizeObserver !== 'undefined') {
-    observer = new ResizeObserver(() => graph?.resize(container.value!.clientWidth, container.value!.clientHeight))
-    observer.observe(container.value)
-  }
-})
+onMounted(render)
 
-onBeforeUnmount(disposeGraph)
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  observer = null
+  disposeGraph()
+})
 
 watch(() => [store.graph, criticalOnly.value], render, { deep: false })
 </script>
@@ -281,17 +315,19 @@ watch(() => [store.graph, criticalOnly.value], render, { deep: false })
             <div class="ip-actions">
               <el-checkbox v-model="criticalOnly">仅关键路径</el-checkbox>
               <el-button-group>
-                <el-button :icon="'ZoomIn'" @click="zoom(1.15)" />
-                <el-button :icon="'ZoomOut'" @click="zoom(0.87)" />
+                <el-button :icon="'ZoomIn'" @click="zoom(1)" />
+                <el-button :icon="'ZoomOut'" @click="zoom(-1)" />
                 <el-button :icon="'FullScreen'" @click="fit" />
               </el-button-group>
             </div>
           </div>
-          <div ref="container" class="ip-dag-canvas" />
+          <div class="ip-dag-canvas">
+            <div ref="container" class="ip-dag-graph" />
+          </div>
           <div class="ip-legend">
-            <span class="ip-legend__item"><i class="ip-legend__dot" style="background: #f04438" />关键路径</span>
-            <span class="ip-legend__item"><i class="ip-legend__dot" style="background: #f79009" />环内任务</span>
-            <span class="ip-legend__item"><i class="ip-legend__dot" style="background: #c3cad9" />普通节点</span>
+            <span class="ip-legend__item"><i class="ip-legend__dot" style="background: var(--ip-danger)" />关键路径</span>
+            <span class="ip-legend__item"><i class="ip-legend__dot" style="background: var(--ip-warning)" />环内任务</span>
+            <span class="ip-legend__item"><i class="ip-legend__dot" style="background: #b9c9d6" />普通节点</span>
             <span class="ip-legend__item ip-muted">按住左键拖拽平移，Ctrl + 滚轮缩放</span>
           </div>
         </div>
@@ -343,6 +379,12 @@ watch(() => [store.graph, criticalOnly.value], render, { deep: false })
   border-radius: 8px;
   overflow: hidden;
   background: #fff;
+}
+
+/* X6 画布根容器：不设边框，保证 clientWidth/Height 与 resize() 回写一致 */
+.ip-dag-graph {
+  width: 100%;
+  height: 100%;
 }
 
 .ip-legend {

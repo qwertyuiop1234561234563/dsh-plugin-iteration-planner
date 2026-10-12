@@ -12,6 +12,8 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiClientError, api, resolveWsUrl } from '@/api/client'
 import type {
+  AdviceResult,
+  AgentHealth,
   AuditRecord,
   CreatePlanPayload,
   EnumMeta,
@@ -21,6 +23,8 @@ import type {
   ProjectPlan,
   ReplanPayload,
   ReportResult,
+  ScenarioCompareResult,
+  ScenarioConstraints,
   TaskDraftPayload,
   TaskUpdatePayload,
 } from '@/api/types'
@@ -43,10 +47,15 @@ export const usePlanStore = defineStore('plan', () => {
   const graph = ref<GraphPayload | null>(null)
   const report = ref<ReportResult | null>(null)
   const audit = ref<AuditRecord[]>([])
+  const advice = ref<AdviceResult | null>(null)
+  const agentHealth = ref<AgentHealth | null>(null)
+  const scenario = ref<ScenarioCompareResult | null>(null)
 
   const listLoading = ref(false)
   const detailLoading = ref(false)
   const mutating = ref(false)
+  const adviceLoading = ref(false)
+  const scenarioLoading = ref(false)
   const wsStatus = ref<WsStatus>('closed')
 
   /** 当前计划 ID */
@@ -78,6 +87,50 @@ export const usePlanStore = defineStore('plan', () => {
     plan.value ? Math.max(1, Math.ceil(plan.value.totalDurationHours / 8)) : 0,
   )
 
+  /** 计划完成日期：直接取引擎燃尽数据末点（引擎按工作日推进，前端不重算） */
+  const plannedEndDate = computed(() => {
+    const points = plan.value?.burndownRawData ?? []
+    return points.length > 0 ? points[points.length - 1].time : null
+  })
+
+  /** 任务状态统计（仪表盘用） */
+  const statusStats = computed(() => {
+    const list = plan.value?.taskList ?? []
+    const counter = new Map<string, number>()
+    for (const task of list) counter.set(task.status, (counter.get(task.status) ?? 0) + 1)
+    return [...counter.entries()].map(([status, count]) => ({ status, count }))
+  })
+
+  /** 按责任人聚合的工时分布（仅求和展示，不参与任何业务判定） */
+  const resourceLoad = computed(() => {
+    const critical = criticalSet.value
+    const map = new Map<string, { assignee: string; hours: number; taskCount: number; criticalCount: number }>()
+    for (const task of plan.value?.taskList ?? []) {
+      const key = task.assignee || '待分配'
+      const entry = map.get(key) ?? { assignee: key, hours: 0, taskCount: 0, criticalCount: 0 }
+      entry.hours += task.estimatedHours
+      entry.taskCount += 1
+      if (critical.has(task.taskId)) entry.criticalCount += 1
+      map.set(key, entry)
+    }
+    return [...map.values()].sort((a, b) => b.hours - a.hours)
+  })
+
+  /**
+   * 过载责任人集合（仪表盘高亮用）。
+   *
+   * 人员过载判定在引擎侧（`src/service/risk.ts` §4.2），此处仅从引擎生成的
+   * 风险描述中解析责任人名称用于展示，不重复实现任何判定逻辑。
+   */
+  const overloadedMembers = computed(() => {
+    const names = new Set<string>()
+    for (const risk of plan.value?.riskList ?? []) {
+      if (!risk.description.includes('单日工时超限')) continue
+      for (const match of risk.description.matchAll(/「([^」]+)」/g)) names.add(match[1])
+    }
+    return names
+  })
+
   /* -------------------------------- 只读加载 ------------------------------- */
 
   async function loadEnums(): Promise<void> {
@@ -103,6 +156,9 @@ export const usePlanStore = defineStore('plan', () => {
   /** 加载计划详情 + DAG + 报表 */
   async function loadPlan(planId: string): Promise<void> {
     detailLoading.value = true
+    // 切换到新计划时清空「按需生成」的分析结果，避免展示上一个计划的建议 / 情景
+    advice.value = null
+    scenario.value = null
     try {
       plan.value = await api.getPlan(planId)
       // DAG 与报表失败不阻断主流程（例如计划为空时报表仍可用）
@@ -127,10 +183,53 @@ export const usePlanStore = defineStore('plan', () => {
     }
   }
 
+  /** 读取 Agent 可用性（是否已配置 LLM 网关），用于风险建议页的模式提示 */
+  async function loadAgentHealth(): Promise<void> {
+    try {
+      agentHealth.value = await api.agentHealth()
+    } catch (error) {
+      agentHealth.value = null
+      ElMessage.error(`获取 Agent 状态失败：${errorText(error)}`)
+    }
+  }
+
+  /** 生成当前计划的风险缓解建议（LLM 不可用时后端自动降级为规则聚合） */
+  async function loadAdvice(): Promise<void> {
+    if (!plan.value) return
+    adviceLoading.value = true
+    try {
+      advice.value = await api.advise(plan.value.planId)
+    } catch (error) {
+      advice.value = null
+      ElMessage.error(`生成风险建议失败：${errorText(error)}`)
+    } finally {
+      adviceLoading.value = false
+    }
+  }
+
+  /** 执行 What-if 情景对比（后端临时生成计划并即时回收，不改动基线计划） */
+  async function runScenarioCompare(constraints: ScenarioConstraints): Promise<boolean> {
+    if (!plan.value) return false
+    scenarioLoading.value = true
+    try {
+      scenario.value = await api.scenarioCompare({ planId: plan.value.planId, ...constraints })
+      return true
+    } catch (error) {
+      scenario.value = null
+      ElMessage.error(`情景对比失败：${errorText(error)}`)
+      return false
+    } finally {
+      scenarioLoading.value = false
+    }
+  }
+
   /** 重新拉取当前计划与 DAG（写操作或外部事件后调用） */
   async function refreshCurrent(): Promise<void> {
     if (!plan.value) return
     const planId = plan.value.planId
+    // 计划内容已变化：按需生成的风险建议 / 情景对比结果随之失效
+    advice.value = null
+    scenario.value = null
     plan.value = await api.getPlan(planId)
     try {
       graph.value = await api.graph(planId)
@@ -341,9 +440,14 @@ export const usePlanStore = defineStore('plan', () => {
     graph,
     report,
     audit,
+    advice,
+    agentHealth,
+    scenario,
     listLoading,
     detailLoading,
     mutating,
+    adviceLoading,
+    scenarioLoading,
     wsStatus,
     // 派生
     currentPlanId,
@@ -351,11 +455,18 @@ export const usePlanStore = defineStore('plan', () => {
     criticalSet,
     riskStats,
     durationWorkDays,
+    plannedEndDate,
+    statusStats,
+    resourceLoad,
+    overloadedMembers,
     // 动作
     loadEnums,
     loadPlans,
     loadPlan,
     loadAudit,
+    loadAgentHealth,
+    loadAdvice,
+    runScenarioCompare,
     refreshCurrent,
     createPlan,
     removePlan,

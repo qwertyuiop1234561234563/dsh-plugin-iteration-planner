@@ -148,6 +148,20 @@ class AgentRunner:
         """清空指定会话，返回是否存在。"""
         return await self._store.pop(session_id)
 
+    async def complete(self, messages: list[dict[str, Any]], *, temperature: float | None = None) -> str:
+        """单轮纯文本补全（不携带工具，供风险建议等「一次性生成」场景使用）。
+
+        与 :meth:`_loop` 不同，这里不做 function calling 编排：只调用一次模型并把
+        assistant 文本归一化返回；未配置 LLM 时抛出 :func:`llm_unavailable` 由调用方降级。
+        """
+        if self._llm is None:
+            raise llm_unavailable()
+        message = await self._llm.chat(
+            messages,
+            temperature=self._temperature if temperature is None else temperature,
+        )
+        return _content_to_text(message.get("content"))
+
     # ------------------------------- 内部实现 -------------------------------
 
     @staticmethod

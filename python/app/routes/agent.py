@@ -10,10 +10,11 @@ import uuid
 
 from fastapi import APIRouter, Request
 
+from ..agent.advisor import generate_advice
 from ..agent.sanitize import sanitize_user_input
 from ..agent.schemas import TOOL_NAMES, TOOL_SPECS
 from ..errors import llm_unavailable, not_found
-from ..models import AgentChatRequest, AgentChatResponse, AgentPlanRequest, AgentRunResult
+from ..models import AdviceRequest, AgentChatRequest, AgentChatResponse, AgentPlanRequest, AgentRunResult
 from ..state import AppContext
 
 
@@ -61,6 +62,17 @@ def build_agent_router(base: str) -> APIRouter:
         result: AgentRunResult = await runner.run_chat(session_id, sanitize_user_input(payload.message))
         response = AgentChatResponse(sessionId=session_id, **result.model_dump())
         return {"data": response.model_dump()}
+
+    @router.post("/advise", summary="基于引擎风险清单生成缓解建议（LLM 优先，缺失则规则模式）")
+    async def agent_advise(payload: AdviceRequest, request: Request) -> dict:
+        ctx: AppContext = request.app.state.ctx
+        result = await generate_advice(
+            ctx.engine,
+            ctx.runner,
+            model=ctx.settings.llm_model or None,
+            plan_id=payload.planId,
+        )
+        return {"data": result.model_dump()}
 
     @router.delete("/sessions/{session_id}", summary="清空指定会话上下文")
     async def reset_session(session_id: str, request: Request) -> dict:
