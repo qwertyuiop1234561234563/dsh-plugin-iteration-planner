@@ -256,7 +256,7 @@ const legend = computed(() => [...assigneeColor.value.entries()].map(([name, col
 .ip-gantt__names {
   flex: 0 0 268px;
   border-right: 1px solid var(--ip-border);
-  background: #fafbfc;
+  background: var(--ip-surface-sunk);
 }
 
 .ip-gantt__names-head {
@@ -267,7 +267,7 @@ const legend = computed(() => [...assigneeColor.value.entries()].map(([name, col
   font-weight: 600;
   color: var(--ip-text-secondary);
   border-bottom: 1px solid var(--ip-border);
-  background: #f2f4f8;
+  background: var(--ip-surface-sunk);
   position: sticky;
   top: 0;
   z-index: 3;
@@ -279,7 +279,7 @@ const legend = computed(() => [...assigneeColor.value.entries()].map(([name, col
   justify-content: center;
   gap: 2px;
   padding: 0 12px;
-  border-bottom: 1px solid #f1f3f7;
+  border-bottom: 1px solid var(--ip-border);
   overflow: hidden;
 }
 
@@ -321,7 +321,7 @@ const legend = computed(() => [...assigneeColor.value.entries()].map(([name, col
 .ip-gantt__axis {
   display: flex;
   border-bottom: 1px solid var(--ip-border);
-  background: #f2f4f8;
+  background: var(--ip-surface-sunk);
   position: sticky;
   top: 0;
   z-index: 2;
@@ -334,7 +334,7 @@ const legend = computed(() => [...assigneeColor.value.entries()].map(([name, col
   justify-content: center;
   font-size: 11px;
   color: var(--ip-text-secondary);
-  border-right: 1px solid #e9edf3;
+  border-right: 1px solid var(--ip-border-strong);
   box-sizing: border-box;
 }
 
@@ -347,12 +347,12 @@ const legend = computed(() => [...assigneeColor.value.entries()].map(([name, col
 .ip-gantt__track {
   position: relative;
   display: flex;
-  border-bottom: 1px solid #f1f3f7;
+  border-bottom: 1px solid var(--ip-border);
 }
 
 .ip-gantt__grid-col {
   flex: 0 0 auto;
-  border-right: 1px solid #f4f6fa;
+  border-right: 1px solid var(--ip-border);
   box-sizing: border-box;
 }
 

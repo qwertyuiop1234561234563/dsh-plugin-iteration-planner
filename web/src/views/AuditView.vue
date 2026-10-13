@@ -6,7 +6,10 @@
  * 支持按计划过滤、变更条数上限与手动刷新，用于问题追溯与合规审计。
  */
 import { computed, onMounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
 import { usePlanStore } from '@/stores/plan'
+import { exportCsv, fileStamp } from '@/utils/export'
+import { AUDIT_EXPORT_COLUMNS } from '@/utils/exportPresets'
 import { formatIso } from '@/utils/format'
 
 const store = usePlanStore()
@@ -58,6 +61,16 @@ function pretty(value: unknown, max = 4000): string {
 
 watch([planFilter, limit], reload)
 onMounted(reload)
+
+/** 导出当前视图内的审计记录（CSV，含入参 / 出参 / 错误） */
+function exportAudit(): void {
+  if (rows.value.length === 0) {
+    ElMessage.warning('当前没有可导出的审计记录')
+    return
+  }
+  exportCsv(`iteration-audit.${fileStamp()}.csv`, AUDIT_EXPORT_COLUMNS, rows.value)
+  ElMessage.success(`已导出 ${rows.value.length} 条审计记录`)
+}
 </script>
 
 <template>
@@ -74,6 +87,7 @@ onMounted(reload)
             <el-option :value="300" label="最近 300" />
             <el-option :value="1000" label="最近 1000" />
           </el-select>
+          <el-button :icon="'Download'" @click="exportAudit">导出 CSV</el-button>
           <el-button :icon="'Refresh'" :loading="loading" @click="reload">刷新</el-button>
         </div>
       </div>
@@ -171,7 +185,7 @@ onMounted(reload)
   margin: 0;
   max-height: 260px;
   overflow: auto;
-  background: #fafbfc;
+  background: var(--ip-surface-sunk);
   border: 1px solid var(--ip-border);
   border-radius: 8px;
   padding: 10px 12px;

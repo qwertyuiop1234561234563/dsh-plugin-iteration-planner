@@ -4,8 +4,10 @@
  */
 import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { usePlanStore } from '@/stores/plan'
+import { exportCsv, fileStamp } from '@/utils/export'
+import { PLAN_EXPORT_COLUMNS } from '@/utils/exportPresets'
 import { formatTime, hoursToWorkDays, truncate } from '@/utils/format'
 
 const store = usePlanStore()
@@ -14,6 +16,16 @@ const router = useRouter()
 onMounted(() => {
   void store.loadPlans()
 })
+
+/** 导出全部计划摘要（CSV，Excel 可直接打开） */
+function exportPlans(): void {
+  if (store.summaries.length === 0) {
+    ElMessage.warning('暂无计划可导出')
+    return
+  }
+  exportCsv(`iteration-plans.${fileStamp()}.csv`, PLAN_EXPORT_COLUMNS, store.summaries)
+  ElMessage.success(`已导出 ${store.summaries.length} 个计划`)
+}
 
 function open(planId: string, target: 'plan-overview' | 'plan-tasks' | 'plan-dag'): void {
   void router.push({ name: target, params: { planId } })
@@ -39,6 +51,7 @@ async function confirmRemove(planId: string, requirement: string): Promise<void>
       <el-button type="primary" :icon="'MagicStick'" @click="router.push({ name: 'plan-create' })">
         新建迭代计划
       </el-button>
+      <el-button :icon="'Download'" @click="exportPlans">导出 CSV</el-button>
       <el-button :icon="'Refresh'" @click="store.loadPlans()">刷新</el-button>
       <span class="ip-muted">共 {{ store.summaries.length }} 个计划</span>
     </div>

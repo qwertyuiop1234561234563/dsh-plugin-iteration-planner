@@ -406,3 +406,190 @@ h4 {
   color: var(--ip-text);
   font-variant-numeric: tabular-nums;
 }
+
+/* ------------------------------------------------- 5. 夜间蓝晒（深色模式） */
+
+/*
+ * 主题切换只做「同一套色板的明度反转」：保留蓝晒墨蓝的结构感，
+ * 把纸面换成深夜台面（--ip-paper → 深墨蓝），文字翻为冷白。
+ * 结构色（侧栏 --ip-ink-950 ~ --ip-ink-600）保持原值，因此侧栏在两种主题下一致。
+ */
+:root[data-theme='dark'] {
+  /* 纸面 → 夜间台面 */
+  --ip-paper: #071726;
+  --ip-paper-deep: #05121e;
+  --ip-surface: #0e2438;
+  --ip-surface-sunk: #0a1c2c;
+
+  /* 文本翻为冷白 */
+  --ip-text: #e2ecf4;
+  --ip-text-secondary: #a9c1d3;
+  --ip-text-muted: #7f9cb2;
+  --ip-border: #1f3f59;
+  --ip-border-strong: #2c5472;
+
+  /* 网格线在深底上改为冷光刻线 */
+  --ip-grid-fine: rgba(122, 182, 226, 0.05);
+  --ip-grid-bold: rgba(122, 182, 226, 0.09);
+
+  --ip-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 16px 34px -20px rgba(0, 0, 0, 0.7);
+  --ip-shadow-sm: 0 1px 0 rgba(0, 0, 0, 0.3), 0 2px 10px -6px rgba(0, 0, 0, 0.6);
+
+  /* Element Plus：底色 / 文本 / 描边 / 填充整体反转 */
+  --el-text-color-primary: #e2ecf4;
+  --el-text-color-regular: #bcd0de;
+  --el-text-color-secondary: #a9c1d3;
+  --el-text-color-placeholder: #6f8ba0;
+  --el-text-color-disabled: #5a7387;
+
+  --el-border-color: #1f3f59;
+  --el-border-color-light: #1b3850;
+  --el-border-color-lighter: #173045;
+  --el-border-color-extra-light: #14293c;
+  --el-border-color-dark: #2c5472;
+
+  --el-fill-color: #12293d;
+  --el-fill-color-light: #0e2438;
+  --el-fill-color-lighter: #0b1e30;
+  --el-fill-color-extra-light: #091a2a;
+  --el-fill-color-dark: #16324a;
+  --el-fill-color-darker: #1a3a55;
+  --el-fill-color-blank: #0e2438;
+
+  --el-bg-color: #0e2438;
+  --el-bg-color-page: #071726;
+  --el-bg-color-overlay: #103048;
+
+  /* 主色浅色档在深底上需要“向亮混合”，否则禁用态 / 浅底档不可见 */
+  --el-color-primary-light-3: #3f8fc4;
+  --el-color-primary-light-5: #2c6f9d;
+  --el-color-primary-light-7: #204f74;
+  --el-color-primary-light-8: #1a425f;
+  --el-color-primary-light-9: #14344c;
+  --el-color-primary-dark-2: #2f8fc9;
+
+  --el-color-success-light-3: #3fae7e;
+  --el-color-success-light-5: #2d8460;
+  --el-color-success-light-7: #23604a;
+  --el-color-success-light-8: #1c4f3d;
+  --el-color-success-light-9: #153c2f;
+  --el-color-success-dark-2: #46b784;
+
+  --el-color-warning-light-3: #dfa24c;
+  --el-color-warning-light-5: #a97a36;
+  --el-color-warning-light-7: #7d5a29;
+  --el-color-warning-light-8: #654921;
+  --el-color-warning-light-9: #4b3618;
+  --el-color-warning-dark-2: #eaa757;
+
+  --el-color-danger-light-3: #d87474;
+  --el-color-danger-light-5: #a85757;
+  --el-color-danger-light-7: #7d4141;
+  --el-color-danger-light-8: #643434;
+  --el-color-danger-light-9: #4b2727;
+  --el-color-danger-dark-2: #e07f7f;
+
+  --el-color-info-light-3: #6f8ba0;
+  --el-color-info-light-5: #567089;
+  --el-color-info-light-7: #405869;
+  --el-color-info-light-8: #344857;
+  --el-color-info-light-9: #27363f;
+  --el-color-info-dark-2: #86a0b3;
+}
+
+/* 深色下使用 --ip-ink-* 作文字色的规则改为语义文本色（结构色仍保持墨蓝） */
+:root[data-theme='dark'] .ip-header__title,
+:root[data-theme='dark'] .ip-panel__title,
+:root[data-theme='dark'] .el-dialog__title,
+:root[data-theme='dark'] .ip-ribbon__val,
+:root[data-theme='dark'] .ip-header__sheet,
+:root[data-theme='dark'] .el-table th.el-table__cell {
+  color: var(--ip-text);
+}
+
+:root[data-theme='dark'] .ip-header {
+  background: rgba(7, 23, 38, 0.86);
+}
+
+:root[data-theme='dark'] .ip-header__sheet {
+  background: var(--ip-surface-sunk);
+  border-color: var(--ip-border-strong);
+}
+
+:root[data-theme='dark'] .ip-ribbon__val.is-brand {
+  color: #4da3dd;
+}
+
+:root[data-theme='dark'] .el-table {
+  --el-table-border-color: #173045;
+  --el-table-row-hover-bg-color: #14324a;
+}
+
+:root[data-theme='dark'] .el-table td.el-table__cell {
+  border-bottom-color: #173045;
+}
+
+:root[data-theme='dark'] ::-webkit-scrollbar-thumb {
+  background: #24465f;
+  background-clip: content-box;
+}
+
+:root[data-theme='dark'] ::-webkit-scrollbar-thumb:hover {
+  background: #315d7c;
+  background-clip: content-box;
+}
+
+/* ------------------------------------------------------- 6. 打印样式 */
+/*
+ * 打印友好：隐藏控制台外框（侧栏 / 抬头 / 概况带 / 工具条），只保留内容区；
+ * 面板去掉阴影与圆角，统一为白底黑字，保证任意主题下打印都清晰。
+ */
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #000000;
+  }
+
+  /* 布局容器在打印时取消固定高度与滚动裁剪，否则长报表会被截断 */
+  .el-container,
+  .el-main,
+  .ip-panel__body {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  .ip-aside,
+  .ip-header,
+  .ip-ribbon,
+  .ip-no-print {
+    display: none !important;
+  }
+
+  .ip-main {
+    overflow: visible !important;
+    padding: 0 !important;
+  }
+
+  .ip-page {
+    padding: 0 !important;
+    gap: 10px !important;
+  }
+
+  .ip-panel,
+  .ip-kpi__card {
+    box-shadow: none !important;
+    border-color: #999999 !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .ip-panel::before,
+  .ip-kpi__card::after {
+    background: #999999 !important;
+  }
+
+  a[href]::after {
+    content: '';
+  }
+}

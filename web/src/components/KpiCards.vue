@@ -118,7 +118,7 @@ const stats = computed(() => {
   line-height: 1.15;
   letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
-  color: var(--ip-ink-900);
+  color: var(--ip-text);
 }
 
 .ip-kpi__value--small {

@@ -12,6 +12,7 @@ import BurndownChart from '@/components/BurndownChart.vue'
 import KpiCards from '@/components/KpiCards.vue'
 import RiskPanel from '@/components/RiskPanel.vue'
 import { usePlanStore } from '@/stores/plan'
+import { detectMilestones } from '@/utils/analytics'
 import { TASK_TYPE_COLOR, TASK_TYPE_LABEL, formatTime, hoursToWorkDays } from '@/utils/format'
 
 const store = usePlanStore()
@@ -44,6 +45,9 @@ const lastUpdated = computed(() => {
 function taskNameOf(taskId: string): string {
   return store.taskIndex.get(taskId)?.taskName ?? taskId
 }
+
+/** 里程碑节点（只读推断：发布任务 / 末端交付任务，不参与排期判定） */
+const milestones = computed(() => detectMilestones(plan.value))
 
 /** 定位风险关联任务：跳转任务表并携带聚焦参数 */
 function locateTask(taskId: string): void {
@@ -115,6 +119,30 @@ watch(
 
       <!-- KPI -->
       <KpiCards :plan="plan" />
+
+      <!-- 里程碑节点（自动标记） -->
+      <div v-if="milestones.length > 0" class="ip-panel">
+        <div class="ip-panel__title">
+          <span>里程碑节点（自动标记）</span>
+          <el-tag size="small" effect="plain">共 {{ milestones.length }} 个</el-tag>
+        </div>
+        <div class="ip-milestones">
+          <el-tag
+            v-for="item in milestones"
+            :key="item.taskId"
+            size="large"
+            effect="plain"
+            :type="item.kind === 'RELEASE' ? 'danger' : 'primary'"
+            class="ip-milestone"
+            @click="locateTask(item.taskId)"
+          >
+            {{ item.kind === 'RELEASE' ? '发布里程碑' : '交付里程碑' }} · {{ item.taskName }} · {{ item.date }}
+          </el-tag>
+        </div>
+        <p class="ip-muted" style="margin: 8px 0 0; font-size: 12px">
+          里程碑由任务类型（部署）与依赖末端自动推断，仅用于展示；点击标签可定位到任务管理页。
+        </p>
+      </div>
 
       <!-- 关键路径 + 风险 -->
       <div class="ip-grid ip-grid--2">
@@ -280,5 +308,15 @@ watch(
 .ip-updated {
   font-size: 12px;
   text-align: right;
+}
+
+.ip-milestones {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ip-milestone {
+  cursor: pointer;
 }
 </style>

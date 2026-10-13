@@ -178,7 +178,7 @@ const total = computed(() => visibleTasks.value.length)
 
 .ip-kanban__column {
   flex: 0 0 258px;
-  background: #f2f4f8;
+  background: var(--ip-surface-sunk);
   border: 1px solid var(--ip-border);
   border-radius: var(--ip-radius);
   padding: 10px;

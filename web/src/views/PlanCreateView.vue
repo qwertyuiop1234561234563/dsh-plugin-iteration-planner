@@ -7,8 +7,12 @@
  */
 import { computed, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
 import { usePlanStore } from '@/stores/plan'
+import { BUILTIN_TEMPLATES, newTemplateId, readCustomTemplates, writeCustomTemplates } from '@/utils/templates'
+import type { IterationTemplate } from '@/utils/templates'
+import { addDays, formatISODate, parseISODate } from '@/utils/workday'
 
 const store = usePlanStore()
 const router = useRouter()
@@ -64,6 +68,87 @@ const rules: FormRules = {
 /** 缓冲规则说明（来自后端枚举元数据，保证与算法一致） */
 const bufferRules = computed(() => store.enums?.bufferRules ?? [])
 
+/* ------------------------------- 迭代模板库 ------------------------------ */
+
+/** 自定义模板（localStorage 持久化） */
+const customTemplates = ref<IterationTemplate[]>(readCustomTemplates())
+
+/** 全部模板：内置 + 自定义 */
+const allTemplates = computed<IterationTemplate[]>(() => [...BUILTIN_TEMPLATES, ...customTemplates.value])
+
+/** 当前选中的模板（用于高亮） */
+const selectedTemplateId = ref('')
+
+/** ISO 日期加减自然日（模板窗口长度按自然日计） */
+function shiftISO(iso: string, days: number): string {
+  return formatISODate(addDays(parseISODate(iso), days))
+}
+
+/** 应用模板：填入需求文本 / 开发人数，并按窗口长度重算截止日期 */
+function applyTemplate(template: IterationTemplate): void {
+  selectedTemplateId.value = template.id
+  form.requirement = template.requirement
+  form.devMemberCount = template.devMemberCount
+  form.iterationDeadline = shiftISO(form.iterationStartDate, Math.max(1, template.windowDays) - 1)
+}
+
+/** 把当前表单保存为自定义模板 */
+async function saveAsTemplate(): Promise<void> {
+  if (!form.requirement.trim()) {
+    ElMessage.warning('请先填写业务需求，再保存为模板')
+    return
+  }
+  let name = ''
+  try {
+    const result = await ElMessageBox.prompt('为当前填写内容命名，保存后可在模板库一键复用', '保存为迭代模板', {
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+      inputPlaceholder: '例如：结算中心重构迭代',
+      inputValidator: (value: string) => (value && value.trim().length >= 2 ? true : '模板名称至少 2 个字符'),
+    })
+    name = result.value.trim()
+  } catch {
+    return // 用户取消
+  }
+
+  const windowDays = Math.max(
+    1,
+    Math.round(
+      (parseISODate(form.iterationDeadline).getTime() - parseISODate(form.iterationStartDate).getTime()) / 86_400_000,
+    ) + 1,
+  )
+  const template: IterationTemplate = {
+    id: newTemplateId(),
+    name,
+    description: `自定义模板 · ${form.devMemberCount} 人 · 窗口 ${windowDays} 天`,
+    requirement: form.requirement,
+    devMemberCount: form.devMemberCount,
+    windowDays,
+    builtin: false,
+  }
+  customTemplates.value = [template, ...customTemplates.value]
+  writeCustomTemplates(customTemplates.value)
+  selectedTemplateId.value = template.id
+  ElMessage.success(`模板「${name}」已保存`)
+}
+
+/** 删除自定义模板（内置模板不可删除） */
+async function removeTemplate(template: IterationTemplate): Promise<void> {
+  if (template.builtin) return
+  try {
+    await ElMessageBox.confirm(`确认删除模板「${template.name}」？`, '删除模板', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return // 用户取消
+  }
+  customTemplates.value = customTemplates.value.filter((item) => item.id !== template.id)
+  writeCustomTemplates(customTemplates.value)
+  if (selectedTemplateId.value === template.id) selectedTemplateId.value = ''
+}
+
 async function submit(): Promise<void> {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
@@ -84,6 +169,43 @@ async function submit(): Promise<void> {
 
 <template>
   <div class="ip-page">
+    <div class="ip-panel">
+      <div class="ip-panel__title">
+        <span>迭代模板库</span>
+        <el-button size="small" :icon="'Collection'" @click="saveAsTemplate">将当前填写保存为模板</el-button>
+      </div>
+      <div class="ip-template-grid">
+        <button
+          v-for="template in allTemplates"
+          :key="template.id"
+          type="button"
+          class="ip-template"
+          :class="{ 'is-active': selectedTemplateId === template.id }"
+          @click="applyTemplate(template)"
+        >
+          <span class="ip-template__head">
+            <span class="ip-template__name">{{ template.name }}</span>
+            <el-tag size="small" effect="plain" :type="template.builtin ? 'info' : 'success'">
+              {{ template.builtin ? '内置' : '自定义' }}
+            </el-tag>
+          </span>
+          <span class="ip-template__desc">{{ template.description }}</span>
+          <span class="ip-template__meta">{{ template.devMemberCount }} 人 · 窗口 {{ template.windowDays }} 天</span>
+          <el-icon
+            v-if="!template.builtin"
+            class="ip-template__del"
+            title="删除该模板"
+            @click.stop="removeTemplate(template)"
+          >
+            <Delete />
+          </el-icon>
+        </button>
+      </div>
+      <p class="ip-muted" style="margin: 10px 0 0">
+        模板只预置「需求文本 + 迭代窗口 + 开发人数」，任务拆解与依赖仍由引擎的规划流水线生成，模板不介入任何算法口径。
+      </p>
+    </div>
+
     <div class="ip-grid ip-grid--2">
       <div class="ip-panel">
         <div class="ip-panel__title">需求与迭代约束</div>
@@ -169,5 +291,73 @@ async function submit(): Promise<void> {
   line-height: 1.9;
   font-size: 13px;
   color: var(--ip-text-secondary);
+}
+
+.ip-template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+.ip-template {
+  position: relative;
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid var(--ip-border);
+  border-radius: var(--ip-radius);
+  background: var(--ip-surface);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.ip-template:hover {
+  border-color: var(--ip-brand);
+  background: var(--ip-surface-sunk);
+}
+
+.ip-template.is-active {
+  border-color: var(--ip-brand);
+  box-shadow: inset 0 0 0 1px var(--ip-brand);
+}
+
+.ip-template__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-right: 16px;
+}
+
+.ip-template__name {
+  font-family: var(--ip-font-display);
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--ip-text);
+}
+
+.ip-template__desc {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ip-text-secondary);
+}
+
+.ip-template__meta {
+  font-family: var(--ip-font-mono);
+  font-size: 11px;
+  color: var(--ip-text-muted);
+}
+
+.ip-template__del {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 14px;
+  color: var(--ip-text-muted);
+}
+
+.ip-template__del:hover {
+  color: var(--ip-danger);
 }
 </style>

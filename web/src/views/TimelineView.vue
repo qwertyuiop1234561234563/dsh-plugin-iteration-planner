@@ -176,7 +176,7 @@ watch(planId, load)
   margin-top: 6px;
   font-size: 12px;
   color: var(--ip-danger);
-  background: #fff5f5;
+  background: color-mix(in srgb, var(--ip-danger) 10%, transparent);
   border-radius: 6px;
   padding: 6px 10px;
 }

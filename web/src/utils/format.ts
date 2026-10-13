@@ -66,6 +66,22 @@ export const STATUS_TAG: Record<TaskStatus, TagType> = {
   DELAYED: 'danger',
 }
 
+/** 任务状态色（累积流图 / 仪表盘堆叠图，与标签样式同源） */
+export const STATUS_COLOR: Record<TaskStatus, string> = {
+  TODO: '#b3c9d8',
+  IN_PROGRESS: '#0e6ba8',
+  BLOCKED: '#d64545',
+  TESTING: '#e08b1a',
+  DONE: '#2f9e6b',
+  DELAYED: '#8b5cf6',
+}
+
+/**
+ * 累积流图工作流顺序（自下而上堆叠）：
+ * 已完成为底、待办为顶，顶部带宽随进度收窄，符合累积流图的常规划读法。
+ */
+export const STATUS_FLOW_ORDER: TaskStatus[] = ['DONE', 'TESTING', 'IN_PROGRESS', 'BLOCKED', 'DELAYED', 'TODO']
+
 /** 优先级标签样式 */
 export const PRIORITY_TAG: Record<Priority, TagType> = {
   P0: 'danger',
@@ -92,6 +108,20 @@ export const RISK_TAG: Record<RiskLevel, TagType> = {
 export function formatTime(timestamp: number): string {
   if (!timestamp) return '—'
   return new Date(timestamp).toLocaleString('zh-CN', { hour12: false })
+}
+
+/** 时间戳 → 相对时间（通知中心 / 时间线用） */
+export function relativeTime(timestamp: number, now = Date.now()): string {
+  const diff = now - timestamp
+  if (diff < 0) return '刚刚'
+  const minute = 60_000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (diff < minute) return '刚刚'
+  if (diff < hour) return `${Math.floor(diff / minute)} 分钟前`
+  if (diff < day) return `${Math.floor(diff / hour)} 小时前`
+  if (diff < 30 * day) return `${Math.floor(diff / day)} 天前`
+  return new Date(timestamp).toLocaleDateString('zh-CN')
 }
 
 /** ISO 字符串 → 本地时间字符串 */

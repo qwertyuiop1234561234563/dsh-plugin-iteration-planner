@@ -72,7 +72,7 @@ const ordered = computed(() => {
 }
 
 .ip-risk {
-  background: #fafbfc;
+  background: var(--ip-surface-sunk);
   border: 1px solid var(--ip-border);
   border-radius: 8px;
   padding: 10px 12px;

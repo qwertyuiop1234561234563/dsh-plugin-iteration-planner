@@ -11,6 +11,7 @@ import { ElMessage } from 'element-plus'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiClientError, api, resolveWsUrl } from '@/api/client'
+import { useNotifyStore } from '@/stores/notify'
 import type {
   AdviceResult,
   AgentHealth,
@@ -27,6 +28,7 @@ import type {
   ScenarioConstraints,
   TaskDraftPayload,
   TaskUpdatePayload,
+  UpdatableField,
 } from '@/api/types'
 
 /** WebSocket 连接状态 */
@@ -39,6 +41,15 @@ export function errorText(error: unknown): string {
 }
 
 export const usePlanStore = defineStore('plan', () => {
+  /** 通知中心：把平台级事件沉淀为可追溯的「人读摘要」 */
+  const notify = useNotifyStore()
+
+  /**
+   * 本地写操作时间戳：引擎在任何写操作后都会广播 `plan.updated`，
+   * 用它抑制「自己触发的变更」被回灌成外部通知，避免重复提示。
+   */
+  let lastWriteAt = 0
+
   /* --------------------------------- 状态 -------------------------------- */
 
   const summaries = ref<PlanSummary[]>([])
@@ -57,6 +68,12 @@ export const usePlanStore = defineStore('plan', () => {
   const adviceLoading = ref(false)
   const scenarioLoading = ref(false)
   const wsStatus = ref<WsStatus>('closed')
+
+  /** 开始一次本地写操作：置忙并记录时间戳（供 WebSocket 通知去重） */
+  function beginWrite(): void {
+    mutating.value = true
+    lastWriteAt = Date.now()
+  }
 
   /** 当前计划 ID */
   const currentPlanId = computed(() => plan.value?.planId ?? '')
@@ -247,10 +264,16 @@ export const usePlanStore = defineStore('plan', () => {
   /* -------------------------------- 写操作 ------------------------------- */
 
   async function createPlan(payload: CreatePlanPayload): Promise<ProjectPlan | null> {
-    mutating.value = true
+    beginWrite()
     try {
       const created = await api.createPlan(payload)
       ElMessage.success(`计划已生成：共 ${created.taskList.length} 个任务`)
+      notify.push({
+        level: created.riskList.length > 0 ? 'warning' : 'success',
+        title: '迭代计划已生成',
+        detail: `${created.taskList.length} 个任务 · 关键工期 ${created.totalDurationHours}h · 风险 ${created.riskList.length} 条`,
+        planId: created.planId,
+      })
       await loadPlans()
       return created
     } catch (error) {
@@ -263,8 +286,10 @@ export const usePlanStore = defineStore('plan', () => {
 
   async function removePlan(planId: string): Promise<void> {
     try {
+      lastWriteAt = Date.now()
       await api.deletePlan(planId)
       ElMessage.success('计划已删除')
+      notify.push({ level: 'info', title: '计划已删除', detail: `planId：${planId}` })
       if (plan.value?.planId === planId) plan.value = null
       await loadPlans()
     } catch (error) {
@@ -274,10 +299,16 @@ export const usePlanStore = defineStore('plan', () => {
 
   async function replan(payload: ReplanPayload): Promise<void> {
     if (!plan.value) return
-    mutating.value = true
+    beginWrite()
     try {
       plan.value = await api.replan(plan.value.planId, payload)
       ElMessage.success(`重规划完成：总工期 ${plan.value.totalDurationHours}h，风险 ${plan.value.riskList.length} 条`)
+      notify.push({
+        level: plan.value.riskList.some((risk) => risk.level === 'HIGH') ? 'warning' : 'success',
+        title: '计划已重新规划',
+        detail: `关键工期 ${plan.value.totalDurationHours}h · 风险 ${plan.value.riskList.length} 条`,
+        planId: plan.value.planId,
+      })
       await refreshCurrent()
       await loadPlans()
     } catch (error) {
@@ -289,11 +320,12 @@ export const usePlanStore = defineStore('plan', () => {
 
   async function addTask(draft: TaskDraftPayload): Promise<boolean> {
     if (!plan.value) return false
-    mutating.value = true
+    beginWrite()
     try {
       const result = await api.addTask(plan.value.planId, draft)
       plan.value = result.plan
       ElMessage.success(`已新增任务：${result.task.taskName}`)
+      notify.push({ level: 'success', title: '已新增任务', detail: result.task.taskName, planId: result.plan.planId })
       await refreshCurrent()
       return true
     } catch (error) {
@@ -306,11 +338,17 @@ export const usePlanStore = defineStore('plan', () => {
 
   async function updateTask(taskId: string, payload: TaskUpdatePayload): Promise<boolean> {
     if (!plan.value) return false
-    mutating.value = true
+    beginWrite()
     try {
       const result = await api.updateTask(plan.value.planId, taskId, payload)
       plan.value = result.plan
       ElMessage.success('任务已更新，计划已重新规划')
+      notify.push({
+        level: 'success',
+        title: '任务已更新',
+        detail: `${result.task.taskName} · ${payload.updateField}`,
+        planId: result.plan.planId,
+      })
       await refreshCurrent()
       return true
     } catch (error) {
@@ -326,13 +364,72 @@ export const usePlanStore = defineStore('plan', () => {
     }
   }
 
+  /**
+   * 批量编辑任务（复用引擎单任务接口，不在 Python/前端复刻任何重规划逻辑）。
+   *
+   * 契约：编辑「同一字段、不同任务」为一批，串行提交以规避并发写冲突；
+   * 引擎在每次 task_update 后执行其标准全量重规划，前端只在全部提交完成后
+   * 统一刷新一次视图，并只产生一条通知，避免批量操作刷屏。
+   */
+  async function batchUpdateTasks(
+    taskIds: string[],
+    field: UpdatableField,
+    value: unknown,
+  ): Promise<{ ok: number; failed: number; error?: string }> {
+    if (!plan.value || taskIds.length === 0) return { ok: 0, failed: 0 }
+    const planId = plan.value.planId
+    beginWrite()
+    let ok = 0
+    let failed = 0
+    let firstError: string | undefined
+    try {
+      for (const taskId of taskIds) {
+        try {
+          await api.updateTask(planId, taskId, { updateField: field, newValue: value })
+          ok += 1
+        } catch (error) {
+          failed += 1
+          // 循环依赖会阻断后续重规划，继续提交没有意义：立即中止并保留已生效部分
+          if (error instanceof ApiClientError && error.code === 'CYCLE_DEPENDENCY') {
+            firstError = `检测到循环依赖，已中止批量编辑：${error.message}`
+            break
+          }
+          firstError ??= errorText(error)
+        }
+      }
+      await refreshCurrent()
+      await loadPlans()
+      if (failed === 0) {
+        ElMessage.success(`批量编辑完成：${ok} 个任务已更新`)
+        notify.push({
+          level: 'success',
+          title: '批量编辑完成',
+          detail: `${ok} 个任务 · 字段 ${field}`,
+          planId,
+        })
+      } else {
+        ElMessage.warning(`批量编辑部分失败：成功 ${ok} 个，失败 ${failed} 个`)
+        notify.push({
+          level: 'warning',
+          title: '批量编辑部分失败',
+          detail: `成功 ${ok} 个 · 失败 ${failed} 个 · ${firstError ?? ''}`,
+          planId,
+        })
+      }
+      return { ok, failed, error: firstError }
+    } finally {
+      mutating.value = false
+    }
+  }
+
   async function deleteTask(taskId: string): Promise<boolean> {
     if (!plan.value) return false
-    mutating.value = true
+    beginWrite()
     try {
       const result = await api.deleteTask(plan.value.planId, taskId)
       plan.value = result.plan
       ElMessage.success('任务已删除，引用已同步清理')
+      notify.push({ level: 'warning', title: '任务已删除', detail: taskId, planId: result.plan.planId })
       await refreshCurrent()
       return true
     } catch (error) {
@@ -414,15 +511,41 @@ export const usePlanStore = defineStore('plan', () => {
     }
     if (message.type === 'connected' || !message.planId) return
 
+    // 本地写操作触发的广播（2s 内）不回灌成通知，避免与本地提示重复
+    const fromOtherSession = Date.now() - lastWriteAt > 2000
+
     // 列表摘要始终刷新；若事件命中当前计划，则同步刷新详情
     const isCurrent = plan.value?.planId === message.planId
     if (message.type === 'plan.deleted') {
+      if (fromOtherSession) {
+        notify.push({
+          level: 'warning',
+          title: '计划已被其他会话删除',
+          detail: message.planId,
+        })
+      }
       if (isCurrent) plan.value = null
       await loadPlans()
       return
     }
+    if (message.type === 'plan.created' && fromOtherSession) {
+      notify.push({
+        level: 'info',
+        title: '其他会话创建了新计划',
+        detail: message.plan?.rawRequirement ?? message.planId,
+        planId: message.planId,
+      })
+    }
     if (isCurrent && message.plan) {
       plan.value = message.plan
+      if (fromOtherSession) {
+        notify.push({
+          level: 'info',
+          title: '当前计划已被其他会话更新',
+          detail: `触发动作：${message.reason ?? 'unknown'}`,
+          planId: message.planId,
+        })
+      }
       try {
         graph.value = await api.graph(message.planId)
       } catch {
@@ -473,6 +596,7 @@ export const usePlanStore = defineStore('plan', () => {
     replan,
     addTask,
     updateTask,
+    batchUpdateTasks,
     deleteTask,
     downloadReport,
     connect,

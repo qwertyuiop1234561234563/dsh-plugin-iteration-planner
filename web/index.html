@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>研发迭代规划控制台 · Iteration Planner</title>
     <meta name="description" content="企业级研发迭代规划智能 Agent 控制台：任务拆解、依赖 DAG、AOE 关键路径、风险识别与燃尽图" />
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#0a2236" />
     <!-- 首屏底色：与设计令牌 --ip-paper 一致，避免脚本与样式加载前出现白闪 -->
     <style>
@@ -14,7 +14,27 @@
         margin: 0;
         background-color: #eaeff4;
       }
+      /* 深色主题首屏底色（脚本未执行前即生效，避免主题闪烁） */
+      html[data-theme='dark'],
+      html[data-theme='dark'] body {
+        background-color: #071726;
+      }
     </style>
+    <script>
+      // 在应用挂载前同步主题，避免深色首屏出现浅色闪烁
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('iteration-planner:theme')
+          if (stored !== 'dark' && stored !== 'light') {
+            stored = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+          }
+          document.documentElement.dataset.theme = stored
+          document.documentElement.style.colorScheme = stored
+        } catch (error) {
+          document.documentElement.dataset.theme = 'light'
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

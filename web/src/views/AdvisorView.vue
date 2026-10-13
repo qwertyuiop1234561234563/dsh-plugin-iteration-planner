@@ -193,7 +193,7 @@ onMounted(() => {
 .ip-advisor-item__suggest {
   font-size: 13px;
   line-height: 1.7;
-  background: #f7f9fc;
+  background: var(--ip-surface-sunk);
   border-radius: 6px;
   padding: 8px 12px;
 }
