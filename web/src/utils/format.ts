@@ -4,7 +4,16 @@
  * 所有枚举 → 文案 / 颜色的映射集中在此，避免散落在各组件中（与后端「枚举统一管理」的规范对齐）。
  */
 
-import type { Priority, RiskLevel, TaskStatus, TaskType } from '@/api/types'
+import type {
+  IssueProbability,
+  IssueSeverity,
+  IssueStatus,
+  Priority,
+  RiskLevel,
+  TaskStatus,
+  TaskType,
+  UpdatableField,
+} from '@/api/types'
 
 /** Element Plus 标签样式类型 */
 export type TagType = 'primary' | 'success' | 'info' | 'warning' | 'danger'
@@ -139,4 +148,111 @@ export function hoursToWorkDays(hours: number): string {
 /** 需求文本截断，用于列表展示 */
 export function truncate(text: string, max = 48): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+/* ------------------------------ 治理层枚举映射 ------------------------------ */
+
+/** 审计动作 → 可读文案（未知动作回退为原始 action；时间线 / 变更历史共用） */
+export const AUDIT_ACTION_LABEL: Record<string, string> = {
+  plan_iteration: '完整规划流水线',
+  task_decompose: '需求拆解',
+  'task_decompose.degrade': '需求拆解降级（规则兜底）',
+  replan_all: '全量重规划',
+  task_add: '新增任务',
+  task_update: '修改任务',
+  task_delete: '删除任务',
+  risk_scan: '风险扫描',
+  'risk_scan.degrade': '风险扫描降级（规则兜底）',
+  'dag_check.dangling': '悬空依赖提示',
+  report_generate: '生成报表',
+  'api.startup': '服务启动',
+}
+
+/** 审计动作文案（集中映射，避免各页面重复维护） */
+export function auditActionLabel(action: string): string {
+  return AUDIT_ACTION_LABEL[action] ?? action
+}
+
+/**
+ * Agent 工具名 → 可读文案。
+ *
+ * 与后端 `python/app/agent/schemas.py` 的 `TOOL_ACTION_LABELS` 保持同一口径，
+ * 供工具调用记录（dot 过程展示）与待确认动作卡片使用。
+ */
+export const AGENT_TOOL_LABEL: Record<string, string> = {
+  plan_iteration: '生成新计划',
+  replan_all: '全量重规划',
+  get_plan: '读取计划',
+  list_plans: '列出计划',
+  task_add: '新增任务',
+  task_update: '修改任务',
+  task_delete: '删除任务',
+  dag_build: '构建 DAG 视图',
+  dag_check: '拓扑校验',
+  schedule_calc: '关键路径计算',
+  risk_scan: '风险扫描',
+  report_generate: '生成报表',
+}
+
+/** Agent 工具文案（未知工具回退为原始工具名） */
+export function agentToolLabel(tool: string): string {
+  return AGENT_TOOL_LABEL[tool] ?? tool
+}
+
+/** 任务可更新字段 → 文案（变更历史 / 批量编辑共用） */
+export const UPDATABLE_FIELD_LABEL: Record<UpdatableField, string> = {
+  estimatedHours: '预估工时',
+  predecessorTaskIds: '前置任务',
+  status: '状态',
+  priority: '优先级',
+  assignee: '责任人',
+}
+
+/** 人工风险严重度文案 */
+export const ISSUE_SEVERITY_LABEL: Record<IssueSeverity, string> = {
+  LOW: '低',
+  MEDIUM: '中',
+  HIGH: '高',
+  CRITICAL: '严重',
+}
+
+/** 人工风险严重度标签样式 */
+export const ISSUE_SEVERITY_TAG: Record<IssueSeverity, TagType> = {
+  LOW: 'info',
+  MEDIUM: 'warning',
+  HIGH: 'danger',
+  CRITICAL: 'danger',
+}
+
+/** 人工风险严重度配色（质量看板图表用） */
+export const ISSUE_SEVERITY_COLOR: Record<IssueSeverity, string> = {
+  LOW: '#6b8296',
+  MEDIUM: '#e08b1a',
+  HIGH: '#d64545',
+  CRITICAL: '#8b5cf6',
+}
+
+/** 人工风险发生概率文案 */
+export const ISSUE_PROBABILITY_LABEL: Record<IssueProbability, string> = {
+  LOW: '低',
+  MEDIUM: '中',
+  HIGH: '高',
+}
+
+/** 人工风险处置状态文案 */
+export const ISSUE_STATUS_LABEL: Record<IssueStatus, string> = {
+  OPEN: '待处理',
+  MITIGATING: '缓解中',
+  MONITORING: '监控中',
+  CLOSED: '已关闭',
+  ACCEPTED: '已接受',
+}
+
+/** 人工风险处置状态标签样式 */
+export const ISSUE_STATUS_TAG: Record<IssueStatus, TagType> = {
+  OPEN: 'danger',
+  MITIGATING: 'warning',
+  MONITORING: 'primary',
+  CLOSED: 'success',
+  ACCEPTED: 'info',
 }

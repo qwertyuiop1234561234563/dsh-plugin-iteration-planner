@@ -16,6 +16,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { PRIORITY_VALUES, TASK_STATUS_VALUES } from '@/api/types'
 import type { ProjectPlan, Task, UpdatableField } from '@/api/types'
 import TaskEditDialog from '@/components/TaskEditDialog.vue'
+import TaskHistoryDrawer from '@/components/TaskHistoryDrawer.vue'
 import { usePlanStore } from '@/stores/plan'
 import { detectMilestones } from '@/utils/analytics'
 import { exportCsv, fileStamp } from '@/utils/export'
@@ -270,6 +271,17 @@ async function confirmRemove(task: Task): Promise<void> {
   await store.deleteTask(task.taskId)
 }
 
+/* ------------------------------- 变更历史 ------------------------------ */
+
+const historyVisible = ref(false)
+const historyTask = ref<Task | null>(null)
+
+/** 打开任务变更历史抽屉（数据由服务端从审计重建） */
+function openHistory(task: Task): void {
+  historyTask.value = task
+  historyVisible.value = true
+}
+
 /* ------------------------------- 定位高亮 ------------------------------ */
 
 const focusTaskId = ref('')
@@ -465,9 +477,10 @@ function clearFocus(): void {
           <el-table-column label="责任人" width="110">
             <template #default="{ row }">{{ row.assignee || '—' }}</template>
           </el-table-column>
-          <el-table-column label="操作" width="130" fixed="right">
+          <el-table-column label="操作" width="176" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+              <el-button link size="small" @click="openHistory(row)">历史</el-button>
               <el-button link type="danger" size="small" @click="confirmRemove(row)">删除</el-button>
             </template>
           </el-table-column>
@@ -475,6 +488,12 @@ function clearFocus(): void {
       </div>
 
       <TaskEditDialog v-model="dialogVisible" :plan="plan" :task="editingTask" />
+      <TaskHistoryDrawer
+        v-model="historyVisible"
+        :plan-id="plan.planId"
+        :task-id="historyTask?.taskId ?? ''"
+        :task-name="historyTask?.taskName"
+      />
 
       <!-- 批量编辑 -->
       <el-dialog v-model="batchVisible" title="批量编辑任务" width="460px">

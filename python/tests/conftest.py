@@ -96,6 +96,19 @@ def _engine_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(204)
     if path == "/api/plans/p1" and method == "GET":
         return httpx.Response(200, json={"data": PLAN_JSON})
+    if path == "/api/plans/p1/replan" and method == "POST":
+        return httpx.Response(200, json={"data": {**PLAN_JSON, "devMemberCount": 5}})
+    if path == "/api/plans/p1/critical-path" and method == "GET":
+        return httpx.Response(200, json={"data": {"criticalPath": ["t1"], "totalDurationHours": 8}})
+    if path == "/api/plans/p1/tasks/t1" and method == "PATCH":
+        try:
+            body = json.loads(request.content.decode() or "{}")
+        except ValueError:
+            body = {}
+        task = {**PLAN_JSON["taskList"][0], body.get("updateField", "status"): body.get("newValue")}
+        return httpx.Response(200, json={"data": {"task": task, "plan": PLAN_JSON}})
+    if path == "/api/plans/p1/tasks/t1" and method == "DELETE":
+        return httpx.Response(200, json={"data": {"plan": PLAN_JSON}})
     if path == "/api/plans/cycle/replan":
         return httpx.Response(409, json={"code": "CYCLE_DEPENDENCY", "message": "存在循环依赖", "details": {"cycleNodes": ["a", "b"]}})
     if path == "/api/plans/p1/risks" and method == "GET":

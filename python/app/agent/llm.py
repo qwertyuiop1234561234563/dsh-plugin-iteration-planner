@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from ..errors import ApiError, bad_gateway
+from ..errors import ApiError, llm_gateway_error
 from ..metrics import METRICS
 from ..resilience import RetryPolicy, is_retryable_exception
 
@@ -106,7 +106,7 @@ class OpenAiCompatibleClient:
                     retry_index += 1
                     continue
                 METRICS.inc_counter("llm_requests_total", {"outcome": "unreachable"})
-                raise bad_gateway(f"LLM 网关不可达：{exc}") from exc
+                raise llm_gateway_error(f"LLM 网关不可达：{exc}") from exc
 
             # 429（限流）与 5xx 属于可恢复的上游压力，允许重试
             if response.status_code in (429, 502, 503, 504) and retry_index < self._retry.attempts:
@@ -117,9 +117,7 @@ class OpenAiCompatibleClient:
 
             if response.status_code >= 400:
                 METRICS.inc_counter("llm_requests_total", {"outcome": "error"})
-                raise ApiError(
-                    502,
-                    "LLM_GATEWAY_ERROR",
+                raise llm_gateway_error(
                     f"LLM 网关返回异常状态：{response.status_code}",
                     response.text[:1000],
                 )

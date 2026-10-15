@@ -64,4 +64,20 @@ def wrap_untrusted(text: str) -> str:
     )
 
 
-__all__ = ["sanitize_user_input", "wrap_untrusted"]
+#: 计划 ID 合法字符集（引擎生成短十六进制串；仅接受字母数字与 ``-`` / ``_``）
+_PLAN_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def sanitize_plan_id(value: str | None) -> str | None:
+    """校验前端上报的「当前计划」ID；非法输入返回 ``None``（视为未指定）。
+
+    该值会被当作**可信上下文**拼入指令（不在用户数据边界内），因此必须做白名单校验，
+    避免经由该字段注入任意指令文本。
+    """
+    if not value:
+        return None
+    candidate = value.strip()
+    return candidate if _PLAN_ID.match(candidate) else None
+
+
+__all__ = ["sanitize_user_input", "wrap_untrusted", "sanitize_plan_id"]

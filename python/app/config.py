@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     #: 前端构建产物目录；存在则同域托管 SPA（history 路由回落 index.html）
     web_static_dir: str = ""
 
+    # ------------------------------ 工作区存储 ------------------------------
+    #: 治理数据（基线快照 / 人工风险登记册 / 配置备份）存储文件路径；
+    #: 为空则使用 ``app.constants.default_store_path()``（``python/.data/workspace-store.json``）
+    workspace_store_path: str = ""
+
     # ------------------------------ Agent 参数 ------------------------------
     #: function calling 循环的最大步数（防止模型死循环调用工具）
     agent_max_steps: int = 8

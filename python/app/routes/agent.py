@@ -11,10 +11,18 @@ import uuid
 from fastapi import APIRouter, Request
 
 from ..agent.advisor import generate_advice
-from ..agent.sanitize import sanitize_user_input
-from ..agent.schemas import TOOL_NAMES, TOOL_SPECS
+from ..agent.sanitize import sanitize_plan_id, sanitize_user_input
+from ..agent.schemas import TOOL_NAMES, TOOL_SPECS, WRITE_TOOL_NAMES
 from ..errors import llm_unavailable, not_found
-from ..models import AdviceRequest, AgentChatRequest, AgentChatResponse, AgentPlanRequest, AgentRunResult
+from ..models import (
+    AdviceRequest,
+    AgentChatRequest,
+    AgentChatResponse,
+    AgentConfirmRequest,
+    AgentConfirmResponse,
+    AgentPlanRequest,
+    AgentRunResult,
+)
 from ..state import AppContext
 
 
@@ -35,6 +43,8 @@ def build_agent_router(base: str) -> APIRouter:
                 "enabled": ctx.runner.available,
                 "llm": ctx.settings.llm_model or None,
                 "tools": TOOL_NAMES,
+                # 写类工具清单：前端据此向用户明示「哪些操作需要确认」
+                "writeTools": list(WRITE_TOOL_NAMES),
             }
         }
 
@@ -59,8 +69,30 @@ def build_agent_router(base: str) -> APIRouter:
         ctx: AppContext = request.app.state.ctx
         runner = _require_agent(ctx)
         session_id = payload.sessionId or uuid.uuid4().hex[:16]
-        result: AgentRunResult = await runner.run_chat(session_id, sanitize_user_input(payload.message))
+        result: AgentRunResult = await runner.run_chat(
+            session_id,
+            sanitize_user_input(payload.message),
+            defer_writes=payload.deferWrites,
+            plan_id=sanitize_plan_id(payload.planId),
+        )
         response = AgentChatResponse(sessionId=session_id, **result.model_dump())
+        return {"data": response.model_dump()}
+
+    @router.post("/confirm", summary="确认执行待确认的写操作（两阶段写操作的第二步）")
+    async def agent_confirm(payload: AgentConfirmRequest, request: Request) -> dict:
+        ctx: AppContext = request.app.state.ctx
+        # 确认执行只依赖引擎（写操作本身），不依赖 LLM：即使模型网关不可用，已登记的
+        # 动作仍应允许用户确认落库（例如模型网关中途故障）。
+        executed, remaining, plan_id = await ctx.runner.confirm_actions(
+            payload.sessionId, payload.actionIds, reject=payload.reject
+        )
+        response = AgentConfirmResponse(
+            sessionId=payload.sessionId,
+            planId=plan_id,
+            executed=executed,
+            remainingActions=remaining,
+            rejected=payload.reject,
+        )
         return {"data": response.model_dump()}
 
     @router.post("/advise", summary="基于引擎风险清单生成缓解建议（LLM 优先，缺失则规则模式）")

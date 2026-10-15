@@ -12,12 +12,17 @@ import { createRouter, createWebHistory } from 'vue-router'
 import DefaultLayout from '@/layouts/DefaultLayout.vue'
 import AdvisorView from '@/views/AdvisorView.vue'
 import AuditView from '@/views/AuditView.vue'
+import BaselineView from '@/views/BaselineView.vue'
+import BurndownAnalysisView from '@/views/BurndownAnalysisView.vue'
 import CalendarView from '@/views/CalendarView.vue'
 import DagView from '@/views/DagView.vue'
 import DashboardView from '@/views/DashboardView.vue'
 import FlowView from '@/views/FlowView.vue'
 import GanttView from '@/views/GanttView.vue'
 import KanbanView from '@/views/KanbanView.vue'
+import QualityView from '@/views/QualityView.vue'
+import RiskRegisterView from '@/views/RiskRegisterView.vue'
+import WorkloadView from '@/views/WorkloadView.vue'
 import PlanCreateView from '@/views/PlanCreateView.vue'
 import PlanListView from '@/views/PlanListView.vue'
 import PlanOverviewView from '@/views/PlanOverviewView.vue'
@@ -90,6 +95,12 @@ const router = createRouter({
           meta: { title: '任务日历', sheet: 'B-06' },
         },
         {
+          path: 'plans/:planId/baseline',
+          name: 'plan-baseline',
+          component: BaselineView,
+          meta: { title: '基线快照与偏差', sheet: 'B-07' },
+        },
+        {
           path: 'plans/:planId/dashboard',
           name: 'plan-dashboard',
           component: DashboardView,
@@ -118,6 +129,30 @@ const router = createRouter({
           name: 'plan-whatif',
           component: WhatIfView,
           meta: { title: 'What-if 情景对比', sheet: 'C-05' },
+        },
+        {
+          path: 'plans/:planId/workload',
+          name: 'plan-workload',
+          component: WorkloadView,
+          meta: { title: '人员负荷与资源平衡', sheet: 'C-06' },
+        },
+        {
+          path: 'plans/:planId/burndown',
+          name: 'plan-burndown',
+          component: BurndownAnalysisView,
+          meta: { title: '燃尽增强分析', sheet: 'C-07' },
+        },
+        {
+          path: 'plans/:planId/quality',
+          name: 'plan-quality',
+          component: QualityView,
+          meta: { title: '交付质量看板', sheet: 'C-08' },
+        },
+        {
+          path: 'plans/:planId/registers',
+          name: 'plan-registers',
+          component: RiskRegisterView,
+          meta: { title: '风险登记册', sheet: 'C-09' },
         },
         {
           path: 'plans/:planId/print',

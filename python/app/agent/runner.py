@@ -8,7 +8,11 @@
 - 单次工具失败不会中断整轮编排，而是把错误作为工具结果回填，让模型自行纠偏；
 - 同一条 assistant 消息中的多个 ``tool_calls`` **并行执行**（``asyncio.gather``，保持原序回填）；
 - 上下文预算超限时自动裁剪**最旧的用户回合**，保证当前请求与系统提示始终完整；
-- 会话历史经 :class:`SessionStore` 持久化（默认内存 + TTL，可切 Redis），同会话串行化。
+- 会话历史经 :class:`SessionStore` 持久化（默认内存 + TTL，可切 Redis），同会话串行化；
+- **写操作两阶段**：写类工具（``plan_iteration`` / ``replan_all`` / ``task_add`` /
+  ``task_update`` / ``task_delete``）不在编排循环内直接执行，而是登记为
+  :class:`PendingAction` 返回前端；用户确认后经 :meth:`AgentRunner.confirm_actions`
+  统一落库（只读工具仍在循环内即时执行，保证问答与排查可正常进行）。
 """
 
 from __future__ import annotations
@@ -16,16 +20,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any
 
-from ..errors import ApiError, llm_unavailable
+from ..errors import ApiError, bad_request, llm_unavailable, not_found
 from ..metrics import METRICS
-from ..models import AgentRunResult, ToolCallRecord
+from ..models import AgentRunResult, PendingAction, ToolCallRecord
 from ..sessions import InMemorySessionStore, SessionStore
 from .llm import LlmClient
-from .prompts import ITERATION_PLANNER_SYSTEM_PROMPT, build_plan_instruction
-from .sanitize import wrap_untrusted
-from .schemas import TOOL_SPECS
+from .prompts import ITERATION_PLANNER_SYSTEM_PROMPT, build_chat_instruction, build_plan_instruction
+from .schemas import TOOL_SPECS, WRITE_TOOLS, describe_action
 from .tools import ToolDispatcher
 
 logger = logging.getLogger("iteration_planner.agent")
@@ -128,12 +132,27 @@ class AgentRunner:
         messages = self._base_messages() + [{"role": "user", "content": instruction}]
         return await self._loop(messages)
 
-    async def run_chat(self, session_id: str, message: str) -> AgentRunResult:
-        """会话式对话：携带历史上下文继续编排（同会话串行化）。"""
+    async def run_chat(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        defer_writes: bool = True,
+        plan_id: str | None = None,
+    ) -> AgentRunResult:
+        """会话式对话：携带历史上下文继续编排（同会话串行化）。
+
+        ``defer_writes`` 为真时，本轮识别到的写操作不会立即执行，而是随结果返回
+        待确认动作；同时**覆盖式**刷新该会话的待确认槽位（新一轮对话会作废上一轮
+        未确认的动作，避免陈旧提案被误执行）。
+
+        ``plan_id`` 为前端上报的「当前计划」，以可信上下文注入本轮指令。
+        """
         async with self._store.lock(session_id):
             history = await self._store.get(session_id) or []
-            messages = self._base_messages() + history + [{"role": "user", "content": wrap_untrusted(message)}]
-            result = await self._loop(messages)
+            instruction = build_chat_instruction(message, plan_id)
+            messages = self._base_messages() + history + [{"role": "user", "content": instruction}]
+            result = await self._loop(messages, defer_writes=defer_writes)
 
             # 仅保留「用户 / 最终助手」两条，工具中间态不入历史，控制上下文体积
             # 历史存原始（已消毒）文本，边界标记仅用于本回合送入模型的即时输入
@@ -142,10 +161,61 @@ class AgentRunner:
                 {"role": "assistant", "content": result.content},
             ]
             await self._store.set(session_id, updated)
+            if defer_writes:
+                await self._store.set_pending(session_id, [item.model_dump() for item in result.pendingActions])
             return result
 
+    async def confirm_actions(
+        self, session_id: str, action_ids: list[str] | None = None, *, reject: bool = False
+    ) -> tuple[list[ToolCallRecord], list[PendingAction], str | None]:
+        """执行（或驳回）待确认写操作（两阶段写操作的第二阶段）。
+
+        :param action_ids: 要执行的 ``actionId``；``None`` 表示确认全部
+        :param reject: 驳回模式——作废全部待确认动作、不执行任何写操作（会话上下文保留）
+        :return: ``(执行记录, 仍待确认的动作, 产生的计划 ID)``
+
+        逐个**串行**执行（每次写操作都会触发引擎全量重规划，串行可避免写冲突）；
+        单个动作失败不影响其余动作；未确认的动作保留在会话中，可再次确认。
+        """
+        async with self._store.lock(session_id):
+            stored = await self._store.get_pending(session_id) or []
+            pending = [PendingAction.model_validate(item) for item in stored if isinstance(item, dict)]
+
+            if reject:
+                # 驳回是幂等操作：即使当前没有待确认动作也返回成功语义
+                await self._store.set_pending(session_id, [])
+                METRICS.inc_counter("agent_confirm_total", {"outcome": "rejected"})
+                logger.info("用户驳回待确认写操作：会话 %s，作废 %d 项", session_id, len(pending))
+                return [], [], None
+
+            if not pending:
+                raise not_found("没有待确认的操作（可能已执行、已取消或会话已过期），请重新发起请求")
+
+            wanted = set(action_ids) if action_ids is not None else None
+            if wanted is not None:
+                unknown = sorted(wanted - {item.actionId for item in pending})
+                if unknown:
+                    raise bad_request(f"待确认动作不存在：{'、'.join(unknown[:5])}")
+            selected = [item for item in pending if wanted is None or item.actionId in wanted]
+            remaining = [item for item in pending if wanted is not None and item.actionId not in wanted]
+
+            records: list[ToolCallRecord] = []
+            plan_id: str | None = None
+            for item in selected:
+                record, produced = await self._execute_action(item)
+                records.append(record)
+                # 任务级写操作的结果信封里 planId 嵌套在 plan 下，回落到动作自身携带的 planId
+                plan_id = produced or item.planId or plan_id
+                if not record.ok:
+                    logger.warning("待确认动作执行失败：%s · %s", item.tool, record.error)
+
+            await self._store.set_pending(session_id, [item.model_dump() for item in remaining])
+            await self._append_execution_history(session_id, selected, records)
+            METRICS.inc_counter("agent_confirm_total", {"outcome": "executed" if records else "empty"})
+            return records, remaining, plan_id
+
     async def reset_session(self, session_id: str) -> bool:
-        """清空指定会话，返回是否存在。"""
+        """清空指定会话（含待确认动作），返回是否存在。"""
         return await self._store.pop(session_id)
 
     async def complete(self, messages: list[dict[str, Any]], *, temperature: float | None = None) -> str:
@@ -168,11 +238,12 @@ class AgentRunner:
     def _base_messages() -> list[dict[str, Any]]:
         return [{"role": "system", "content": ITERATION_PLANNER_SYSTEM_PROMPT}]
 
-    async def _loop(self, messages: list[dict[str, Any]]) -> AgentRunResult:
+    async def _loop(self, messages: list[dict[str, Any]], *, defer_writes: bool = False) -> AgentRunResult:
         if self._llm is None:
             raise llm_unavailable()
 
         records: list[ToolCallRecord] = []
+        pending: list[PendingAction] = []
         plan_id: str | None = None
 
         for step in range(1, self._max_steps + 1):
@@ -192,11 +263,31 @@ class AgentRunner:
                 )
 
             # 同一条消息内的多个工具调用并行执行，结果按原序回填（OpenAI 协议要求顺序一致）
-            outcomes = await asyncio.gather(*(self._run_tool_call(index, call) for index, call in enumerate(tool_calls)))
-            for record, tool_message, produced_plan_id in outcomes:
+            outcomes = await asyncio.gather(
+                *(self._run_tool_call(index, call, defer_writes) for index, call in enumerate(tool_calls))
+            )
+            for record, tool_message, produced_plan_id, pending_action in outcomes:
                 records.append(record)
                 plan_id = produced_plan_id or plan_id
-                messages.append(tool_message)
+                if tool_message is not None:
+                    messages.append(tool_message)
+                if pending_action is not None:
+                    pending.append(pending_action)
+
+            if pending:
+                # 出现写操作：本轮到此为止，交由用户确认后再落库（不继续消耗模型步数）
+                pending = _dedupe_pending(pending)
+                METRICS.observe("agent_steps", step, buckets=(1, 2, 3, 4, 5, 6, 8), help="Agent 收敛步数")
+                METRICS.inc_counter("agent_runs_total", {"outcome": "pending_confirmation"})
+                narrative = _content_to_text(message.get("content")).strip()
+                summary = _describe_pending(pending)
+                return AgentRunResult(
+                    content=f"{narrative}\n\n{summary}" if narrative else summary,
+                    planId=plan_id,
+                    toolCalls=records,
+                    steps=step,
+                    pendingActions=pending,
+                )
 
         METRICS.inc_counter("agent_runs_total", {"outcome": "max_steps"})
         raise ApiError(
@@ -230,13 +321,16 @@ class AgentRunner:
         return canonical
 
     async def _run_tool_call(
-        self, index: int, call: Any
-    ) -> tuple[ToolCallRecord, dict[str, Any], str | None]:
+        self, index: int, call: Any, defer_writes: bool = False
+    ) -> tuple[ToolCallRecord, dict[str, Any] | None, str | None, PendingAction | None]:
         """校验 + 执行单个工具调用（任何异常都以错误结果回填，绝不中断整轮编排）。
 
         并行执行（``asyncio.gather``）下，单个子任务抛出非预期异常会导致整批失败并中断
         Agent 循环，因此这里做**兜底捕获**：把任何意外错误降级为一条错误工具结果，
         交由模型自行纠偏。
+
+        返回 ``(记录, 回填消息, 产生的 planId, 待确认动作)``：当 ``defer_writes`` 为真且
+        命中写类工具时，不执行而是返回待确认动作（回填消息为 ``None``）。
         """
         call_id = f"call_{index}"
         name = ""
@@ -249,36 +343,69 @@ class AgentRunner:
             if not isinstance(function, dict):
                 raise ApiError(422, "LLM_FORMAT_ERROR", "工具调用缺少 function 定义")
             name = str(function.get("name") or "")
-            return await self._dispatch_validated(call_id, name, function.get("arguments"))
+            return await self._dispatch_validated(call_id, name, function.get("arguments"), defer_writes)
         except ApiError as exc:
-            return self._error_result(call_id, name, arguments, exc.code, exc.message)
+            record, tool_message = self._error_result(call_id, name, arguments, exc.code, exc.message)
+            return record, tool_message, None, None
         except Exception as exc:  # noqa: BLE001 - 兜底：任何意外错误都不应中断编排
             logger.exception("工具调用出现未预期异常：%s", name or "(未知)")
-            return self._error_result(call_id, name, arguments, "TOOL_EXECUTION_ERROR", f"工具执行异常：{exc}")
+            record, tool_message = self._error_result(
+                call_id, name, arguments, "TOOL_EXECUTION_ERROR", f"工具执行异常：{exc}"
+            )
+            return record, tool_message, None, None
 
     async def _dispatch_validated(
-        self, call_id: str, name: str, raw_arguments: Any
-    ) -> tuple[ToolCallRecord, dict[str, Any], str | None]:
-        """校验工具名与入参后执行。"""
+        self, call_id: str, name: str, raw_arguments: Any, defer_writes: bool
+    ) -> tuple[ToolCallRecord, dict[str, Any] | None, str | None, PendingAction | None]:
+        """校验工具名与入参后执行（或登记为待确认写操作）。"""
         arguments: dict[str, Any] = {}
         if name not in _TOOL_NAMES:
-            return self._error_result(call_id, name, arguments, "VALIDATION_ERROR", f"未知工具：{name or '(空)'}")
+            record, tool_message = self._error_result(
+                call_id, name, arguments, "VALIDATION_ERROR", f"未知工具：{name or '(空)'}"
+            )
+            return record, tool_message, None, None
         arguments = _parse_arguments(raw_arguments)
         missing = [key for key in _REQUIRED[name] if arguments.get(key) in (None, "")]
         if missing:
             message = f"工具 {name} 缺少必填参数：{', '.join(missing)}"
-            return self._error_result(call_id, name, arguments, "VALIDATION_ERROR", message)
-        return await self._execute(call_id, name, arguments)
+            record, tool_message = self._error_result(call_id, name, arguments, "VALIDATION_ERROR", message)
+            return record, tool_message, None, None
+        if defer_writes and name in WRITE_TOOLS:
+            return self._register_pending(name, arguments)
+        record, tool_message, plan_id = await self._execute(call_id, name, arguments)
+        return record, tool_message, plan_id, None
+
+    @staticmethod
+    def _register_pending(
+        name: str, arguments: dict[str, Any]
+    ) -> tuple[ToolCallRecord, None, None, PendingAction]:
+        """把写类工具登记为待确认动作（不触碰引擎）。"""
+        plan_ref = arguments.get("planId")
+        action = PendingAction(
+            actionId=f"act_{uuid.uuid4().hex[:12]}",
+            tool=name,
+            label=describe_action(name, arguments),
+            arguments=arguments,
+            planId=plan_ref if isinstance(plan_ref, str) and plan_ref else None,
+        )
+        METRICS.inc_counter("agent_tool_calls_total", {"tool": name, "ok": "deferred"})
+        record = ToolCallRecord(
+            name=name,
+            arguments=arguments,
+            ok=True,
+            result={"status": "PENDING_CONFIRMATION", "actionId": action.actionId},
+        )
+        return record, None, None, action
 
     @staticmethod
     def _error_result(
         call_id: str, name: str, arguments: dict[str, Any], code: str, message: str
-    ) -> tuple[ToolCallRecord, dict[str, Any], str | None]:
+    ) -> tuple[ToolCallRecord, dict[str, Any]]:
         """构造一条错误工具结果（回填给模型，供其纠偏）。"""
         METRICS.inc_counter("agent_tool_calls_total", {"tool": name or "unknown", "ok": "false"})
         record = ToolCallRecord(name=name, arguments=arguments, ok=False, error=message)
         payload = json.dumps({"error": code, "message": message}, ensure_ascii=False)
-        return record, {"role": "tool", "tool_call_id": call_id, "content": payload}, None
+        return record, {"role": "tool", "tool_call_id": call_id, "content": payload}
 
     async def _execute(
         self, call_id: str, name: str, arguments: dict[str, Any]
@@ -290,6 +417,61 @@ class AgentRunner:
         plan_id = result.get("planId") if isinstance(result, dict) else None
         payload = _dump(result)
         return record, {"role": "tool", "tool_call_id": call_id, "content": payload}, plan_id
+
+    async def _execute_action(self, action: PendingAction) -> tuple[ToolCallRecord, str | None]:
+        """执行单个已确认的写操作（失败降级为错误记录，不抛出）。"""
+        try:
+            result = await self._dispatcher.dispatch(action.tool, action.arguments)
+        except ApiError as exc:
+            METRICS.inc_counter("agent_tool_calls_total", {"tool": action.tool, "ok": "false"})
+            return ToolCallRecord(name=action.tool, arguments=action.arguments, ok=False, error=exc.message), None
+        except Exception as exc:  # noqa: BLE001 - 兜底：单个动作失败不应影响其余动作
+            logger.exception("待确认动作执行异常：%s", action.tool)
+            METRICS.inc_counter("agent_tool_calls_total", {"tool": action.tool, "ok": "false"})
+            return (
+                ToolCallRecord(name=action.tool, arguments=action.arguments, ok=False, error=f"工具执行异常：{exc}"),
+                None,
+            )
+        METRICS.inc_counter("agent_tool_calls_total", {"tool": action.tool, "ok": "true"})
+        plan_id = result.get("planId") if isinstance(result, dict) else None
+        return ToolCallRecord(name=action.tool, arguments=action.arguments, ok=True, result=result), plan_id
+
+    async def _append_execution_history(
+        self, session_id: str, selected: list[PendingAction], records: list[ToolCallRecord]
+    ) -> None:
+        """把确认执行的结果写入会话历史（供后续追问引用，历史只存可读摘要）。"""
+        if not records:
+            return
+        lines: list[str] = []
+        for item, record in zip(selected, records):
+            outcome = "已执行" if record.ok else f"失败（{record.error or '未知原因'}）"
+            lines.append(f"- {item.label}：{outcome}")
+        summary = "用户已确认并执行以下写操作：\n" + "\n".join(lines)
+        history = await self._store.get(session_id) or []
+        await self._store.set(session_id, history + [{"role": "assistant", "content": summary}])
+
+
+def _dedupe_pending(pending: list[PendingAction]) -> list[PendingAction]:
+    """同一轮内模型可能重复提交同一写操作，按「工具 + 入参」去重（保留首次出现）。"""
+    seen: set[str] = set()
+    unique: list[PendingAction] = []
+    for item in pending:
+        key = f"{item.tool}|{json.dumps(item.arguments, ensure_ascii=False, sort_keys=True, default=str)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _describe_pending(pending: list[PendingAction]) -> str:
+    """确定性生成「待确认」摘要文本（不依赖模型输出，保证降级场景下也可读）。"""
+    lines = [f"{index}. {item.label}" for index, item in enumerate(pending, start=1)]
+    return (
+        f"本次拟执行以下 {len(pending)} 项写操作，**需您确认后才会真正落库**：\n"
+        + "\n".join(lines)
+        + "\n\n点击确认后我将立即执行，并由算法引擎完成全量重规划。"
+    )
 
 
 def _dump(value: Any) -> str:

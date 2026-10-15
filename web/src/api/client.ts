@@ -10,10 +10,17 @@
 import axios, { type AxiosError } from 'axios'
 import type {
   AdviceResult,
+  AgentChatRequest,
+  AgentChatResult,
+  AgentConfirmResult,
   AgentHealth,
   ApiEnvelope,
   ApiErrorBody,
   AuditRecord,
+  BaselineDetail,
+  BaselineDiff,
+  BaselineSummary,
+  BurndownAnalysis,
   BurndownItem,
   CreatePlanPayload,
   CriticalPathResult,
@@ -22,16 +29,25 @@ import type {
   EnumMeta,
   GraphPayload,
   HealthResult,
+  ImportPayload,
+  ImportResult,
   PlanSummary,
+  PreferenceBlob,
   ProjectPlan,
+  QualityResult,
+  RegisterItem,
+  RegisterListResult,
+  RegisterPayload,
   ReplanPayload,
   ReportResult,
   RiskItem,
   ScenarioCompareRequest,
   ScenarioCompareResult,
   TaskDraftPayload,
+  TaskHistoryResult,
   TaskMutationResult,
   TaskUpdatePayload,
+  WorkloadResult,
 } from './types'
 
 /** 令牌本地存储键 */
@@ -167,6 +183,30 @@ export const api = {
   /** 风险缓解建议（LLM 可用时走模型，否则规则聚合降级） */
   advise: (planId: string) => unwrap<AdviceResult>(http.post('/agent/advise', { planId })),
 
+  /* --------------------------- Agent 会话式对话（AI 助手） --------------------------- */
+
+  /** 会话式对话（多轮；写操作默认登记为待确认，用户确认后才落库）。LLM 编排耗时较长，放宽超时。 */
+  agentChat: (payload: AgentChatRequest) =>
+    unwrap<AgentChatResult>(http.post('/agent/chat', payload, { timeout: 180_000 })),
+
+  /** 确认执行待确认的写操作；`actionIds` 缺省表示确认全部 */
+  agentConfirm: (sessionId: string, actionIds?: string[]) =>
+    unwrap<AgentConfirmResult>(
+      http.post(
+        '/agent/confirm',
+        actionIds && actionIds.length ? { sessionId, actionIds } : { sessionId },
+        { timeout: 180_000 },
+      ),
+    ),
+
+  /** 驳回全部待确认写操作（不执行、仅作废；会话上下文保留） */
+  agentReject: (sessionId: string) =>
+    unwrap<AgentConfirmResult>(http.post('/agent/confirm', { sessionId, reject: true })),
+
+  /** 清空 Agent 会话上下文（含未确认的写操作） */
+  agentResetSession: (sessionId: string) =>
+    http.delete(`/agent/sessions/${encodeURIComponent(sessionId)}`).then(() => undefined),
+
   /** What-if 情景对比：以同需求 + 情景约束临时生成计划并与基线对比（后端会即时回收临时计划） */
   scenarioCompare: (payload: ScenarioCompareRequest) =>
     unwrap<ScenarioCompareResult>(http.post('/scenario/compare', payload)),
@@ -186,6 +226,75 @@ export const api = {
     link.remove()
     URL.revokeObjectURL(url)
   },
+
+  /* ------------------------- 治理能力（/workspace/**） ------------------------- */
+
+  /** 数据导入：追加到现有计划或由导入行新建计划 */
+  importTasks: (payload: ImportPayload) => unwrap<ImportResult>(http.post('/workspace/import', payload)),
+
+  /** 基线快照列表 */
+  listBaselines: (planId: string) =>
+    unwrap<{ planId: string; items: BaselineSummary[] }>(http.get(`/workspace/plans/${planId}/baselines`)),
+
+  /** 创建基线快照（快照内容由服务端从引擎读取当前计划） */
+  createBaseline: (planId: string, payload: { name: string; note?: string }) =>
+    unwrap<BaselineSummary>(http.post(`/workspace/plans/${planId}/baselines`, payload)),
+
+  /** 基线快照详情（含任务快照） */
+  getBaseline: (planId: string, baselineId: string) =>
+    unwrap<BaselineDetail>(http.get(`/workspace/plans/${planId}/baselines/${baselineId}`)),
+
+  /** 基线 vs 现状偏差对比 */
+  baselineDiff: (planId: string, baselineId: string) =>
+    unwrap<BaselineDiff>(http.get(`/workspace/plans/${planId}/baselines/${baselineId}/diff`)),
+
+  /** 删除基线快照 */
+  deleteBaseline: (planId: string, baselineId: string) =>
+    http.delete(`/workspace/plans/${planId}/baselines/${baselineId}`).then(() => undefined),
+
+  /** 人工风险登记册列表（含统计） */
+  listRegisters: (planId: string) =>
+    unwrap<RegisterListResult>(http.get(`/workspace/plans/${planId}/registers`)),
+
+  /** 登记一条人工风险 */
+  createRegister: (planId: string, payload: RegisterPayload) =>
+    unwrap<RegisterItem>(http.post(`/workspace/plans/${planId}/registers`, payload)),
+
+  /** 更新人工风险条目（部分字段） */
+  updateRegister: (planId: string, issueId: string, payload: Partial<RegisterPayload>) =>
+    unwrap<RegisterItem>(http.patch(`/workspace/plans/${planId}/registers/${issueId}`, payload)),
+
+  /** 删除人工风险条目 */
+  deleteRegister: (planId: string, issueId: string) =>
+    http.delete(`/workspace/plans/${planId}/registers/${issueId}`).then(() => undefined),
+
+  /** 人员负荷与资源平衡 */
+  workload: (planId: string) => unwrap<WorkloadResult>(http.get(`/workspace/plans/${planId}/workload`)),
+
+  /** 燃尽增强：审计重建实际剩余曲线 + 偏离度 + 预计完成日 */
+  burndownAnalysis: (planId: string) =>
+    unwrap<BurndownAnalysis>(http.get(`/workspace/plans/${planId}/burndown-analysis`)),
+
+  /** 任务级变更历史（由审计重建） */
+  taskHistory: (planId: string, taskId: string) =>
+    unwrap<TaskHistoryResult>(http.get(`/workspace/plans/${planId}/tasks/${taskId}/history`)),
+
+  /** 交付质量看板 */
+  quality: (planId: string) => unwrap<QualityResult>(http.get(`/workspace/plans/${planId}/quality`)),
+
+  /** 读取服务端配置备份 */
+  getPreferences: (profile?: string) =>
+    unwrap<PreferenceBlob>(http.get('/workspace/preferences', { params: profile ? { profile } : {} })),
+
+  /** 写入服务端配置备份 */
+  putPreferences: (payload: Record<string, unknown>, profile?: string) =>
+    unwrap<{ profile: string; updatedAt: string; bytes: number }>(
+      http.put('/workspace/preferences', { payload, ...(profile ? { profile } : {}) }),
+    ),
+
+  /** 删除服务端配置备份 */
+  deletePreferences: (profile?: string) =>
+    http.delete('/workspace/preferences', { params: profile ? { profile } : {} }).then(() => undefined),
 }
 
 /** 推导 WebSocket 地址（开发环境由 Vite 代理 /ws） */

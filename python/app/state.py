@@ -14,6 +14,7 @@ from .config import Settings
 from .engine_client import EngineClient
 from .metrics import Metrics
 from .sessions import SessionStore
+from .workstore import WorkspaceStore
 from .ws import EngineEventBridge, WsBroadcaster
 
 
@@ -28,6 +29,7 @@ class AppContext:
     bridge: EngineEventBridge
     metrics: Metrics
     store: SessionStore
+    workspace: WorkspaceStore
     started_at: float
     version: str
     #: 优雅关机标志：置位后 /readyz 返回未就绪，拒绝新请求（在途请求自然排空）

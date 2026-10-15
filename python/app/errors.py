@@ -9,8 +9,8 @@
 ``LLM_FORMAT_ERROR``(422) / ``STORAGE_UNAVAILABLE``(503) / ``UNAUTHORIZED``(401)。
 
 Python 对外服务扩展错误码：``ENGINE_UNAVAILABLE``(502) / ``ENGINE_CIRCUIT_OPEN``(503) /
-``LLM_UNAVAILABLE``(503) / ``RATE_LIMITED``(429) / ``SERVICE_UNAVAILABLE``(503) /
-``AGENT_MAX_STEPS``(422) / ``INTERNAL_ERROR``(500)。
+``LLM_UNAVAILABLE``(503) / ``LLM_GATEWAY_ERROR``(502) / ``RATE_LIMITED``(429) /
+``SERVICE_UNAVAILABLE``(503) / ``AGENT_MAX_STEPS``(422) / ``INTERNAL_ERROR``(500)。
 """
 
 from __future__ import annotations
@@ -66,6 +66,15 @@ def llm_unavailable(
     message: str = "未配置 LLM 网关，Agent 功能不可用；请设置 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL",
 ) -> ApiError:
     return ApiError(503, "LLM_UNAVAILABLE", message)
+
+
+def llm_gateway_error(message: str, details: Any | None = None) -> ApiError:
+    """LLM 网关不可达或返回异常状态。
+
+    与 :func:`bad_gateway`（算法引擎）区分开：调用方与监控需要按**失败的依赖方**分流，
+    例如前端在模型侧不可用时降级为内置规则问答，而引擎故障则应原样提示。
+    """
+    return ApiError(502, "LLM_GATEWAY_ERROR", message, details)
 
 
 def engine_circuit_open(message: str = "算法引擎连续失败，已触发熔断保护，请稍后重试") -> ApiError:

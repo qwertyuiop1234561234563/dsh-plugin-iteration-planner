@@ -14,6 +14,8 @@ const SHORTCUTS: Array<{ keys: string; label: string; note: string }> = [
   { keys: 'Ctrl / ⌘ + Shift + L', label: '切换主题', note: '蓝晒日间 / 夜间台面互切' },
   { keys: 'Ctrl / ⌘ + Shift + E', label: '导出任务 CSV', note: '导出当前计划的全部任务（Excel 可直接打开）' },
   { keys: 'Ctrl / ⌘ + Shift + H', label: '打印当前计划报告', note: '跳转打印友好报告页并唤起打印' },
+  { keys: 'Ctrl / ⌘ + Shift + I', label: '导入任务数据', note: '粘贴 / 上传 CSV、JSON，追加到当前计划或新建计划' },
+  { keys: 'Ctrl / ⌘ + Shift + A', label: 'AI 助手', note: '唤起会话抽屉，可问答或改计划（写操作需确认后执行）' },
   { keys: 'F1', label: '打开本帮助', note: '任意状态（含输入框内）均可触发' },
   { keys: '?', label: '打开本帮助', note: '非输入状态下按 Shift + / 触发（中文输入法可能拦截，可用 F1）' },
   { keys: 'Esc', label: '关闭弹层', note: '关闭搜索 / 帮助 / 对话框' },

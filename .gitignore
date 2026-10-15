@@ -36,3 +36,5 @@ Thumbs.db
 *.sqlite
 pgdata/
 redisdata/
+# 治理数据本地落盘（基线 / 风险登记册 / 配置备份）
+python/.data/

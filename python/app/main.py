@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .agent import AgentRunner, OpenAiCompatibleClient, ToolDispatcher
 from .config import Settings, get_settings
+from .constants import default_store_path
 from .engine_client import EngineClient
 from .errors import ApiError, bad_request, internal, rate_limited, unauthorized
 from .logging_config import configure_logging, request_id_var
@@ -41,9 +42,11 @@ from .routes.agent import build_agent_router
 from .routes.proxy import register_proxy_and_static
 from .routes.scenario import build_scenario_router
 from .routes.system import register_system_routes
+from .routes.workspace import build_workspace_router
 from .security import SECURITY_HEADERS, RateLimiter, client_ip, constant_time_equals
 from .sessions import build_session_store
 from .state import AppContext
+from .workstore import WorkspaceStore
 from .ws import EngineEventBridge, WsBroadcaster
 
 logger = logging.getLogger("iteration_planner.http")
@@ -122,10 +125,12 @@ def create_app(
     broadcaster = WsBroadcaster(replay_size=settings.ws_replay_size)
     bridge = EngineEventBridge(derive_engine_ws_url(settings.engine_base_url, settings.api_ws_path), broadcaster)
     limiter = RateLimiter(settings.api_rate_limit_per_minute, settings.api_rate_limit_burst or None)
+    workspace = WorkspaceStore(settings.workspace_store_path or default_store_path())
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await store.start()
+        await workspace.start()
         if start_bridge:
             bridge.start()
         try:
@@ -136,6 +141,7 @@ def create_app(
             if start_bridge:
                 await bridge.stop()
             await store.close()
+            await workspace.close()
             await resolved_engine.aclose()
             if isinstance(resolved_llm, OpenAiCompatibleClient):
                 await resolved_llm.aclose()
@@ -157,6 +163,7 @@ def create_app(
         bridge=bridge,
         metrics=METRICS,
         store=store,
+        workspace=workspace,
         started_at=time.monotonic(),
         version=__version__,
     )
@@ -173,6 +180,8 @@ def create_app(
     app.include_router(build_agent_router(settings.api_base_path))
     # 情景对比必须先于 catch-all 静态/代理路由注册（Starlette 先注册先匹配）
     app.include_router(build_scenario_router(settings.api_base_path))
+    # 治理能力（导入 / 基线 / 登记册 / 负荷 / 燃尽分析 / 变更历史 / 质量 / 配置备份）
+    app.include_router(build_workspace_router(settings.api_base_path))
     register_proxy_and_static(app)
     return app
 

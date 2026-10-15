@@ -35,6 +35,19 @@ def _default_start() -> str:
     return date.today().isoformat()
 
 
+def build_chat_instruction(message: str, plan_id: str | None = None) -> str:
+    """构造会话轮次的用户指令。
+
+    前端会带上「当前正在查看的计划」，这里以**可信上下文**（不在用户数据边界内）注入，
+    使「给这个计划加个任务」这类指代能直接落到正确的 planId 上；``plan_id`` 已在
+    :func:`~.sanitize.sanitize_plan_id` 做过白名单校验。
+    """
+    if not plan_id:
+        return wrap_untrusted(message)
+    context = f"当前界面正在查看的计划为 {plan_id}；涉及该计划的读写操作请直接使用该 planId 作为参数。"
+    return f"{context}\n\n{wrap_untrusted(message)}"
+
+
 def build_plan_instruction(
     requirement: str,
     *,

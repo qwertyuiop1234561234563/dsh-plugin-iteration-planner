@@ -273,6 +273,26 @@ async def test_llm_retries_on_5xx_exhausted_raises_gateway_error():
     await client.aclose()
 
 
+async def test_llm_unreachable_reports_llm_gateway_error_not_engine():
+    """LLM 不可达必须报 ``LLM_GATEWAY_ERROR``（而非 ENGINE_UNAVAILABLE），调用方才能按依赖方分流。"""
+
+    def boom(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    client = OpenAiCompatibleClient(
+        "http://llm.test",
+        "key",
+        "demo",
+        transport=httpx.MockTransport(boom),
+        retry=RetryPolicy(attempts=1, base_delay=0.0),
+    )
+    with pytest.raises(ApiError) as info:
+        await client.chat([{"role": "user", "content": "hi"}])
+    assert info.value.code == "LLM_GATEWAY_ERROR"
+    assert info.value.status_code == 502
+    await client.aclose()
+
+
 async def test_llm_does_not_retry_4xx():
     calls = {"n": 0}
 

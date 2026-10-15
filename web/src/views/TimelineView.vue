@@ -9,31 +9,15 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import type { AuditRecord } from '@/api/types'
 import { usePlanStore } from '@/stores/plan'
-import { formatIso } from '@/utils/format'
+import { auditActionLabel, formatIso } from '@/utils/format'
 
 const store = usePlanStore()
 const route = useRoute()
 
 const planId = computed(() => (route.params.planId as string | undefined) ?? '')
 
-/** 审计动作 → 可读文案（未知动作回退为原始 action） */
-const ACTION_LABEL: Record<string, string> = {
-  plan_iteration: '完整规划流水线',
-  task_decompose: '需求拆解',
-  'task_decompose.degrade': '需求拆解降级（规则兜底）',
-  replan_all: '全量重规划',
-  task_add: '新增任务',
-  task_update: '修改任务',
-  task_delete: '删除任务',
-  risk_scan: '风险扫描',
-  'risk_scan.degrade': '风险扫描降级（规则兜底）',
-  'dag_check.dangling': '悬空依赖提示',
-  report_generate: '生成报表',
-  'api.startup': '服务启动',
-}
-
 function actionLabel(action: string): string {
-  return ACTION_LABEL[action] ?? action
+  return auditActionLabel(action)
 }
 
 const failedOnly = ref(false)

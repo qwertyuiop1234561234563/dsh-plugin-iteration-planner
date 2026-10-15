@@ -36,8 +36,16 @@ class SessionStore(Protocol):
         """写入 / 覆盖会话历史。"""
         ...
 
+    async def get_pending(self, session_id: str) -> list[dict[str, Any]] | None:
+        """读取会话的「待确认写操作」；不存在或已过期返回 ``None``。"""
+        ...
+
+    async def set_pending(self, session_id: str, actions: list[dict[str, Any]]) -> None:
+        """写入 / 覆盖待确认写操作（空列表表示清空）。"""
+        ...
+
     async def pop(self, session_id: str) -> bool:
-        """删除会话，返回是否存在。"""
+        """删除会话（含待确认动作），返回是否存在。"""
         ...
 
     def lock(self, session_id: str) -> "asyncio.Lock":
@@ -63,6 +71,8 @@ class InMemorySessionStore:
         self._max_sessions = max(1, max_sessions)
         self._ttl = ttl_seconds
         self._sessions: OrderedDict[str, tuple[list[dict[str, Any]], float]] = OrderedDict()
+        #: 待确认写操作（与历史分开存放：它不是消息，不能污染送入模型的上下文）
+        self._pending: OrderedDict[str, tuple[list[dict[str, Any]], float]] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
         self._cleanup_task: asyncio.Task[None] | None = None
 
@@ -86,8 +96,29 @@ class InMemorySessionStore:
         while len(self._sessions) > self._max_sessions:
             self._sessions.popitem(last=False)
 
+    async def get_pending(self, session_id: str) -> list[dict[str, Any]] | None:
+        entry = self._pending.get(session_id)
+        if entry is None:
+            return None
+        actions, updated_at = entry
+        if self._is_expired(updated_at, time.monotonic()):
+            self._pending.pop(session_id, None)
+            return None
+        self._pending.move_to_end(session_id)
+        return actions
+
+    async def set_pending(self, session_id: str, actions: list[dict[str, Any]]) -> None:
+        if not actions:
+            self._pending.pop(session_id, None)
+            return
+        self._pending[session_id] = (actions, time.monotonic())
+        self._pending.move_to_end(session_id)
+        while len(self._pending) > self._max_sessions:
+            self._pending.popitem(last=False)
+
     async def pop(self, session_id: str) -> bool:
         self._locks.pop(session_id, None)
+        self._pending.pop(session_id, None)
         return self._sessions.pop(session_id, None) is not None
 
     def lock(self, session_id: str) -> asyncio.Lock:
@@ -119,11 +150,14 @@ class InMemorySessionStore:
             expired = [sid for sid, (_, ts) in self._sessions.items() if self._is_expired(ts, now)]
             for sid in expired:
                 self._sessions.pop(sid, None)
+            expired_pending = [sid for sid, (_, ts) in self._pending.items() if self._is_expired(ts, now)]
+            for sid in expired_pending:
+                self._pending.pop(sid, None)
             idle_locks = [sid for sid, lock in self._locks.items() if not lock.locked() and sid not in self._sessions]
             for sid in idle_locks:
                 self._locks.pop(sid, None)
-            if expired:
-                logger.info("会话清理：移除 %d 个过期会话", len(expired))
+            if expired or expired_pending:
+                logger.info("会话清理：移除 %d 个过期会话 / %d 份待确认动作", len(expired), len(expired_pending))
 
 
 class RedisSessionStore:
@@ -147,6 +181,9 @@ class RedisSessionStore:
     def _key(self, session_id: str) -> str:
         return f"{self._prefix}{session_id}"
 
+    def _pending_key(self, session_id: str) -> str:
+        return f"{self._prefix}{session_id}:pending"
+
     async def get(self, session_id: str) -> list[dict[str, Any]] | None:
         raw = await self._redis.get(self._key(session_id))
         if not raw:
@@ -164,8 +201,30 @@ class RedisSessionStore:
         else:
             await self._redis.set(self._key(session_id), payload)
 
+    async def get_pending(self, session_id: str) -> list[dict[str, Any]] | None:
+        raw = await self._redis.get(self._pending_key(session_id))
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+        return data if isinstance(data, list) else None
+
+    async def set_pending(self, session_id: str, actions: list[dict[str, Any]]) -> None:
+        key = self._pending_key(session_id)
+        if not actions:
+            await self._redis.delete(key)
+            return
+        payload = json.dumps(actions, ensure_ascii=False, default=str)
+        if self._ttl > 0:
+            await self._redis.set(key, payload, ex=self._ttl)
+        else:
+            await self._redis.set(key, payload)
+
     async def pop(self, session_id: str) -> bool:
         self._locks.pop(session_id, None)
+        await self._redis.delete(self._pending_key(session_id))
         return bool(await self._redis.delete(self._key(session_id)))
 
     def lock(self, session_id: str) -> asyncio.Lock:
@@ -177,8 +236,10 @@ class RedisSessionStore:
 
     async def size(self) -> int:
         count = 0
-        async for _ in self._redis.scan_iter(match=f"{self._prefix}*", count=100):
-            count += 1
+        async for key in self._redis.scan_iter(match=f"{self._prefix}*", count=100):
+            # 待确认动作使用 `<session>:pending` 后缀键，不计入会话数
+            if not str(key).endswith(":pending"):
+                count += 1
         return count
 
     async def start(self) -> None:

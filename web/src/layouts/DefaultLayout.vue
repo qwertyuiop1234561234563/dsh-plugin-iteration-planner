@@ -13,16 +13,26 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { api } from '@/api/client'
+import AgentDrawer from '@/components/AgentDrawer.vue'
 import GlobalSearch from '@/components/GlobalSearch.vue'
+import ImportDialog from '@/components/ImportDialog.vue'
 import NotifyCenter from '@/components/NotifyCenter.vue'
 import ShortcutHelp from '@/components/ShortcutHelp.vue'
 import { usePlanStore } from '@/stores/plan'
 import { useSettingsStore } from '@/stores/settings'
 import { detectMilestones } from '@/utils/analytics'
-import { exportCsv, fileStamp } from '@/utils/export'
+import { exportCsv, downloadText, fileStamp } from '@/utils/export'
 import { taskExportColumns } from '@/utils/exportPresets'
 import { truncate } from '@/utils/format'
+import {
+  applyPreferenceBackup,
+  backupToJson,
+  collectPreferenceBackup,
+  describeBackup,
+  parseBackupText,
+} from '@/utils/preferences'
 
 const store = usePlanStore()
 const settings = useSettingsStore()
@@ -33,9 +43,13 @@ const router = useRouter()
 const tokenDialogVisible = ref(false)
 const tokenDraft = ref(settings.token)
 
-/** 全局搜索 / 快捷键帮助面板 */
+/** 全局搜索 / 快捷键帮助面板 / 数据导入 / AI 助手 */
 const searchVisible = ref(false)
 const helpVisible = ref(false)
+const importVisible = ref(false)
+const agentVisible = ref(false)
+/** 恢复配置用的隐藏文件选择器 */
+const restoreInput = ref<HTMLInputElement>()
 
 /** 单计划页面路由名 → 左侧菜单项 key（菜单与路由解耦，避免字符串散落） */
 const PLAN_TAB_MENU: Record<string, string> = {
@@ -50,6 +64,11 @@ const PLAN_TAB_MENU: Record<string, string> = {
   'plan-flow': 'current-flow',
   'plan-advisor': 'current-advisor',
   'plan-whatif': 'current-whatif',
+  'plan-baseline': 'current-baseline',
+  'plan-workload': 'current-workload',
+  'plan-burndown': 'current-burndown',
+  'plan-quality': 'current-quality',
+  'plan-registers': 'current-registers',
   'plan-print': 'current-print',
 }
 
@@ -194,6 +213,96 @@ function openPrintReport(): void {
   void router.push({ name: 'plan-print', params: { planId: currentPlanId.value }, query: { autoprint: '1' } })
 }
 
+/* ---------------------------- 数据导入 / 配置备份 ---------------------------- */
+
+/** 导入完成回调：新建计划或追加到「非当前计划」时跳转过去，否则原地刷新 */
+async function onImported(result: { planId: string; createdPlan: boolean; addedCount: number }): Promise<void> {
+  await store.loadPlans()
+  // 各视图取 planId 的口径不一致（部分以路由为准、部分以 store 为准）。若只把 store.plan
+  // 换成另一个计划而不改路由，同一页面会出现两个计划的数据混读，故统一跳转到目标计划。
+  if (result.createdPlan || currentPlanId.value !== result.planId) {
+    void router.push({ name: 'plan-overview', params: { planId: result.planId } })
+    return
+  }
+  await store.refreshCurrent()
+}
+
+/** 导出本地配置备份为 JSON 文件（不含访问令牌） */
+function exportPreferences(): void {
+  const backup = collectPreferenceBackup()
+  downloadText(`iteration-planner-preferences-${fileStamp()}.json`, backupToJson(backup), 'application/json;charset=utf-8')
+  ElMessage.success(`已导出 ${describeBackup(backup).length} 项配置（不含访问令牌）`)
+}
+
+/** 立即同步「肉眼可见」的偏好项；其余项在其模块下次读取时生效（刷新页面） */
+function syncVisiblePreferences(entries: Record<string, string>): void {
+  const theme = entries['iteration-planner:theme']
+  if (theme === 'light' || theme === 'dark') settings.setTheme(theme)
+  const compact = entries['iteration-planner:theme:compact']
+  if (compact === '0' || compact === '1') settings.toggleCompact(compact === '1')
+}
+
+/** 校验通过 → 二次确认 → 覆盖式写入 */
+async function applyBackupText(text: string, source: string): Promise<void> {
+  const parsed = parseBackupText(text)
+  if (parsed.error || !parsed.backup) {
+    ElMessage.error(`${source}无效：${parsed.error ?? '结构不完整'}`)
+    return
+  }
+  const labels = describeBackup(parsed.backup).map((item) => item.label).join('、')
+  try {
+    await ElMessageBox.confirm(`将覆盖当前本地配置（${labels}），是否继续？`, '恢复配置备份', {
+      type: 'warning',
+      confirmButtonText: '恢复',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  const written = applyPreferenceBackup(parsed.backup)
+  syncVisiblePreferences(parsed.backup.entries)
+  ElMessage.success(`已恢复 ${written} 项配置；部分配置将在刷新页面后生效`)
+}
+
+/** 从本地文件恢复（覆盖式） */
+async function onRestoreFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  try {
+    await applyBackupText(await file.text(), '备份文件')
+  } catch (error) {
+    ElMessage.error(`读取备份文件失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/** 备份当前本地配置到服务端 */
+async function backupToServer(): Promise<void> {
+  const backup = collectPreferenceBackup()
+  const payload: Record<string, unknown> = { version: backup.version, exportedAt: backup.exportedAt, entries: backup.entries }
+  try {
+    const result = await api.putPreferences(payload)
+    ElMessage.success(`已备份到服务端（${result.bytes} 字节）`)
+  } catch (error) {
+    ElMessage.error(`备份到服务端失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/** 从服务端恢复配置（覆盖式） */
+async function restoreFromServer(): Promise<void> {
+  try {
+    const blob = await api.getPreferences()
+    if (!blob.payload) {
+      ElMessage.warning('服务端暂无配置备份')
+      return
+    }
+    await applyBackupText(JSON.stringify(blob.payload), '服务端备份')
+  } catch (error) {
+    ElMessage.error(`读取服务端备份失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 /**
  * 全局键盘监听。
  *
@@ -225,6 +334,16 @@ function onGlobalKeydown(event: KeyboardEvent): void {
   if (mod && event.shiftKey && key === 'h') {
     event.preventDefault()
     openPrintReport()
+    return
+  }
+  if (mod && event.shiftKey && key === 'i') {
+    event.preventDefault()
+    importVisible.value = true
+    return
+  }
+  if (mod && event.shiftKey && key === 'a') {
+    event.preventDefault()
+    agentVisible.value = true
     return
   }
   // F1 与 `?` 等价：中文输入法激活时 Shift+/ 可能被输入法拦截，F1 作为稳定入口
@@ -298,6 +417,16 @@ onBeforeUnmount(() => {
           <el-menu-item index="current-advisor">风险缓解建议</el-menu-item>
           <el-menu-item index="current-whatif">What-if 情景对比</el-menu-item>
         </el-sub-menu>
+        <el-sub-menu index="govern" :disabled="!currentPlanId">
+          <template #title>
+            <el-icon><Files /></el-icon><span>治理与质量</span>
+          </template>
+          <el-menu-item index="current-baseline">基线快照与偏差</el-menu-item>
+          <el-menu-item index="current-workload">人员负荷与资源平衡</el-menu-item>
+          <el-menu-item index="current-burndown">燃尽增强分析</el-menu-item>
+          <el-menu-item index="current-quality">交付质量看板</el-menu-item>
+          <el-menu-item index="current-registers">风险登记册</el-menu-item>
+        </el-sub-menu>
         <el-sub-menu index="deliver" :disabled="!currentPlanId">
           <template #title>
             <el-icon><Printer /></el-icon><span>交付与归档</span>
@@ -343,6 +472,18 @@ onBeforeUnmount(() => {
             <span>搜索</span>
             <span class="ip-search-trigger__keys">Ctrl K</span>
           </el-button>
+          <el-tooltip content="批量导入任务（Ctrl / ⌘ + Shift + I）" placement="bottom">
+            <el-button class="ip-search-trigger" @click="importVisible = true">
+              <el-icon><Upload /></el-icon>
+              <span>导入数据</span>
+            </el-button>
+          </el-tooltip>
+          <el-tooltip content="AI 助手：问答与改计划（Ctrl / ⌘ + Shift + A）" placement="bottom">
+            <el-button class="ip-search-trigger" @click="agentVisible = true">
+              <el-icon><MagicStick /></el-icon>
+              <span>AI 助手</span>
+            </el-button>
+          </el-tooltip>
           <el-select
             v-model="selectedPlan"
             placeholder="选择计划"
@@ -383,8 +524,19 @@ onBeforeUnmount(() => {
 
     <GlobalSearch v-model="searchVisible" />
     <ShortcutHelp v-model="helpVisible" />
+    <AgentDrawer v-model="agentVisible" :plan-id="currentPlanId" :plan-label="store.plan?.rawRequirement" />
+    <ImportDialog
+      v-model="importVisible"
+      :plan-id="currentPlanId"
+      :plans="store.summaries"
+      :default-mode="currentPlanId ? 'append' : 'new'"
+      @imported="onImported"
+    />
 
-    <el-dialog v-model="tokenDialogVisible" title="访问配置" width="480px">
+    <!-- 恢复配置：隐藏的文件选择器（避免引入额外依赖） -->
+    <input ref="restoreInput" type="file" accept="application/json,.json" class="ip-hidden-file" @change="onRestoreFile" />
+
+    <el-dialog v-model="tokenDialogVisible" title="访问配置" width="520px">
       <el-form label-width="96px">
         <el-form-item label="访问令牌">
           <el-input v-model="tokenDraft" type="password" show-password placeholder="与后端 API_TOKEN 一致；未启用鉴权时留空" />
@@ -392,7 +544,18 @@ onBeforeUnmount(() => {
         <el-form-item label="接口文档">
           <el-link type="primary" :href="'/api/docs'" target="_blank">在新标签打开 Swagger UI</el-link>
         </el-form-item>
+        <el-form-item label="配置备份">
+          <div class="ip-backup">
+            <el-button size="small" :icon="'Download'" @click="exportPreferences">导出到本地文件</el-button>
+            <el-button size="small" :icon="'Upload'" @click="restoreInput?.click()">从文件恢复</el-button>
+            <el-button size="small" :icon="'Cloudy'" @click="backupToServer">备份到服务端</el-button>
+            <el-button size="small" :icon="'RefreshLeft'" @click="restoreFromServer">从服务端恢复</el-button>
+          </div>
+        </el-form-item>
       </el-form>
+      <p class="ip-muted ip-backup__note">
+        备份包含主题、表格密度、通知、保存的筛选视图与自定义模板，不包含访问令牌。恢复为覆盖式写入，部分配置需刷新页面后生效。
+      </p>
       <template #footer>
         <el-button @click="tokenDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="saveToken">保存</el-button>
@@ -687,5 +850,22 @@ onBeforeUnmount(() => {
   background: transparent;
   padding: 0;
   overflow: auto;
+}
+
+/* 配置备份：隐藏的文件选择器与按钮组 */
+.ip-hidden-file {
+  display: none;
+}
+
+.ip-backup {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ip-backup__note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
 }
 </style>
