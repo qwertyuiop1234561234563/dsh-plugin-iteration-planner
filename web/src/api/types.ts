@@ -362,6 +362,21 @@ export interface AgentChatResult {
   memories?: MemoryItem[]
 }
 
+/** 流式对话首帧：会话 ID 与本轮检索增强上下文（知识库引用 / 长期记忆） */
+export interface AgentStreamMeta {
+  sessionId: string
+  references: KbHit[]
+  memories: MemoryItem[]
+}
+
+/** 流式工具调用结果（轻量：不含完整 result，最终事件会补齐完整明细） */
+export interface AgentStreamToolResult {
+  name: string
+  arguments: Record<string, unknown>
+  ok: boolean
+  error?: string | null
+}
+
 /** 确认执行待确认写操作的响应 */
 export interface AgentConfirmResult {
   sessionId: string

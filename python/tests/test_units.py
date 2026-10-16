@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
+from app.agent.llm import OpenAiCompatibleClient
 from app.agent.tools import ToolDispatcher
 from app.engine_client import EngineClient
 from app.errors import ApiError, bad_request, unauthorized
@@ -88,3 +91,76 @@ async def test_tool_dispatcher_rejects_unknown_and_invalid_args():
     with pytest.raises(ApiError):
         await dispatcher.dispatch("get_plan", {})  # 缺少 planId
     await client.aclose()
+
+
+# ---------------------- LLM 流式客户端（chat_stream） ----------------------
+
+
+def _sse(payload: dict) -> str:
+    """构造一行 OpenAI 兼容流式分片。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def test_llm_client_stream_aggregates_content_and_tool_calls():
+    """流式聚合正确性：``content`` 增量逐帧产出；``tool_calls.arguments`` 分片须按 index 拼接。"""
+    body = (
+        _sse({"choices": [{"delta": {"content": "关键"}}]})
+        + _sse({"choices": [{"delta": {"content": "路径"}}]})
+        + _sse(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "id": "call_1", "type": "function", "function": {"name": "get_plan", "arguments": '{"plan'}}
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        + _sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'Id":"p1"}'}}]}}]})
+        + "data: [DONE]\n\n"
+    ).encode("utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        assert json.loads(request.content.decode())["stream"] is True
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    client = OpenAiCompatibleClient("http://llm.test/v1", "k", "demo", transport=httpx.MockTransport(handler))
+    try:
+        texts: list[str] = []
+        message: dict | None = None
+        async for chunk in client.chat_stream([{"role": "user", "content": "hi"}]):
+            if chunk["type"] == "content":
+                texts.append(chunk["text"])
+            else:
+                message = chunk["message"]
+    finally:
+        await client.aclose()
+
+    assert texts == ["关键", "路径"]
+    assert message is not None
+    assert message["content"] == "关键路径"
+    call = message["tool_calls"][0]
+    assert call["id"] == "call_1"
+    assert call["function"]["name"] == "get_plan"
+    # arguments 被切成两个分片，必须完整拼接后仍是合法 JSON
+    assert json.loads(call["function"]["arguments"]) == {"planId": "p1"}
+
+
+async def test_llm_client_stream_surfaces_upstream_error():
+    """流式请求遇到 4xx：直接以 LLM_GATEWAY_ERROR 抛出（连接阶段的错误不得静默）。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "bad request"})
+
+    client = OpenAiCompatibleClient("http://llm.test/v1", "k", "demo", transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(ApiError) as exc:
+            async for _ in client.chat_stream([{"role": "user", "content": "hi"}]):
+                pass  # pragma: no cover - 不应产出任何事件
+        assert exc.value.code == "LLM_GATEWAY_ERROR"
+    finally:
+        await client.aclose()

@@ -56,6 +56,8 @@ interface ChatMessage {
   references?: KbHit[]
   /** 本轮注入上下文的长期记忆（供用户纠偏） */
   memories?: MemoryItem[]
+  /** 是否仍在流式生成中（用于展示光标与「停止生成」） */
+  streaming?: boolean
 }
 
 const messages = ref<ChatMessage[]>([])
@@ -66,6 +68,8 @@ const confirming = ref(false)
 const health = ref<AgentHealth | null>(null)
 const healthLoading = ref(false)
 const scroller = ref<HTMLElement>()
+/** 当前流式请求的中断控制器（「停止生成」用） */
+const abortController = ref<AbortController | null>(null)
 
 let messageSeq = 0
 
@@ -98,9 +102,9 @@ const quickPrompts = computed<string[]>(() => {
 
 function push(partial: Omit<ChatMessage, 'id' | 'ts'>): ChatMessage {
   messageSeq += 1
-  const message: ChatMessage = { id: `M-${messageSeq}`, ts: Date.now(), ...partial }
-  messages.value = [...messages.value, message]
-  return message
+  messages.value = [...messages.value, { id: `M-${messageSeq}`, ts: Date.now(), ...partial }]
+  // 必须返回**响应式代理**而非原始对象：流式增量（content += delta）只有经代理写入才会触发重渲染
+  return messages.value[messages.value.length - 1]
 }
 
 /** 追加一条错误消息（任何失败都可见，不静默） */
@@ -108,13 +112,18 @@ function pushError(text: string): void {
   push({ role: 'assistant', mode: 'error', content: text })
 }
 
-watch(
-  () => messages.value.length,
-  async () => {
-    await nextTick()
-    if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight
-  },
-)
+/** 从消息流中移除指定消息（用于撤销空的流式占位消息） */
+function removeMessage(id: string): void {
+  messages.value = messages.value.filter((item) => item.id !== id)
+}
+
+/** 滚动到底部（流式追加时每次增量后调用，否则打字机内容会溢出可视区） */
+async function scrollToBottom(): Promise<void> {
+  await nextTick()
+  if (scroller.value) scroller.value.scrollTop = scroller.value.scrollHeight
+}
+
+watch(() => messages.value.length, () => void scrollToBottom())
 
 /** 拉取 Agent 可用性（LLM 是否已配置；决定问答走模型还是内置规则） */
 async function loadHealth(): Promise<void> {
@@ -155,6 +164,13 @@ function canJumpTo(routeName?: string): boolean {
 /** LLM 侧不可用的错误码（走到这里说明模型链路整体不可用，应降级为规则问答） */
 const LLM_DOWN_CODES = new Set(['LLM_UNAVAILABLE', 'LLM_GATEWAY_ERROR'])
 
+/**
+ * 发送问题：走 **SSE 流式**编排（逐字追加渲染）。
+ *
+ * 事件与 UI 的对应关系：``meta`` → 会话 ID + 引用 / 记忆卡片；``delta`` → 文本增量；
+ * ``tool_result`` → 工具调用明细；``pending`` → 待确认写操作；``final`` → 权威结果补全。
+ * 全程可「停止生成」（AbortController），失败时保留已生成内容并给出明确提示。
+ */
 async function send(raw?: string): Promise<void> {
   const content = (raw ?? draft.value).trim()
   if (!content || sending.value) return
@@ -166,37 +182,84 @@ async function send(raw?: string): Promise<void> {
     return
   }
   sending.value = true
+  const controller = new AbortController()
+  abortController.value = controller
+  // 先占位渲染助手气泡：首帧之前展示「编排中」提示，避免出现无反馈等待
+  const assistant = push({ role: 'assistant', mode: 'llm', content: '', streaming: true })
   try {
-    const result = await api.agentChat({
-      message: content,
-      sessionId: sessionId.value || undefined,
-      planId: props.planId || undefined,
-    })
-    sessionId.value = result.sessionId
-    push({
-      role: 'assistant',
-      mode: 'llm',
-      content: result.content,
-      toolCalls: result.toolCalls,
-      pending: result.pendingActions.length > 0 ? result.pendingActions : undefined,
-      planId: result.planId ?? undefined,
-      references: result.references && result.references.length > 0 ? result.references : undefined,
-      memories: result.memories && result.memories.length > 0 ? result.memories : undefined,
-    })
+    await api.agentChatStream(
+      { message: content, sessionId: sessionId.value || undefined, planId: props.planId || undefined },
+      {
+        onMeta: (meta) => {
+          sessionId.value = meta.sessionId
+          // 引用 / 记忆随首帧到达即渲染，用户可在生成过程中查看依据
+          if (meta.references.length > 0) assistant.references = meta.references
+          if (meta.memories.length > 0) assistant.memories = meta.memories
+        },
+        onDelta: (text) => {
+          if (!text) return
+          assistant.content += text
+          void scrollToBottom()
+        },
+        onToolResult: (record) => {
+          assistant.toolCalls = [...(assistant.toolCalls ?? []), record]
+        },
+        onPending: (actions) => {
+          if (actions.length > 0) assistant.pending = actions
+        },
+        onFinal: (result) => {
+          sessionId.value = result.sessionId
+          // final 为权威结果：仅在流式内容缺失时兜底，避免重复追加
+          if (!assistant.content) assistant.content = result.content
+          assistant.toolCalls = result.toolCalls.length > 0 ? result.toolCalls : assistant.toolCalls
+          assistant.pending = result.pendingActions.length > 0 ? result.pendingActions : undefined
+          assistant.planId = result.planId ?? undefined
+          if (result.references && result.references.length > 0) assistant.references = result.references
+          if (result.memories && result.memories.length > 0) assistant.memories = result.memories
+        },
+      },
+      controller.signal,
+    )
   } catch (error) {
-    if (error instanceof ApiClientError && LLM_DOWN_CODES.has(error.code)) {
-      // 模型链路不可用（未配置 / 网关不可达 / 上游异常）：即时降级，避免用户卡在报错上
-      health.value = health.value ? { ...health.value, enabled: false } : null
-      pushError(
-        `LLM 网关当前不可用（${error.message}），已降级为内置规则问答。修复模型网关配置后重新打开抽屉即可恢复模型问答。`,
-      )
-      answerByRule(content)
-    } else {
-      pushError(error instanceof ApiClientError ? error.message : String(error))
-    }
+    handleStreamFailure(assistant, content, error)
   } finally {
+    assistant.streaming = false
+    abortController.value = null
     sending.value = false
   }
+}
+
+/** 停止生成：中断 SSE 连接（已产出的内容保留） */
+function stopGenerating(): void {
+  abortController.value?.abort()
+}
+
+/** 流式失败处理：区分「用户取消 / 部分内容已产出 / 模型链路不可用」三种情形 */
+function handleStreamFailure(message: ChatMessage, prompt: string, error: unknown): void {
+  const apiError = error instanceof ApiClientError ? error : null
+  if (apiError?.code === 'ABORTED') {
+    // 用户主动停止：保留已生成内容；若一个字都没产出则移除空气泡
+    if (!message.content) removeMessage(message.id)
+    return
+  }
+  const reason = apiError?.message ?? String(error)
+  if (message.content) {
+    // 已产出部分内容：保留并追加中断说明，避免用户已看到的答案被清空
+    message.content += `\n\n（响应中断：${reason}）`
+    return
+  }
+  if (apiError && LLM_DOWN_CODES.has(apiError.code)) {
+    // 模型链路不可用（未配置 / 网关不可达 / 上游异常）：即时降级，避免用户卡在报错上
+    health.value = health.value ? { ...health.value, enabled: false } : null
+    removeMessage(message.id)
+    pushError(
+      `LLM 网关当前不可用（${apiError.message}），已降级为内置规则问答。修复模型网关配置后重新打开抽屉即可恢复模型问答。`,
+    )
+    answerByRule(prompt)
+    return
+  }
+  message.mode = 'error'
+  message.content = reason
 }
 
 /** Enter 发送（Shift + Enter 换行由 `.exact` 排除）
@@ -351,7 +414,8 @@ watch(visible, (open) => {
 
           <div v-for="message in messages" :key="message.id" class="ip-agent__msg" :class="`is-${message.role}`">
             <div class="ip-agent__bubble">
-              <pre class="ip-agent__text">{{ message.content }}</pre>
+              <pre class="ip-agent__text">{{ message.content }}<span v-if="message.streaming" class="ip-agent__caret" aria-hidden="true" /></pre>
+              <span v-if="message.streaming && !message.content" class="ip-agent__typing">正在调用算法引擎工具编排中…</span>
 
               <!-- 待确认写操作卡片：确认后才真正落库 -->
               <div v-if="message.pending && message.pending.length > 0" class="ip-agent__pending">
@@ -428,12 +492,6 @@ watch(visible, (open) => {
             </div>
             <div class="ip-agent__role">{{ message.role === 'user' ? '我' : 'AI 助手' }}</div>
           </div>
-
-          <div v-if="sending" class="ip-agent__msg is-assistant">
-            <div class="ip-agent__bubble">
-              <span class="ip-agent__typing">正在调用算法引擎工具编排中…</span>
-            </div>
-          </div>
         </div>
 
         <div v-if="messages.length === 0" class="ip-agent__prompts">
@@ -453,6 +511,7 @@ watch(visible, (open) => {
           />
           <div class="ip-agent__composer-foot">
             <span class="ip-agent__hint">Enter 发送 · Shift + Enter 换行 · 写操作需确认后执行</span>
+            <el-button v-if="sending" size="small" :icon="'VideoPause'" @click="stopGenerating">停止生成</el-button>
             <el-button type="primary" size="small" :icon="'Promotion'" :loading="sending" @click="send()">发送</el-button>
           </div>
         </div>
@@ -699,6 +758,23 @@ watch(visible, (open) => {
 .ip-agent__typing {
   font-size: 12.5px;
   color: var(--ip-text-muted);
+}
+
+/* 流式输出光标：跟随在已生成文本末尾，随内容增长自然下移 */
+.ip-agent__caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: currentColor;
+  animation: ip-agent-blink 1s steps(2, start) infinite;
+}
+
+@keyframes ip-agent-blink {
+  to {
+    visibility: hidden;
+  }
 }
 
 /* 快捷提问 */

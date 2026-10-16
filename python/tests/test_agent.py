@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from tests.conftest import ScriptedLlm, auth, tool_call
+import json
+
+from tests.conftest import ScriptedLlm, StreamingScriptedLlm, auth, tool_call
 
 
 def _plan_args() -> dict:
@@ -313,3 +315,121 @@ def test_describe_action_labels():
     update = describe_action("task_update", {"planId": "p1", "taskId": "t1", "updateField": "estimatedHours", "newValue": 6})
     assert "预估工时" in update and "6" in update
     assert describe_action("task_delete", {"planId": "p1", "taskId": "t1"}) == "删除任务 t1（计划 p1）"
+
+
+# ---------------------- SSE 流式输出（POST /api/agent/chat/stream） ----------------------
+
+
+def _parse_sse(text: str) -> list[tuple[str, dict]]:
+    """把 SSE 响应体解析为 ``[(event, data), ...]``（仅保留数据帧，忽略心跳注释行）。"""
+    frames: list[tuple[str, dict]] = []
+    for block in text.split("\n\n"):
+        name: str | None = None
+        data_lines: list[str] = []
+        for line in block.split("\n"):
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                name = line[len("event:") :].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:") :].lstrip())
+        if name is None or not data_lines:
+            continue
+        frames.append((name, json.loads("\n".join(data_lines))))
+    return frames
+
+
+def test_agent_chat_stream_requires_llm(make_client):
+    with make_client() as c:
+        response = c.post("/api/agent/chat/stream", json={"message": "你好"}, headers=auth())
+        assert response.status_code == 503
+        assert response.json()["code"] == "LLM_UNAVAILABLE"
+
+
+def test_agent_chat_stream_emits_incremental_deltas(make_client):
+    llm = StreamingScriptedLlm([{"role": "assistant", "content": "关键路径是 t1 → t2。"}])
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat/stream", json={"message": "关键路径是什么"}, headers=auth())
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        frames = _parse_sse(response.text)
+
+        assert frames[0][0] == "meta"
+        assert frames[0][1]["sessionId"]
+        assert frames[-1][0] == "final"
+
+        deltas = [data["text"] for name, data in frames if name == "delta"]
+        # 逐字下发：应为多帧增量且拼接后与最终内容一致
+        assert len(deltas) > 1
+        assert "".join(deltas) == "关键路径是 t1 → t2。"
+        assert frames[-1][1]["content"] == "关键路径是 t1 → t2。"
+        # 走的是流式通道（而非一次性 chat）
+        assert llm.stream_calls == 1
+        assert len(llm.calls) == 1
+
+
+def test_agent_chat_stream_reports_tool_call_events(make_client):
+    llm = StreamingScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [tool_call("get_plan", {"planId": "p1"}, "call_g")]},
+            {"role": "assistant", "content": "当前计划共 1 个任务。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat/stream", json={"message": "列出计划"}, headers=auth())
+        frames = _parse_sse(response.text)
+        names = [name for name, _ in frames]
+
+        assert "tool_start" in names and "tool_result" in names
+        start = next(data for name, data in frames if name == "tool_start")
+        assert start["name"] == "get_plan"
+        result = next(data for name, data in frames if name == "tool_result")
+        assert result["name"] == "get_plan" and result["ok"] is True
+        # 事件顺序：meta → tool_start → tool_result → 增量 → final
+        assert names.index("meta") < names.index("tool_start") < names.index("tool_result")
+        assert names[-1] == "final"
+        assert frames[-1][1]["toolCalls"][0]["name"] == "get_plan"
+        assert frames[-1][1]["steps"] == 2
+
+
+def test_agent_chat_stream_defers_write_action(make_client):
+    """流式链路同样遵守两阶段写操作：本轮只登记待确认动作，不落库。"""
+    llm = StreamingScriptedLlm([{"role": "assistant", "content": "准备新增任务。", "tool_calls": [_task_add_call()]}])
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat/stream", json={"message": "补一个任务"}, headers=auth())
+        frames = _parse_sse(response.text)
+        names = [name for name, _ in frames]
+
+        assert "pending" in names
+        pending = next(data["actions"] for name, data in frames if name == "pending")
+        assert len(pending) == 1 and pending[0]["tool"] == "task_add"
+        final = frames[-1][1]
+        assert len(final["pendingActions"]) == 1
+        assert "新增任务" in final["content"]
+        # 只登记未落库：工具记录标记为待确认状态（引擎未被写入）
+        assert final["toolCalls"][0]["result"]["status"] == "PENDING_CONFIRMATION"
+        assert final["steps"] == 1
+
+
+def test_agent_chat_stream_falls_back_when_model_not_streamable(make_client):
+    """模型未实现 ``chat_stream``：SSE 链路仍可用，全文以单帧增量下发（功能不降级）。"""
+    llm = ScriptedLlm([{"role": "assistant", "content": "规则说明与跳转建议。"}])
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat/stream", json={"message": "怎么用"}, headers=auth())
+        assert response.status_code == 200
+        frames = _parse_sse(response.text)
+        deltas = [data["text"] for name, data in frames if name == "delta"]
+        assert deltas == ["规则说明与跳转建议。"]
+        assert frames[-1][0] == "final"
+        assert frames[-1][1]["content"] == "规则说明与跳转建议。"
+
+
+def test_agent_chat_stream_reports_error_event(make_client):
+    """编排异常：响应已开始，必须以 ``error`` 事件收尾（不允许静默中断）。"""
+    llm = ScriptedLlm([])
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat/stream", json={"message": "你好"}, headers=auth())
+        assert response.status_code == 200
+        frames = _parse_sse(response.text)
+        assert frames[-1][0] == "error"
+        assert frames[-1][1]["code"] and frames[-1][1]["message"]

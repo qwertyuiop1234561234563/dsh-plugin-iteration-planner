@@ -162,6 +162,32 @@ class ScriptedLlm:
         return self._responses.pop(0)
 
 
+class StreamingScriptedLlm(ScriptedLlm):
+    """在 :class:`ScriptedLlm` 基础上实现 ``chat_stream`` 的假流式 LLM。
+
+    把脚本消息的 ``content`` 按 ``chunk_size`` 切分为多个增量分片下发，最后给出聚合消息
+    （含 ``tool_calls``），用于验证 SSE 逐字输出链路与「增量 + 终态」两段语义。
+    """
+
+    name = "scripted-stream"
+
+    def __init__(self, responses: list[dict[str, Any]], *, chunk_size: int = 4) -> None:
+        super().__init__(responses)
+        self._chunk_size = chunk_size
+        self.stream_calls = 0
+
+    async def chat_stream(self, messages, *, tools=None, temperature=0.2):
+        self.stream_calls += 1
+        self.calls.append(messages)
+        if not self._responses:
+            raise AssertionError("脚本化 LLM 响应已耗尽")
+        message = self._responses.pop(0)
+        content = message.get("content") or ""
+        for index in range(0, len(content), self._chunk_size):
+            yield {"type": "content", "text": content[index : index + self._chunk_size]}
+        yield {"type": "message", "message": message}
+
+
 class StubEmbedder:
     """确定性桩向量化器（不触网）。
 

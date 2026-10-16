@@ -558,6 +558,7 @@ LLM_MODEL=qwen-plus
 |---|---|---|
 | `POST` | `/api/agent/plan` | 自然语言需求 → 完整迭代计划（一次端到端编排） |
 | `POST` | `/api/agent/chat` | 会话式对话（携带上下文，多轮修改计划） |
+| `POST` | `/api/agent/chat/stream` | 同上，但以 **SSE 流式输出**（逐字下发 + 工具/待确认事件） |
 | `GET` | `/api/agent/tools` | Agent 可调用工具清单（OpenAI function calling 格式） |
 | `DELETE` | `/api/agent/sessions/:id` | 清空指定会话上下文 |
 
@@ -567,6 +568,22 @@ LLM_MODEL=qwen-plus
 // → { "data": { "content": "…", "planId": "…",
 //              "toolCalls": [ { "name": "plan_iteration", "ok": true, "result": {…} } ], "steps": 2 } }
 ```
+
+`POST /api/agent/chat/stream` 返回 `text/event-stream`，每帧为 `event: <name>\ndata: <json>\n\n`，
+事件契约与前端消费方式（`fetch` + `ReadableStream`，支持 `AbortController` 中断）：
+
+| 事件 | 载荷 | 说明 |
+|---|---|---|
+| `meta` | `{ sessionId, references, memories }` | 首帧，回传会话 ID 与本轮检索增强上下文 |
+| `delta` | `{ text }` | 模型增量文本（逐字下发；不可流式的模型回退为单帧全量） |
+| `tool_start` | `{ name, arguments }` | 开始调用某个引擎工具 |
+| `tool_result` | `{ name, arguments, ok, error? }` | 工具返回摘要（明细在 `final.toolCalls`） |
+| `pending` | `{ actions }` | 待用户确认的写操作（两阶段确认，确认前不落库） |
+| `final` | `AgentChatResponse` | 收尾帧，与非流式 `/api/agent/chat` 响应结构一致 |
+| `error` | `{ code, message, details }` | 编排失败，随后关闭连接 |
+
+服务端每 15s 发送一行注释心跳（`: ping`）防止中间代理空闲断连；
+调用方主动断开（如前端「停止生成」）时后端会取消进行中的编排并释放连接。
 
 ### 10.4 Agent 工具 → 内部引擎 REST 映射
 
@@ -669,7 +686,8 @@ Agent 工具调度、工具失败容忍、会话上下文、步数上限，企�
 
 Agent 侧新增三个**只读**检索工具（写类工具仍走两阶段确认）：`kb_search`、`kb_list_documents`、`memory_search`；
 `POST /api/agent/chat` 的响应新增 `references`（本轮引用的知识库片段）与 `memories`（本轮注入的记忆），
-控制台 AI 助手抽屉会以卡片展示，便于用户核对结论依据并在发现记忆跑偏时及时纠偏。
+控制台 AI 助手抽屉会以卡片展示，便于用户核对结论依据并在发现记忆跑偏时及时纠偏；
+流式链路同样携带（`meta` 首帧与 `final` 收尾帧各回传一次）。
 
 > 运行期数据默认落在 `python/.data/chroma`（已 gitignore）；容器部署请挂载卷以免重建镜像丢库。
 > Chroma 为**单进程本地库**：多 worker / 多副本时需改用 Chroma Server 或远端向量库（如 Milvus / pgvector）。

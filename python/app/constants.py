@@ -92,6 +92,22 @@ def default_chroma_dir() -> str:
 #: 单日标准工时（与引擎 ``src/constants/enums.ts`` 的 ``SCHEDULE.WORK_HOURS_PER_DAY`` 对齐）
 WORK_HOURS_PER_DAY = 8
 
+# ------------------------------ SSE 流式输出（/api/agent/chat/stream） ------------------------------
+
+#: SSE 事件名（前后端共用契约，集中登记避免字符串散落）
+SSE_META = "meta"  #: 会话 ID 与本轮检索增强上下文（知识库引用 / 长期记忆）
+SSE_DELTA = "delta"  #: 助手文本增量（打字机式追加）
+SSE_TOOL_START = "tool_start"  #: 开始调用某个工具
+SSE_TOOL_RESULT = "tool_result"  #: 工具调用结果（只读工具即时执行；写工具为「待确认」）
+SSE_PENDING = "pending"  #: 待用户确认的写操作清单
+SSE_FINAL = "final"  #: 终态事件，携带完整结果（工具明细 / 计划 / 引用 / 记忆）
+SSE_ERROR = "error"  #: 流式过程中的错误（已建立连接后以事件形式下发）
+#: 内部标记：编排内部结果事件（不直接下发，由流式入口转换为 ``final``）
+SSE_RESULT = "__result"
+
+#: SSE 心跳间隔（秒）：空闲超过该时长即发送注释行，避免代理/网关因空闲断开长连接
+SSE_HEARTBEAT_SECONDS = 15.0
+
 # ------------------------------ 工作区存储限额 ------------------------------
 
 #: 单个计划可保存的基线快照数量上限
@@ -144,5 +160,14 @@ __all__ = [
     "MAX_PREFERENCE_BYTES",
     "DEFAULT_PROFILE",
     "WORKSPACE_STORE_VERSION",
+    "SSE_META",
+    "SSE_DELTA",
+    "SSE_TOOL_START",
+    "SSE_TOOL_RESULT",
+    "SSE_PENDING",
+    "SSE_FINAL",
+    "SSE_ERROR",
+    "SSE_RESULT",
+    "SSE_HEARTBEAT_SECONDS",
     "default_store_path",
 ]

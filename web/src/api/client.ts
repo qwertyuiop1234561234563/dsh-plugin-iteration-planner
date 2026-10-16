@@ -14,6 +14,9 @@ import type {
   AgentChatResult,
   AgentConfirmResult,
   AgentHealth,
+  AgentPendingAction,
+  AgentStreamMeta,
+  AgentStreamToolResult,
   ApiEnvelope,
   ApiErrorBody,
   AuditRecord,
@@ -201,9 +204,9 @@ export const api = {
 
   /* --------------------------- Agent 会话式对话（AI 助手） --------------------------- */
 
-  /** 会话式对话（多轮；写操作默认登记为待确认，用户确认后才落库）。LLM 编排耗时较长，放宽超时。 */
-  agentChat: (payload: AgentChatRequest) =>
-    unwrap<AgentChatResult>(http.post('/agent/chat', payload, { timeout: 180_000 })),
+  /** 会话式对话（SSE 流式输出，逐字下发；写操作默认登记为待确认，用户确认后才落库）。 */
+  agentChatStream: (payload: AgentChatRequest, handlers: AgentStreamHandlers, signal?: AbortSignal) =>
+    agentChatStream(payload, handlers, signal),
 
   /** 确认执行待确认的写操作；`actionIds` 缺省表示确认全部 */
   agentConfirm: (sessionId: string, actionIds?: string[]) =>
@@ -371,6 +374,158 @@ export const api = {
 
   /** 清空全部记忆（危险操作，前端需二次确认） */
   clearMemories: () => unwrap<MemoryClearResult>(http.delete('/memories')),
+}
+
+/* ----------------------- Agent 流式对话（SSE · /agent/chat/stream） ----------------------- */
+
+/** 流式对话事件回调（按需监听，未提供的事件类型自动忽略） */
+export interface AgentStreamHandlers {
+  /** 首帧：会话 ID + 本轮检索增强上下文（知识库引用 / 长期记忆） */
+  onMeta?: (meta: AgentStreamMeta) => void
+  /** 助手文本增量（打字机式追加） */
+  onDelta?: (text: string) => void
+  /** 开始调用某个工具 */
+  onToolStart?: (name: string) => void
+  /** 工具调用结果（轻量字段，完整明细由 onFinal 补齐） */
+  onToolResult?: (record: AgentStreamToolResult) => void
+  /** 待用户确认的写操作（确认前不会修改任何数据） */
+  onPending?: (actions: AgentPendingAction[]) => void
+  /** 终态：完整结果（工具明细 / 计划 / 引用 / 记忆） */
+  onFinal?: (result: AgentChatResult) => void
+}
+
+/**
+ * 解析单个 SSE 帧并回调。
+ *
+ * 支持：注释行（`: ping` 心跳，忽略）、`event:` / `data:` 字段、CRLF 归一化后的单行 JSON。
+ * `error` 事件以 {@link ApiClientError} 抛出，由调用方统一处理（含 LLM 降级判定）。
+ */
+function dispatchSseFrame(frame: string, handlers: AgentStreamHandlers, status: number): void {
+  let name = 'message'
+  const dataLines: string[] = []
+  for (const line of frame.split('\n')) {
+    if (!line || line.startsWith(':')) continue
+    const colon = line.indexOf(':')
+    const field = colon === -1 ? line : line.slice(0, colon)
+    let value = colon === -1 ? '' : line.slice(colon + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'event') name = value
+    else if (field === 'data') dataLines.push(value)
+  }
+  if (dataLines.length === 0) return
+
+  let data: unknown
+  try {
+    data = JSON.parse(dataLines.join('\n'))
+  } catch {
+    return
+  }
+
+  switch (name) {
+    case 'meta':
+      handlers.onMeta?.(data as AgentStreamMeta)
+      break
+    case 'delta':
+      handlers.onDelta?.((data as { text?: string }).text ?? '')
+      break
+    case 'tool_start':
+      handlers.onToolStart?.((data as { name?: string }).name ?? '')
+      break
+    case 'tool_result':
+      handlers.onToolResult?.(data as AgentStreamToolResult)
+      break
+    case 'pending':
+      handlers.onPending?.((data as { actions?: AgentPendingAction[] }).actions ?? [])
+      break
+    case 'final':
+      handlers.onFinal?.(data as AgentChatResult)
+      break
+    case 'error': {
+      const body = data as ApiErrorBody
+      throw new ApiClientError(
+        body?.message ?? '流式响应出错',
+        body?.code ?? 'STREAM_ERROR',
+        status,
+        body?.details,
+      )
+    }
+    default:
+      break
+  }
+}
+
+/**
+ * SSE 流式会话对话。
+ *
+ * 用 `fetch` + `ReadableStream` 读取（axios 无法增量读取响应体），因此需手工注入
+ * Bearer 令牌；`AbortSignal` 支持「停止生成」；错误统一归一化为 {@link ApiClientError}
+ * （含 `ABORTED` 取消码），与 axios 链路保持一致的错误契约。
+ */
+export async function agentChatStream(
+  payload: AgentChatRequest,
+  handlers: AgentStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    accept: 'text/event-stream',
+  }
+  const token = getToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}/agent/chat/stream`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal,
+    })
+  } catch {
+    if (signal?.aborted) throw new ApiClientError('已取消生成', 'ABORTED', 0)
+    throw new ApiClientError('无法连接到服务端，请确认 API 服务已启动', 'NETWORK_ERROR', 0)
+  }
+
+  if (!response.ok) {
+    let body: ApiErrorBody | undefined
+    try {
+      body = (await response.json()) as ApiErrorBody
+    } catch {
+      body = undefined
+    }
+    throw new ApiClientError(
+      body?.message ?? `请求失败（HTTP ${response.status}）`,
+      body?.code ?? 'HTTP_ERROR',
+      response.status,
+      body?.details,
+    )
+  }
+  if (!response.body) throw new ApiClientError('服务端未返回流式响应体', 'STREAM_ERROR', response.status)
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      // 归一化 CRLF：JSON 中的换行已被转义，真实 CR 只可能是 SSE 行分隔符
+      buffer += decoder.decode(value, { stream: true }).replace(/\r/g, '')
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        dispatchSseFrame(frame, handlers, response.status)
+        boundary = buffer.indexOf('\n\n')
+      }
+    }
+  } catch (error) {
+    if (error instanceof ApiClientError) throw error
+    if (signal?.aborted) throw new ApiClientError('已取消生成', 'ABORTED', 0)
+    throw new ApiClientError('流式响应中断，请重试', 'STREAM_ERROR', response.status)
+  } finally {
+    reader.releaseLock()
+  }
 }
 
 /** 推导 WebSocket 地址（开发环境由 Vite 代理 /ws） */

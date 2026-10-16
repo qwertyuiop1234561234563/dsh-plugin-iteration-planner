@@ -25,12 +25,21 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
+from ..constants import (
+    SSE_DELTA,
+    SSE_FINAL,
+    SSE_META,
+    SSE_PENDING,
+    SSE_RESULT,
+    SSE_TOOL_RESULT,
+    SSE_TOOL_START,
+)
 from ..errors import ApiError, bad_request, llm_unavailable, not_found
 from ..kb.pipeline import KnowledgeBaseService
 from ..metrics import METRICS
-from ..models import AgentRunResult, KbHit, MemoryItem, PendingAction, ToolCallRecord
+from ..models import AgentChatResponse, AgentRunResult, KbHit, MemoryItem, PendingAction, ToolCallRecord
 from ..sessions import InMemorySessionStore, SessionStore
 from .llm import LlmClient
 from .memory import MemoryService
@@ -225,6 +234,59 @@ class AgentRunner:
                 self._memory.schedule_extract(session_id, message, result.content)
             return result
 
+    async def run_chat_stream(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        defer_writes: bool = True,
+        plan_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """流式版 :meth:`run_chat`：以 SSE 事件序列逐步产出（打字机式输出）。
+
+        事件顺序：``meta``（会话 ID + 检索增强上下文）→ 若干 ``delta`` / ``tool_start`` /
+        ``tool_result`` / ``pending`` → ``final``（完整结果）。事件名常量见
+        ``app.constants.SSE_*``。
+
+        与 :meth:`run_chat` **完全共享**同一套编排、会话持久化与后台记忆提取逻辑，
+        仅把「一次性返回」改为「边编排边下发」，因此两条链路的业务语义严格一致。
+        """
+        async with self._store.lock(session_id):
+            history = await self._store.get(session_id) or []
+            instruction = build_chat_instruction(message, plan_id)
+            memory_context, memories = await self._retrieve_memories(message)
+            kb_context, references = await self._retrieve_knowledge(message)
+            messages = (
+                self._base_messages(memory_context, kb_context) + history + [{"role": "user", "content": instruction}]
+            )
+            # 首帧即携带检索增强上下文：前端可提前渲染「参考依据 / 召回记忆」卡片
+            yield {"event": SSE_META, "data": {"sessionId": session_id, "references": references, "memories": memories}}
+
+            result: AgentRunResult | None = None
+            async for event in self._loop_stream(messages, defer_writes=defer_writes):
+                if event["event"] == SSE_RESULT:
+                    result = event["data"]
+                    continue
+                yield event
+            if result is None:  # pragma: no cover - 编排必然产出结果或抛出异常
+                raise ApiError(500, "INTERNAL_ERROR", "Agent 编排未产出结果")
+
+            result.references = [KbHit(**hit) for hit in references]
+            result.memories = [MemoryItem(**item) for item in memories]
+
+            # 仅保留「用户 / 最终助手」两条，工具中间态不入历史，控制上下文体积
+            updated = history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": result.content},
+            ]
+            await self._store.set(session_id, updated)
+            if defer_writes:
+                await self._store.set_pending(session_id, [item.model_dump() for item in result.pendingActions])
+            if self._memory is not None:
+                self._memory.schedule_extract(session_id, message, result.content)
+            response = AgentChatResponse(sessionId=session_id, **result.model_dump())
+            yield {"event": SSE_FINAL, "data": response.model_dump()}
+
     async def confirm_actions(
         self, session_id: str, action_ids: list[str] | None = None, *, reject: bool = False
     ) -> tuple[list[ToolCallRecord], list[PendingAction], str | None]:
@@ -320,28 +382,74 @@ class AgentRunner:
         return await self._memory.context_and_memories(query, top_k=self._memory_top_k)
 
     async def _loop(self, messages: list[dict[str, Any]], *, defer_writes: bool = False) -> AgentRunResult:
+        """非流式编排：消费 :meth:`_loop_stream` 并取回终态结果。
+
+        保持「单一实现」：流式与非流式共用同一套循环，避免两条链路语义漂移。
+        """
+        async for event in self._loop_stream(messages, defer_writes=defer_writes):
+            if event["event"] == SSE_RESULT:
+                return event["data"]
+        raise ApiError(500, "INTERNAL_ERROR", "Agent 编排未产出结果")  # pragma: no cover
+
+    async def _loop_stream(
+        self, messages: list[dict[str, Any]], *, defer_writes: bool = False
+    ) -> AsyncIterator[dict[str, Any]]:
+        """编排循环的**流式实现**：边调用模型/工具边产出事件。
+
+        产出 ``delta`` / ``tool_start`` / ``tool_result`` / ``pending`` 事件（可直接下发给
+        前端），并以 ``SSE_RESULT`` 事件收尾（内部使用，携带 :class:`AgentRunResult`，
+        由调用方转换为 ``final`` 或直接返回）。
+
+        模型未实现 ``chat_stream`` 时自动回退为一次性调用：仅退化为「无逐字效果」，
+        功能与语义不变。
+        """
         if self._llm is None:
             raise llm_unavailable()
 
+        streamer = getattr(self._llm, "chat_stream", None)
         records: list[ToolCallRecord] = []
         pending: list[PendingAction] = []
         plan_id: str | None = None
 
         for step in range(1, self._max_steps + 1):
             self._enforce_budget(messages)
-            message = await self._llm.chat(messages, tools=self._tool_specs, temperature=self._temperature)
-            messages.append(self._canonical_assistant(message))
+            message: dict[str, Any] | None = None
+            if streamer is None:
+                # 模型未实现流式能力：一次性调用，并把全文作为单帧下发（功能不变，仅少了逐字效果）
+                message = await self._llm.chat(messages, tools=self._tool_specs, temperature=self._temperature)
+                text = _content_to_text(message.get("content"))
+                if text:
+                    yield {"event": SSE_DELTA, "data": {"text": text}}
+            else:
+                async for chunk in streamer(messages, tools=self._tool_specs, temperature=self._temperature):
+                    if chunk.get("type") == "content":
+                        yield {"event": SSE_DELTA, "data": {"text": chunk["text"]}}
+                    elif chunk.get("type") == "message":
+                        message = chunk.get("message")
+                if message is None:
+                    raise ApiError(422, "LLM_FORMAT_ERROR", "LLM 流式响应未返回完整消息")
 
+            messages.append(self._canonical_assistant(message))
             tool_calls = message.get("tool_calls") or []
+
             if not tool_calls:
                 METRICS.observe("agent_steps", step, buckets=(1, 2, 3, 4, 5, 6, 8), help="Agent 收敛步数")
                 METRICS.inc_counter("agent_runs_total", {"outcome": "completed"})
-                return AgentRunResult(
-                    content=_content_to_text(message.get("content")),
-                    planId=plan_id,
-                    toolCalls=records,
-                    steps=step,
-                )
+                yield {
+                    "event": SSE_RESULT,
+                    "data": AgentRunResult(
+                        content=_content_to_text(message.get("content")),
+                        planId=plan_id,
+                        toolCalls=records,
+                        steps=step,
+                    ),
+                }
+                return
+
+            for call in tool_calls:
+                function = call.get("function") if isinstance(call, dict) else None
+                name = function.get("name") if isinstance(function, dict) else None
+                yield {"event": SSE_TOOL_START, "data": {"name": name}}
 
             # 同一条消息内的多个工具调用并行执行，结果按原序回填（OpenAI 协议要求顺序一致）
             outcomes = await asyncio.gather(
@@ -354,6 +462,16 @@ class AgentRunner:
                     messages.append(tool_message)
                 if pending_action is not None:
                     pending.append(pending_action)
+                # result 可能很大（整份计划），此处只下发轻量字段，完整明细由 final 事件补齐
+                yield {
+                    "event": SSE_TOOL_RESULT,
+                    "data": {
+                        "name": record.name,
+                        "arguments": record.arguments,
+                        "ok": record.ok,
+                        "error": record.error,
+                    },
+                }
 
             if pending:
                 # 出现写操作：本轮到此为止，交由用户确认后再落库（不继续消耗模型步数）
@@ -362,13 +480,20 @@ class AgentRunner:
                 METRICS.inc_counter("agent_runs_total", {"outcome": "pending_confirmation"})
                 narrative = _content_to_text(message.get("content")).strip()
                 summary = _describe_pending(pending)
-                return AgentRunResult(
-                    content=f"{narrative}\n\n{summary}" if narrative else summary,
-                    planId=plan_id,
-                    toolCalls=records,
-                    steps=step,
-                    pendingActions=pending,
-                )
+                # 待确认摘要由服务端确定性生成：以增量下发，保证前端文案与最终结果一致
+                yield {"event": SSE_DELTA, "data": {"text": f"{narrative}\n\n{summary}" if narrative else summary}}
+                yield {"event": SSE_PENDING, "data": {"actions": [item.model_dump() for item in pending]}}
+                yield {
+                    "event": SSE_RESULT,
+                    "data": AgentRunResult(
+                        content=f"{narrative}\n\n{summary}" if narrative else summary,
+                        planId=plan_id,
+                        toolCalls=records,
+                        steps=step,
+                        pendingActions=pending,
+                    ),
+                }
+                return
 
         METRICS.inc_counter("agent_runs_total", {"outcome": "max_steps"})
         raise ApiError(
