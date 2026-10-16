@@ -37,6 +37,56 @@ ISSUE_OPEN_STATUSES: tuple[str, ...] = ("OPEN", "MITIGATING", "MONITORING")
 #: 高关注严重度（用于质量看板的高危未关闭计数）
 ISSUE_HIGH_SEVERITIES: tuple[str, ...] = ("HIGH", "CRITICAL")
 
+# ------------------------------ 知识库 / 向量检索 ------------------------------
+
+#: Chroma 集合名（分块正文 / 长期记忆各一，物理隔离避免互相污染）
+KB_COLLECTION = "kb_chunks"
+MEMORY_COLLECTION = "memories"
+
+#: 支持解析的文档扩展名（其余后缀按纯文本尽力解析，二进制则明确报错）
+KB_DOCUMENT_EXTENSIONS: tuple[str, ...] = (
+    ".md",
+    ".markdown",
+    ".txt",
+    ".csv",
+    ".json",
+    ".html",
+    ".htm",
+    ".pdf",
+    ".docx",
+)
+
+#: 长期记忆类型（与前端 / 模型抽取口径一致）
+MEMORY_TYPES: tuple[str, ...] = ("fact", "preference", "decision", "constraint", "task", "other")
+#: 记忆类型 → 中文名（前端展示）
+MEMORY_TYPE_LABELS: dict[str, str] = {
+    "fact": "事实",
+    "preference": "偏好",
+    "decision": "决策",
+    "constraint": "约束",
+    "task": "任务",
+    "other": "其他",
+}
+#: 记忆重要度取值（high 优先注入上下文）
+MEMORY_IMPORTANCE: tuple[str, ...] = ("high", "medium", "low")
+#: 记忆状态：启用（参与召回）/ 停用（保留但不参与）
+MEMORY_STATUS_ACTIVE = "active"
+MEMORY_STATUS_DISABLED = "disabled"
+MEMORY_STATUSES: tuple[str, ...] = (MEMORY_STATUS_ACTIVE, MEMORY_STATUS_DISABLED)
+
+
+def default_chroma_dir() -> str:
+    """默认向量库持久化目录（可用环境变量 ``CHROMA_DIR`` 覆盖）。
+
+    与工作区存储同放 ``.data`` 目录：运行期数据不进源码目录，且该目录已在
+    ``.gitignore`` 中忽略，避免把向量库二进制误提交。
+    """
+    override = os.environ.get("CHROMA_DIR")
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent.parent / ".data" / "chroma")
+
+
 # ------------------------------ 排期口径 ------------------------------
 
 #: 单日标准工时（与引擎 ``src/constants/enums.ts`` 的 ``SCHEDULE.WORK_HOURS_PER_DAY`` 对齐）
@@ -73,6 +123,16 @@ __all__ = [
     "IMPORT_MODE_APPEND",
     "IMPORT_MODE_NEW",
     "IMPORT_MODES",
+    "KB_COLLECTION",
+    "MEMORY_COLLECTION",
+    "KB_DOCUMENT_EXTENSIONS",
+    "MEMORY_TYPES",
+    "MEMORY_TYPE_LABELS",
+    "MEMORY_IMPORTANCE",
+    "MEMORY_STATUS_ACTIVE",
+    "MEMORY_STATUS_DISABLED",
+    "MEMORY_STATUSES",
+    "default_chroma_dir",
     "ISSUE_SEVERITIES",
     "ISSUE_PROBABILITIES",
     "ISSUE_STATUSES",

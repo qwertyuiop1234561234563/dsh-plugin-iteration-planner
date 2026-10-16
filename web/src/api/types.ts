@@ -281,6 +281,14 @@ export interface AgentHealth {
   tools: string[]
   /** 需用户确认后才执行的写类工具（两阶段写操作） */
   writeTools: string[]
+  /** 知识库（向量检索）是否已启用；未启用时不含 kb_* 工具，前端不展示引用卡片 */
+  knowledgeEnabled?: boolean
+  /** 长期记忆是否已启用；未启用时不含 memory_* 工具 */
+  memoryEnabled?: boolean
+  /** 是否在每轮对话后自动提取长期记忆 */
+  memoryAutoExtract?: boolean
+  /** 当前向量化模型名（未启用为 null） */
+  embeddingModel?: string | null
 }
 
 /** 风险缓解建议来源：llm（模型生成）/ rule（规则聚合，LLM 未配置或调用失败时降级） */
@@ -348,6 +356,10 @@ export interface AgentChatResult {
   toolCalls: AgentToolCallRecord[]
   steps: number
   pendingActions: AgentPendingAction[]
+  /** 本轮实际引用到的知识库片段（供用户核对结论依据） */
+  references?: KbHit[]
+  /** 本轮注入上下文的长期记忆（供用户纠偏） */
+  memories?: MemoryItem[]
 }
 
 /** 确认执行待确认写操作的响应 */
@@ -662,4 +674,159 @@ export interface PreferenceBlob {
   profile: string
   updatedAt: string | null
   payload: Record<string, unknown> | null
+}
+
+/* ------------------------- 知识库（RAG · /api/kb/**） ------------------------- */
+
+/** 检索命中片段（score 为 RRF 融合分或余弦相似度，越大越相关） */
+export interface KbHit {
+  chunkId?: string | null
+  docId?: string | null
+  title?: string | null
+  source: string
+  chunkIndex: number
+  tags: string[]
+  text: string
+  score: number
+}
+
+export interface KbHitList {
+  query: string
+  /** 本次实际使用的检索模式：hybrid（稠密 + BM25 → RRF）/ dense（纯向量） */
+  mode: string
+  items: KbHit[]
+}
+
+export interface KbChunkPreview {
+  chunkId?: string | null
+  chunkIndex: number
+  text: string
+}
+
+export interface KbDocument {
+  docId: string
+  title?: string | null
+  source: string
+  filename: string
+  extension: string
+  tags: string[]
+  chunkCount: number
+  charCount: number
+  createdAt: string
+}
+
+export interface KbDocumentDetail extends KbDocument {
+  chunks: KbChunkPreview[]
+}
+
+export interface KbDocumentList {
+  items: KbDocument[]
+  total: number
+}
+
+export interface KbDeleteResult {
+  docId: string
+  deletedChunks: number
+  deleted: boolean
+}
+
+export interface KbStats {
+  documentCount: number
+  chunkCount: number
+  totalChars: number
+  /** 是否启用混合检索（稠密 + BM25） */
+  hybrid: boolean
+  /** 当前向量化模型名 */
+  embedder: string
+  chunkSize: number
+  chunkOverlap: number
+  topK: number
+  maxDocuments: number
+  updatedAt: string | null
+}
+
+export interface KbDocumentCreatePayload {
+  title: string
+  content: string
+  source?: string
+  tags?: string[]
+}
+
+export interface KbSearchPayload {
+  query: string
+  topK?: number
+  hybrid?: boolean
+}
+
+export interface KbUploadPayload {
+  file: File
+  title?: string
+  source?: string
+  /** 标签，逗号分隔（中英文逗号均可） */
+  tags?: string
+}
+
+/* --------------------- 长期记忆（Mem0 风格 · /api/memories/**） --------------------- */
+
+export const MEMORY_TYPE_VALUES = ['fact', 'preference', 'decision', 'constraint', 'task', 'other'] as const
+export type MemoryType = (typeof MEMORY_TYPE_VALUES)[number]
+
+export const MEMORY_IMPORTANCE_VALUES = ['high', 'medium', 'low'] as const
+export type MemoryImportance = (typeof MEMORY_IMPORTANCE_VALUES)[number]
+
+export const MEMORY_STATUS_VALUES = ['active', 'disabled'] as const
+export type MemoryStatus = (typeof MEMORY_STATUS_VALUES)[number]
+
+export interface MemoryItem {
+  memoryId: string
+  text: string
+  type: string
+  importance: string
+  tags: string[]
+  source: string
+  status: string
+  createdAt: string
+  lastUsedAt: string
+  /** 召回时的语义相似度（列表接口恒为 0，检索接口才填充） */
+  score: number
+  /** 写入是否真正发生（false 表示与既有记忆高度相似被去重跳过） */
+  created: boolean
+}
+
+export interface MemoryList {
+  items: MemoryItem[]
+  total: number
+}
+
+export interface MemorySearchResult {
+  query: string
+  items: MemoryItem[]
+}
+
+export interface MemoryStats {
+  total: number
+  active: number
+  disabled: number
+  byType: Record<string, number>
+  maxItems: number
+  /** 是否在每轮对话后自动提取 */
+  autoExtract: boolean
+  topK: number
+}
+
+export interface MemoryCreatePayload {
+  text: string
+  type?: string
+  importance?: string
+  tags?: string[]
+  source?: string
+}
+
+export interface MemoryDeleteResult {
+  memoryId?: string
+  deleted: boolean
+}
+
+export interface MemoryClearResult {
+  deleted: number
 }

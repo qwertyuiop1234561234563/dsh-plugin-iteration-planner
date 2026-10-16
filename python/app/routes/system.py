@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 
-from ..agent.schemas import TOOL_NAMES
 from ..metrics import METRICS
 from ..state import AppContext
 
@@ -46,7 +45,9 @@ async def _collect_health(ctx: AppContext) -> dict:
             "engineReachable": reachable,
             "engineCircuit": ctx.engine.breaker_state,
             "agentEnabled": ctx.runner.available,
-            "agentTools": len(TOOL_NAMES),
+            "agentTools": len(ctx.runner.tool_names),
+            "knowledgeEnabled": ctx.knowledge is not None,
+            "memoryEnabled": ctx.memory is not None,
         },
     }
 

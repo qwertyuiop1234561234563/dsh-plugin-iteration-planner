@@ -2,6 +2,10 @@
 
 Python Agent 的每个工具都通过 HTTP 调用 TypeScript 引擎（唯一算法事实来源），
 不在 Python 侧重写任何算法。工具名与引擎 REST 能力一一对应。
+
+**检索类工具例外**：``kb_search`` / ``kb_list_documents`` / ``memory_search`` 不走上游引擎，
+而是直接读取本进程的知识库与长期记忆（**只读**，不产生任何写副作用），
+用于 agentic RAG（模型按需自行检索资料与历史约定）。
 """
 
 from __future__ import annotations
@@ -9,7 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..engine_client import EngineClient
-from ..errors import ApiError, bad_request
+from ..errors import ApiError, bad_request, embedding_unavailable
 
 
 def _require_str(args: dict[str, Any], key: str) -> str:
@@ -36,10 +40,12 @@ def _require_int(args: dict[str, Any], key: str) -> int:
 
 
 class ToolDispatcher:
-    """把 LLM 的 function call 翻译为对引擎 REST 的调用。"""
+    """把 LLM 的 function call 翻译为对引擎 REST 的调用（检索类工具直连本地知识库）。"""
 
-    def __init__(self, engine: EngineClient) -> None:
+    def __init__(self, engine: EngineClient, *, knowledge: Any | None = None, memory: Any | None = None) -> None:
         self._engine = engine
+        self._knowledge = knowledge
+        self._memory = memory
 
     async def dispatch(self, name: str, args: dict[str, Any]) -> Any:
         """执行工具并返回 canonical JSON 结果（供回填模型）。"""
@@ -113,6 +119,34 @@ class ToolDispatcher:
 
     async def _tool_report_generate(self, args: dict[str, Any]) -> Any:
         return await self._engine.request("GET", f"/plans/{_require_str(args, 'planId')}/report")
+
+    # ---------------------- 知识库 / 长期记忆（只读，本地检索） ----------------------
+
+    def _require_knowledge(self) -> Any:
+        if self._knowledge is None:
+            raise embedding_unavailable("知识库未启用（未配置向量化模型），无法检索文档")
+        return self._knowledge
+
+    def _require_memory(self) -> Any:
+        if self._memory is None:
+            raise embedding_unavailable("长期记忆未启用（未配置向量化模型），无法召回记忆")
+        return self._memory
+
+    async def _tool_kb_search(self, args: dict[str, Any]) -> Any:
+        knowledge = self._require_knowledge()
+        top_k = args.get("topK")
+        hits = await knowledge.search(_require_str(args, "query"), top_k=int(top_k) if top_k else None)
+        return {"count": len(hits), "hits": hits}
+
+    async def _tool_kb_list_documents(self, _args: dict[str, Any]) -> Any:
+        knowledge = self._require_knowledge()
+        documents = await knowledge.list_documents()
+        return {"count": len(documents), "documents": documents}
+
+    async def _tool_memory_search(self, args: dict[str, Any]) -> Any:
+        memory = self._require_memory()
+        items = await memory.recall(_require_str(args, "query"))
+        return {"count": len(items), "memories": items}
 
 
 __all__ = ["ToolDispatcher", "ApiError"]

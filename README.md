@@ -111,9 +111,10 @@ dsh-plugin-iteration-planner/
 │   │   ├── models.py            # Agent 原生端点请求 / 响应模型
 │   │   ├── state.py             # 运行时上下文（配置 / 引擎 / Agent / WS）
 │   │   ├── ws.py                # WebSocket 广播 + 引擎事件流桥接
-│   │   ├── agent/               # 【Agent 编排层】提示词 / 工具定义与调度 / LLM 客户端 / function calling 循环
-│   │   └── routes/              # 系统路由 / Agent 路由 / 网关透传（SPA 托管）
-│   ├── tests/                   # pytest（Mock 引擎 + 脚本化 LLM，覆盖转发/错误/鉴权/Agent）
+│   │   ├── agent/               # 【Agent 编排层】提示词 / 工具定义与调度 / LLM 客户端 / function calling 循环 / 长期记忆
+│   │   ├── kb/                  # 【知识库 RAG】向量化 / Chroma 向量库 / 递归分块 / 文档解析 / 混合检索（BM25 + RRF）
+│   │   └── routes/              # 系统路由 / Agent / 知识库 / 长期记忆 / 治理工作区 / 网关透传（SPA 托管）
+│   ├── tests/                   # pytest（Mock 引擎 + 脚本化 LLM + 桩向量化，覆盖转发/错误/鉴权/Agent/知识库/记忆）
 │   ├── requirements.txt         # 运行时依赖
 │   ├── requirements-dev.txt     # 开发测试依赖
 │   ├── pyproject.toml           # pytest 配置
@@ -134,7 +135,7 @@ dsh-plugin-iteration-planner/
 │   ├── src/
 │   │   ├── api/                 # 前端 API 客户端 + 领域类型契约
 │   │   ├── stores/              # Pinia 状态（计划 / 偏好设置）
-│   │   ├── views/               # 6 个页面（列表 / 新建 / 总览 / 任务 / DAG / 审计）
+│   │   ├── views/               # 页面（计划 / 治理 / 分析 / 知识库 / 长期记忆 / 审计）
 │   │   ├── components/          # KPI 卡片 / 燃尽图 / 风险面板 / 任务编辑弹窗
 │   │   ├── layouts/             # 控制台主布局（导航 + 计划切换 + WS 状态）
 │   │   └── utils/               # 枚举文案映射与格式化
@@ -452,7 +453,15 @@ docker compose up -d --build
 | `DATABASE_URL` | — | PostgreSQL 连接串（优先于离散 `PG*` 参数） |
 | `WEB_STATIC_DIR` | 空 | 前端产物目录；存在则同域托管 SPA |
 | `PLANNER_FALLBACK_TO_RULE` | `true` | LLM 输出异常时是否降级规则实现 |
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 空 | OpenAI 兼容网关；三项齐全才启用 LLM 主路径 |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 空 | OpenAI 兼容网关；三项齐全才启用 LLM 主路径。阿里云百炼示例：`https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus` |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | 空 / 空 / `text-embedding-v4` | 向量化网关；端点与密钥留空则回落 `LLM_BASE_URL` / `LLM_API_KEY`（百炼同一端点兼做 embeddings） |
+| `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE` | `1024` / `10` | 向量维度（v4 支持 2048…64）/ 单次请求条数 |
+| `VECTOR_STORE` / `CHROMA_DIR` | `chroma` / 空 | 向量库驱动 / 持久化目录（留空用 `python/.data/chroma`，已 gitignore） |
+| `KB_CHUNK_SIZE` / `KB_CHUNK_OVERLAP` / `KB_TOP_K` | `800` / `120` / `4` | 分块字符数 / 重叠字符数 / 默认召回条数 |
+| `KB_HYBRID` / `KB_RRF_K` / `KB_AUTO_INJECT` / `KB_INJECT_TOP_K` | `true` / `60` / `true` / `3` | 混合检索开关 / RRF 平滑常数 / 对话自动注入开关 / 注入条数 |
+| `KB_MAX_DOCUMENT_BYTES` / `KB_MAX_DOCUMENTS` | `20971520` / `500` | 单文档体积上限 / 文档总数上限 |
+| `MEMORY_ENABLED` / `MEMORY_EXTRACT` / `MEMORY_TOP_K` | `true` / `true` / `4` | 记忆总开关 / 自动提取开关 / 每轮注入条数 |
+| `MEMORY_DEDUP_THRESHOLD` / `MEMORY_MAX_ITEMS` | `0.92` / `2000` | 去重相似度阈值 / 记忆总量上限 |
 
 ### 10.6 开放 API 一览
 
@@ -469,6 +478,7 @@ docker compose up -d --build
 | `GET` | `/api/plans/:planId/graph` | DAG 视图（节点含 critical/isolated/inCycle 标记） |
 | `GET` | `/api/plans/:planId/{critical-path,risks,burndown,report,export}` | 关键路径 / 风险 / 燃尽 / 报表 / 导出 |
 | `GET` / `POST` | `/api/audit`、`/api/plans/:planId/dag-check` | 审计查询 / 手动校验 DAG |
+| `*` | `/api/kb/**`、`/api/memories/**` | 知识库（RAG）与长期记忆（Python 服务提供，详见 §10.9） |
 | `WS` | `/ws` | 计划创建/更新/删除事件推送（含 30s 心跳） |
 
 成功响应统一为 `{ "data": ... }`；错误统一为 `{ "code", "message", "details" }`，并映射到稳定错误码：
@@ -483,6 +493,8 @@ docker compose up -d --build
 | 计划总览 | KPI 卡片、关键路径时间线（es/ls 与进度条）、风险面板（可定位关联任务）、燃尽图、Markdown 报表预览、导出 JSON/MD、重规划弹窗 |
 | 任务管理 | 关键字 / 状态 / 关键路径过滤，新增与编辑（保存即重规划）、删除，循环依赖阻断时给出专项提示并定位 |
 | 依赖 DAG | AntV X6 画布，按拓扑层级自动布局；关键路径红色、环内橙色虚线、孤立灰底；环 / 悬空依赖顶部告警；缩放与平移；节点详情面板 |
+| 知识库 | 文档清单（格式 / 分块数 / 字符数 / 标签）、上传文件或粘贴文本入库、分块预览、删除；检索试跑展示命中片段与得分，并可切换混合 / 纯向量模式 |
+| 长期记忆 | 记忆清单（类型 / 重要度 / 状态 / 来源 / 最近使用）、按状态与类型过滤、关键词搜索、启用停用、删除与清空、手工新增（写入前自动去重）；语义召回试跑展示相似度排序 |
 | 审计日志 | 按计划过滤、条数上限、成功/失败与耗时统计、展开查看入参与返回值完整 JSON |
 
 > 前端令牌保存在浏览器 `localStorage`，与后端 `API_TOKEN` 一致即可；未开启鉴权时留空。
@@ -501,6 +513,8 @@ docker compose up -d --build
 |---|---|---|
 | 对外网关（Python） | [`python/app/routes/proxy.py`](./python/app/routes/proxy.py) | `/api/**` 原样透传（信封 / 状态码 / 导出文件），统一 Bearer 鉴权、CORS、SPA 托管 |
 | Agent 编排（Python） | [`python/app/agent/`](./python/app/agent) | 系统提示词 + function calling 循环；每个工具通过 HTTP 调用 TS 引擎 |
+| 知识库 RAG（Python） | [`python/app/kb/`](./python/app/kb) | 文档解析 → 递归分块 → 批量向量化（百炼 `text-embedding-v4`）→ Chroma 持久化；检索走稠密向量 + BM25 → RRF 融合 |
+| 长期记忆（Python） | [`python/app/agent/memory.py`](./python/app/agent/memory.py) | 每轮对话后自动提取（Mem0 风格）→ 向量去重 → 语义召回 top-k 注入上下文 |
 | 内部算法引擎（TS） | [`src/api/`](./src/api)、[`src/service/`](./src/service)、[`src/algorithm/`](./src/algorithm) | Kahn 拓扑 / AOE 关键路径 / 缓冲 / 风险 / 燃尽 / 报表，**算法零改动** |
 | 控制台（Vue3） | [`web/`](./web) | 仅把 base URL 指向 Python 服务，**页面代码零改动** |
 
@@ -518,6 +532,8 @@ ENGINE_BASE_URL=http://127.0.0.1:8080 API_PORT=8000 python python/run.py
 
 > Windows PowerShell：`$env:ENGINE_BASE_URL="http://127.0.0.1:8080"; $env:API_PORT="8000"; python python/run.py`
 > 便捷脚本：`npm run py:install` / `npm run py:start` / `npm run py:test`。
+> 启用知识库与长期记忆：在仓库根 `.env` 中配置 `EMBEDDING_API_KEY`（留空则回落 `LLM_API_KEY`）；
+> 未配置时二者自动降级为「不可用」，主链路（算法与对话）不受影响。**注意 `Settings` 按进程当前目录读取 `.env`，需从仓库根启动。**
 
 启动后：
 - 控制台 / 透传 API：`http://localhost:8000`
@@ -527,6 +543,16 @@ ENGINE_BASE_URL=http://127.0.0.1:8080 API_PORT=8000 python python/run.py
 ### 10.3 Agent 原生端点（`/api/agent/*`）
 
 需配置 `LLM_BASE_URL / LLM_API_KEY / LLM_MODEL`（OpenAI 兼容网关）后启用；未配置时明确返回 `503 LLM_UNAVAILABLE`。
+
+以阿里云百炼（Model Studio）为例：把密钥写入仓库根目录 `.env`（已被 `.gitignore` 忽略，不会入库），重启服务即生效。
+
+```ini
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_API_KEY=sk-xxxxxxxxxxxxxxxx
+LLM_MODEL=qwen-plus
+```
+
+新人免费额度按模型发放、仅「华北2（北京）」地域享有（开通后 90 天内有效），额度用尽后已实名账号会自动转为按量计费。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -554,6 +580,8 @@ Agent 的工具**不实现算法**，仅把 function call 翻译为引擎 REST �
 | `dag_build` / `dag_check` / `schedule_calc` | `GET …/graph`、`POST …/dag-check`、`GET …/critical-path` |
 | `risk_scan` / `report_generate` | `GET …/risks`、`GET …/report` |
 | `get_plan` / `list_plans` | `GET /api/plans/:planId`、`GET /api/plans` |
+| `kb_search` / `kb_list_documents` | **Python 本地**（Chroma 向量库 + BM25，不经过引擎） |
+| `memory_search` | **Python 本地**（长期记忆语义召回，不经过引擎） |
 
 ### 10.5 错误契约（Python 与引擎完全一致）
 
@@ -561,7 +589,9 @@ Agent 的工具**不实现算法**，仅把 function call 翻译为引擎 REST �
 `CYCLE_DEPENDENCY`(409)、`VALIDATION_ERROR`(400)、`LLM_FORMAT_ERROR`(422)、`STORAGE_UNAVAILABLE`(503)、`UNAUTHORIZED`(401)；
 Python 新增：`ENGINE_UNAVAILABLE`(502，引擎不可达)、`ENGINE_CIRCUIT_OPEN`(503，引擎断路器开路)、
 `LLM_UNAVAILABLE`(503，未配置网关)、`AGENT_MAX_STEPS`(422，编排未收敛)、
-`RATE_LIMITED`(429，触发限流)、`SERVICE_UNAVAILABLE`(503，未就绪/关机)。
+`RATE_LIMITED`(429，触发限流)、`SERVICE_UNAVAILABLE`(503，未就绪/关机)、
+`EMBEDDING_UNAVAILABLE`(503，未配置向量化模型)、`EMBEDDING_GATEWAY_ERROR`(502，向量化网关异常)、
+`VECTOR_STORE_UNAVAILABLE`(503，Chroma 不可用/集合未知)。
 
 ### 10.6 测试
 
@@ -569,10 +599,11 @@ Python 新增：`ENGINE_UNAVAILABLE`(502，引擎不可达)、`ENGINE_CIRCUIT_OP
 npm run py:test          # 等价于 python -m pytest -c python/pyproject.toml
 ```
 
-50 个用例（Mock 引擎 + 脚本化 LLM，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
-Agent 工具调度、工具失败容忍、会话上下文、步数上限，以及企业级加固能力（限流 / 安全头 / 关联 ID /
+149 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
+Agent 工具调度、工具失败容忍、会话上下文、步数上限，企业级加固能力（限流 / 安全头 / 关联 ID /
 指标 / 就绪探针 / 断路器 / 重试 / 并行工具调用 / 上下文裁剪 / 会话存储 / LLM 调用重试 / WS 断线重放 /
-工具异常兜底 / 输入边界包裹）。
+工具异常兜底 / 输入边界包裹），以及**知识库全链路**（分块 / 文档解析 / BM25 / RRF / 向量库增删查 /
+入库-检索-删除 REST）与**长期记忆**（候选解析 / 去重 / 语义召回 / 停用治理 / 自动提取 / agentic RAG 工具）。
 
 ### 10.7 Docker Compose（Python 对外，引擎内网）
 
@@ -600,6 +631,49 @@ Agent 工具调度、工具失败容忍、会话上下文、步数上限，以�
 
 运维端点：`http://<host>/healthz`、`/readyz`、`/metrics`（均免鉴权，便于 k8s 探针与 Prometheus 抓取）。
 
+### 10.9 知识库（RAG）与长期记忆
+
+两项能力均为**可选增强**：向量化模型未配置时自动降级，`/agent/health` 的 `knowledgeEnabled` / `memoryEnabled`
+返回 `false`，控制台对应页面展示配置引导，主对话链路不受影响。
+
+**技术选型（当前主流方案）**：向量库 [Chroma](https://www.trychroma.com/)（本地持久化，生产可换远端客户端）；
+向量化用阿里云百炼 `text-embedding-v4`（OpenAI 兼容 `/embeddings`，支持 2048/1536/1024/768/512/256/128/64 维，默认 1024）；
+检索用**混合检索**——稠密向量召回 + `BM25`（中文按 unigram + bigram 切分，零分词依赖）→ **RRF 融合**（`k=60`）。
+
+**入库流水线**（`python/app/kb/`）：
+
+```
+文件/文本 → 文档解析（md / txt / csv / json / html / pdf / docx）→ 递归字符分块（800 字 / 120 重叠）
+        → 批量向量化（每批 10 条，指数退避重试）→ 写入 Chroma（cosine）
+```
+
+**检索流水线**：`query` → 向量化 → Chroma `query`（相似度 `1 - distance`）+ BM25 全量打分 → RRF 融合 → top-k。
+
+**长期记忆（Mem0 风格）**：每轮对话结束后异步提取「自包含的一句话」候选（模型抽取，容忍 ```json 围栏与噪声）；
+写入前与既有记忆做向量比对，相似度 ≥ `MEMORY_DEDUP_THRESHOLD`(0.92) 视为重复并跳过；召回时按
+`相似度 ≥ 0.25` 过滤 → 相关度 + 重要度加权（high +0.12 / medium +0.04）排序 → top-k 作为**独立 system 区块**
+注入（记忆在前、知识库在后，主提示保持稳定以利缓存）。记忆可停用 / 删除 / 清空，停用后保留数据但不再召回。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/kb/stats` | 文档数 / 分块数 / 字符数、分块与检索配置、当前向量化模型 |
+| `GET` / `POST` | `/api/kb/documents` | 文档清单 / 以粘贴文本入库 |
+| `POST` | `/api/kb/documents/upload` | 上传文件入库（multipart：`file`、`title`、`source`、`tags`） |
+| `GET` / `DELETE` | `/api/kb/documents/:docId` | 文档详情（含分块预览）/ 删除文档及其全部分块 |
+| `POST` | `/api/kb/search` | 混合检索试跑（`query`、`topK`、`hybrid`），返回命中片段与得分 |
+| `GET` | `/api/memories/stats` | 记忆总数 / 启用数 / 按类型分布 / 自动提取开关 |
+| `GET` / `POST` | `/api/memories` | 记忆清单（可按 `status` 过滤）/ 手工新增 |
+| `POST` | `/api/memories/search` | 语义召回试跑（返回下一轮对话会想起哪些记忆） |
+| `PATCH` / `DELETE` | `/api/memories/:memoryId` | 启用 / 停用 / 删除单条记忆 |
+| `DELETE` | `/api/memories` | 清空全部记忆 |
+
+Agent 侧新增三个**只读**检索工具（写类工具仍走两阶段确认）：`kb_search`、`kb_list_documents`、`memory_search`；
+`POST /api/agent/chat` 的响应新增 `references`（本轮引用的知识库片段）与 `memories`（本轮注入的记忆），
+控制台 AI 助手抽屉会以卡片展示，便于用户核对结论依据并在发现记忆跑偏时及时纠偏。
+
+> 运行期数据默认落在 `python/.data/chroma`（已 gitignore）；容器部署请挂载卷以免重建镜像丢库。
+> Chroma 为**单进程本地库**：多 worker / 多副本时需改用 Chroma Server 或远端向量库（如 Milvus / pgvector）。
+
 ---
 
 ## 十一、已知边界
@@ -607,3 +681,8 @@ Agent 工具调度、工具失败容忍、会话上下文、步数上限，以�
 - **算法口径修正**：§5.2 表格中两处已与需求方确认，其余严格遵循需求文档。
 - **LLM 拆解质量**依赖所接入模型；未接入 LLM 时使用规则拆解（按需求关键词映射任务模板），保证离线可运行。
 - **扩展接口**（Jira / Git / CI-CD）当前仅为接口占位，尚未实现具体适配器。
+- **知识库与长期记忆为可选增强**：需配置向量化模型（`EMBEDDING_API_KEY` 或复用 `LLM_API_KEY`）后启用，
+  未配置时自动降级且主链路不受影响；向量库为**本地 Chroma 单进程库**，多 worker / 多副本部署需改用
+  Chroma Server 或远端向量库（Milvus / pgvector），并在容器中挂载持久卷（默认 `python/.data/chroma`）。
+- **检索策略**为「混合检索（向量 + BM25 → RRF）+ agentic 检索工具」，**未引入 rerank 精排模型**；
+  若需更高精度可接入 `gte-rerank` 等重排服务作为后续扩展点。

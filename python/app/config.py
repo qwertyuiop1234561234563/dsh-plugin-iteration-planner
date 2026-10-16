@@ -97,10 +97,75 @@ class Settings(BaseSettings):
     llm_retry_attempts: int = 2
     llm_retry_base_delay: float = 0.5
 
+    # ------------------------ 向量化模型（Embedding） ------------------------
+    #: 兼容端点基地址；留空则回落 ``LLM_BASE_URL``（百炼同一端点既做 chat 也做 embeddings）
+    embedding_base_url: str = ""
+    #: 密钥；留空则回落 ``LLM_API_KEY``
+    embedding_api_key: str = ""
+    #: 向量化模型名（百炼 text-embedding-v4 支持 2048/1536/1024/768/512/256/128/64 维）
+    embedding_model: str = "text-embedding-v4"
+    #: 输出维度（需与模型支持的档位一致；默认 1024 兼顾效果与体积）
+    embedding_dimensions: int = 1024
+    #: 单次请求的文本条数（百炼 text-embedding-v4 单次上限较小，保守按 10 条分批）
+    embedding_batch_size: int = 10
+    embedding_timeout_seconds: float = 60.0
+    #: 向量化调用额外重试次数（连接失败 / 429 / 5xx 生效）
+    embedding_retry_attempts: int = 2
+    embedding_retry_base_delay: float = 0.5
+
+    # --------------------------- 知识库（RAG） ---------------------------
+    #: 向量库驱动（当前仅 chroma；保留字段便于后续平滑切换）
+    vector_store: str = "chroma"
+    #: Chroma 持久化目录；留空则使用 ``python/.data/chroma``
+    chroma_dir: str = ""
+    #: 分块目标字符数 / 相邻块重叠字符数（按字符计，中文场景稳定）
+    kb_chunk_size: int = 800
+    kb_chunk_overlap: int = 120
+    #: 默认召回条数
+    kb_top_k: int = 4
+    #: 是否启用混合检索（稠密向量 + BM25 稀疏，RRF 融合）
+    kb_hybrid: bool = True
+    #: RRF 融合平滑常数（经验值 60）
+    kb_rrf_k: int = 60
+    #: 单文档体积上限（字节）与知识库文档总数上限
+    kb_max_document_bytes: int = 20 * 1024 * 1024
+    kb_max_documents: int = 500
+    #: 对话时是否自动把命中的知识库片段注入上下文（agentic 检索工具同时可用）
+    kb_auto_inject: bool = True
+    #: 自动注入时使用的召回条数（通常小于人工检索）
+    kb_inject_top_k: int = 3
+
+    # --------------------------- 长期记忆 ---------------------------
+    #: 是否启用长期记忆（记忆提取 + 语义召回）
+    memory_enabled: bool = True
+    #: 是否自动从每轮对话中提取记忆（关闭则只支持手工新增）
+    memory_extract: bool = True
+    #: 每轮注入上下文的最大记忆条数
+    memory_top_k: int = 4
+    #: 去重阈值：新记忆与既有记忆的余弦相似度 ≥ 该值视为重复，跳过写入
+    memory_dedup_threshold: float = 0.92
+    #: 记忆总量上限（防止无界增长）
+    memory_max_items: int = 2000
+
     @property
     def llm_enabled(self) -> bool:
         """LLM 网关三项齐全才启用 Agent 的模型主路径。"""
         return bool(self.llm_base_url and self.llm_model)
+
+    @property
+    def resolved_embedding_base_url(self) -> str:
+        """向量化端点：优先独立配置，否则回落 LLM 网关（百炼同一端点）。"""
+        return self.embedding_base_url or self.llm_base_url
+
+    @property
+    def resolved_embedding_api_key(self) -> str:
+        """向量化密钥：优先独立配置，否则回落 LLM 密钥。"""
+        return self.embedding_api_key or self.llm_api_key
+
+    @property
+    def embedding_enabled(self) -> bool:
+        """向量化三项齐全（端点 + 模型 + 密钥）才启用知识库与长期记忆。"""
+        return bool(self.resolved_embedding_base_url and self.embedding_model and self.resolved_embedding_api_key)
 
     @property
     def cors_origins(self) -> list[str]:

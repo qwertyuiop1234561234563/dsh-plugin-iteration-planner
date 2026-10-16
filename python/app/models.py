@@ -72,6 +72,10 @@ class AgentRunResult(BaseModel):
     toolCalls: list[ToolCallRecord] = Field(default_factory=list)
     steps: int = 0
     pendingActions: list[PendingAction] = Field(default_factory=list)
+    #: 本轮实际引用到的知识库片段（供前端展示「参考依据」，便于用户核对模型结论来源）
+    references: list["KbHit"] = Field(default_factory=list)
+    #: 本轮注入上下文的长期记忆（供前端展示「模型记得什么」，便于用户纠偏）
+    memories: list["MemoryItem"] = Field(default_factory=list)
 
 
 class AgentChatResponse(AgentRunResult):
@@ -270,3 +274,181 @@ class PreferencesRequest(BaseModel):
 
     profile: str | None = Field(default=None, max_length=64)
     payload: dict[str, Any]
+
+
+# ============================ 知识库（RAG） ============================
+#
+# 说明：知识库与长期记忆是本层**新增的检索增强能力**，出参形状稳定且前端强依赖
+# （列表渲染、字段级提示），因此与既有 ``/api/workspace/**`` 的「dict 组装」不同，
+# 这里给出显式模型，保证前后端契约可被 IDE 与类型检查校验。
+
+
+class KbDocumentCreateRequest(BaseModel):
+    """以「直接粘贴文本」的方式新建知识库文档（与文件上传接口互补）。"""
+
+    title: str = Field(min_length=1, max_length=200, description="文档标题")
+    content: str = Field(min_length=1, max_length=2_000_000, description="文档正文（纯文本 / Markdown）")
+    source: str | None = Field(default=None, max_length=200, description="来源说明（如系统名、链接）")
+    tags: list[str] = Field(default_factory=list, max_length=10, description="标签")
+
+
+class KbSearchRequest(BaseModel):
+    """知识库检索（混合检索试跑 / 外部系统调用）。"""
+
+    query: str = Field(min_length=1, max_length=2000, description="检索关键词或问题")
+    topK: int | None = Field(default=None, gt=0, le=50, description="返回条数（缺省取服务端配置）")
+    hybrid: bool | None = Field(default=None, description="是否启用混合检索（缺省取服务端配置）")
+
+
+class KbHit(BaseModel):
+    """单条命中片段（``score`` 为 RRF 融合分或余弦相似度）。"""
+
+    chunkId: str | None = None
+    docId: str | None = None
+    title: str | None = None
+    source: str = ""
+    chunkIndex: int = 0
+    tags: list[str] = Field(default_factory=list)
+    text: str = ""
+    score: float = 0.0
+
+
+class KbHitList(BaseModel):
+    """命中片段列表。"""
+
+    query: str
+    mode: str = Field(description="hybrid | dense")
+    items: list[KbHit] = Field(default_factory=list)
+
+
+class KbChunkPreview(BaseModel):
+    """分块预览（文档详情用）。"""
+
+    chunkId: str | None = None
+    chunkIndex: int = 0
+    text: str = ""
+
+
+class KbDocument(BaseModel):
+    """知识库文档摘要。"""
+
+    docId: str
+    title: str | None = None
+    source: str = ""
+    filename: str = ""
+    extension: str = ""
+    tags: list[str] = Field(default_factory=list)
+    chunkCount: int = 0
+    charCount: int = 0
+    createdAt: str = ""
+
+
+class KbDocumentDetail(KbDocument):
+    """知识库文档详情（含分块预览）。"""
+
+    chunks: list[KbChunkPreview] = Field(default_factory=list)
+
+
+class KbDocumentList(BaseModel):
+    """文档列表。"""
+
+    items: list[KbDocument] = Field(default_factory=list)
+    total: int = 0
+
+
+class KbDeleteResult(BaseModel):
+    """文档删除结果。"""
+
+    docId: str
+    deletedChunks: int = 0
+    deleted: bool = True
+
+
+class KbStats(BaseModel):
+    """知识库统计与检索配置（前端「设置概览」展示）。"""
+
+    documentCount: int = 0
+    chunkCount: int = 0
+    totalChars: int = 0
+    hybrid: bool = True
+    embedder: str = ""
+    chunkSize: int = 0
+    chunkOverlap: int = 0
+    topK: int = 0
+    maxDocuments: int = 0
+    updatedAt: str | None = None
+
+
+# ============================ 长期记忆 ============================
+
+
+class MemoryCreateRequest(BaseModel):
+    """手工新增一条长期记忆（自动提取之外的治理入口）。"""
+
+    text: str = Field(min_length=1, max_length=500, description="记忆内容（自包含的一句话）")
+    type: str = Field(default="fact", description="fact | preference | decision | constraint | task | other")
+    importance: str = Field(default="medium", description="high | medium | low")
+    tags: list[str] = Field(default_factory=list, max_length=5)
+    source: str | None = Field(default=None, max_length=128, description="来源标记（会话 ID 或手工）")
+
+
+class MemoryStatusRequest(BaseModel):
+    """启用 / 停用一条记忆。"""
+
+    status: str = Field(description="active | disabled")
+
+
+class MemoryItem(BaseModel):
+    """单条长期记忆。"""
+
+    memoryId: str
+    text: str = ""
+    type: str = "other"
+    importance: str = "medium"
+    tags: list[str] = Field(default_factory=list)
+    source: str = ""
+    status: str = "active"
+    createdAt: str = ""
+    lastUsedAt: str = ""
+    score: float = 0.0
+    #: 写入是否真正发生（``false`` 表示与既有记忆高度相似被去重跳过）
+    created: bool = True
+
+
+class MemoryList(BaseModel):
+    """记忆列表。"""
+
+    items: list[MemoryItem] = Field(default_factory=list)
+    total: int = 0
+
+
+class MemorySearchRequest(BaseModel):
+    """按语义召回记忆（试跑 / 外部系统调用）。"""
+
+    query: str = Field(min_length=1, max_length=2000)
+    topK: int | None = Field(default=None, gt=0, le=50)
+
+
+class MemorySearchResult(BaseModel):
+    """记忆召回结果。"""
+
+    query: str
+    items: list[MemoryItem] = Field(default_factory=list)
+
+
+class MemoryStats(BaseModel):
+    """记忆统计。"""
+
+    total: int = 0
+    active: int = 0
+    disabled: int = 0
+    byType: dict[str, int] = Field(default_factory=dict)
+    maxItems: int = 0
+    autoExtract: bool = False
+    topK: int = 0
+
+
+# ``AgentRunResult`` 通过**前向引用**引用知识库 / 记忆模型（声明位置在文件后部），
+# 需在模块加载完成后显式重建，否则首次校验时才会解析，易在子类继承场景下遗漏。
+AgentRunResult.model_rebuild()
+AgentChatResponse.model_rebuild()

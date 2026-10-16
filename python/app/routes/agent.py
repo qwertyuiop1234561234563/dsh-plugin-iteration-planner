@@ -12,7 +12,7 @@ from fastapi import APIRouter, Request
 
 from ..agent.advisor import generate_advice
 from ..agent.sanitize import sanitize_plan_id, sanitize_user_input
-from ..agent.schemas import TOOL_NAMES, TOOL_SPECS, WRITE_TOOL_NAMES
+from ..agent.schemas import WRITE_TOOL_NAMES
 from ..errors import llm_unavailable, not_found
 from ..models import (
     AdviceRequest,
@@ -35,22 +35,29 @@ def _require_agent(ctx: AppContext):
 def build_agent_router(base: str) -> APIRouter:
     router = APIRouter(prefix=f"{base}/agent", tags=["agent"])
 
-    @router.get("/health", summary="Agent 可用性（是否已配置 LLM 网关）")
+    @router.get("/health", summary="Agent 可用性（LLM / 知识库 / 长期记忆）")
     async def agent_health(request: Request) -> dict:
         ctx: AppContext = request.app.state.ctx
         return {
             "data": {
                 "enabled": ctx.runner.available,
                 "llm": ctx.settings.llm_model or None,
-                "tools": TOOL_NAMES,
+                # 工具清单按「当前真正可用」返回：未启用向量化时不含 kb_* / memory_* 工具
+                "tools": ctx.runner.tool_names,
                 # 写类工具清单：前端据此向用户明示「哪些操作需要确认」
                 "writeTools": list(WRITE_TOOL_NAMES),
+                # 检索增强能力状态（前端据此决定是否展示知识库 / 记忆卡片）
+                "knowledgeEnabled": ctx.knowledge is not None,
+                "memoryEnabled": ctx.memory is not None,
+                "memoryAutoExtract": bool(ctx.memory and ctx.memory.auto_extract_enabled),
+                "embeddingModel": ctx.settings.embedding_model if ctx.settings.embedding_enabled else None,
             }
         }
 
     @router.get("/tools", summary="Agent 可调用的工具清单（OpenAI function calling 格式）")
-    async def agent_tools() -> dict:
-        return {"data": TOOL_SPECS}
+    async def agent_tools(request: Request) -> dict:
+        ctx: AppContext = request.app.state.ctx
+        return {"data": ctx.runner.tool_specs}
 
     @router.post("/plan", summary="自然语言需求 → 完整迭代计划（端到端编排）")
     async def agent_plan(payload: AgentPlanRequest, request: Request) -> dict:

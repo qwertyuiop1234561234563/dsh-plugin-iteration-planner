@@ -95,8 +95,27 @@ services:
       # 会话存储：单副本用 memory；多副本/多 worker 改为 redis 并设置 REDIS_URL
       SESSION_STORE: ${SESSION_STORE:-memory}
       REDIS_URL: ${REDIS_URL:-}
+      # 知识库（RAG）与长期记忆：留空 EMBEDDING_* 则回落 LLM_*（百炼同一端点兼做 embeddings）
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v4}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      VECTOR_STORE: ${VECTOR_STORE:-chroma}
+      CHROMA_DIR: /app/.data/chroma
+      KB_CHUNK_SIZE: ${KB_CHUNK_SIZE:-800}
+      KB_CHUNK_OVERLAP: ${KB_CHUNK_OVERLAP:-120}
+      KB_TOP_K: ${KB_TOP_K:-4}
+      KB_HYBRID: ${KB_HYBRID:-true}
+      KB_AUTO_INJECT: ${KB_AUTO_INJECT:-true}
+      KB_INJECT_TOP_K: ${KB_INJECT_TOP_K:-3}
+      MEMORY_ENABLED: ${MEMORY_ENABLED:-true}
+      MEMORY_EXTRACT: ${MEMORY_EXTRACT:-true}
+      MEMORY_TOP_K: ${MEMORY_TOP_K:-4}
     ports:
       - '${APP_PORT:-8080}:8080'
+    volumes:
+      # 向量库本地持久化（Chroma 为单进程嵌入式库，重建镜像不丢库）
+      - chromadata:/app/.data
     restart: unless-stopped
 
   # ------------------- 可选：Redis（多副本共享会话时启用） -------------------
@@ -119,3 +138,4 @@ services:
 volumes:
   pgdata:
   redisdata:
+  chromadata:

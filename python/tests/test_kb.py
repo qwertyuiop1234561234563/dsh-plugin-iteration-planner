@@ -1,0 +1,332 @@
+"""知识库（RAG）测试：分块、解析、混合检索、向量库读写与 REST 契约。
+
+全部使用**桩向量化器 + 临时向量库**，不触网、不依赖外部服务；断言覆盖
+「正常路径 / 空态 / 错误码 / 降级」，而非仅验证返回 200。
+"""
+
+from __future__ import annotations
+
+import io
+import json
+
+import pytest
+
+from app.errors import ApiError
+from app.constants import KB_COLLECTION
+from app.kb.chunking import chunk_text
+from app.kb.loader import load_document
+from app.kb.retrieval import bm25_search, rrf_fuse, tokenize
+from tests.conftest import FailingEmbedder, auth
+
+
+# ============================ 分块 ============================
+
+
+def test_chunk_text_returns_empty_for_blank():
+    assert chunk_text("") == []
+    assert chunk_text("   \n\n  ") == []
+
+
+def test_chunk_text_splits_long_text_within_budget():
+    text = "\n\n".join(f"第{i}段：这是用于验证分块的段落内容。" * 6 for i in range(24))
+    chunks = chunk_text(text, size=300, overlap=50)
+    assert len(chunks) > 1
+    # 合并阶段允许轻微超长（重叠尾巴），但不应出现「远超目标」的块
+    assert all(len(chunk) <= 300 + 50 for chunk in chunks)
+    assert all(chunk.strip() for chunk in chunks)
+
+
+def test_chunk_text_preserves_content_after_merge():
+    text = "\n".join(f"行{i}" for i in range(400))
+    chunks = chunk_text(text, size=200, overlap=20)
+    joined = "".join(chunks)
+    # 首尾行必须被保留（避免切分丢内容）
+    assert "行0" in joined and "行399" in joined
+
+
+def test_chunk_text_small_text_single_chunk():
+    assert chunk_text("很短的一段话", size=800, overlap=120) == ["很短的一段话"]
+
+
+# ============================ 检索基础件 ============================
+
+
+def test_tokenize_chinese_bigram_and_ascii_words():
+    tokens = tokenize("Kahn 拓扑排序 TOPO-1")
+    assert "kahn" in tokens
+    assert "拓扑" in tokens and "扑排" in tokens  # 中文 bigram
+    assert "topo" in tokens and "1" in tokens
+
+
+def test_bm25_ranks_literal_match_first():
+    rows = [
+        {"id": "1", "document": "关键路径由 AOE 算法计算得出", "metadata": {}},
+        {"id": "2", "document": "人员过载风险需要削峰处理", "metadata": {}},
+    ]
+    hits = bm25_search(rows, "关键路径", top_k=2)
+    assert hits and hits[0]["id"] == "1"
+    assert hits[0]["score"] > 0
+
+
+def test_bm25_returns_empty_for_unmatched_query():
+    rows = [{"id": "1", "document": "完全无关的内容", "metadata": {}}]
+    assert bm25_search(rows, "量子力学", top_k=3) == []
+
+
+def test_rrf_fuse_ranks_documents_hit_by_both_channels_higher():
+    fused = rrf_fuse([["a", "b"], ["b", "c"]], k=60)
+    assert fused["b"] == pytest.approx(1 / 62 + 1 / 61)
+    assert fused["b"] > fused["a"] > fused["c"] - 1
+
+
+# ============================ 文档解析 ============================
+
+
+def test_load_markdown_document():
+    loaded = load_document("需求.md", "# 标题\n\n正文内容".encode())
+    assert "正文内容" in loaded.text
+    assert loaded.meta["extension"] == ".md"
+    assert loaded.meta["charCount"] > 0
+
+
+def test_load_json_document_is_flattened():
+    payload = {"plan": {"tasks": [{"name": "数据库设计"}]}}
+    loaded = load_document("plan.json", json.dumps(payload, ensure_ascii=False).encode())
+    assert "plan.tasks[0].name: 数据库设计" in loaded.text
+
+
+def test_load_html_document_strips_tags_and_scripts():
+    html = "<html><head><style>.a{color:red}</style></head><body><h1>标题</h1><p>正文&nbsp;内容</p></body></html>"
+    loaded = load_document("page.html", html.encode())
+    assert "标题" in loaded.text
+    assert "正文 内容" in loaded.text
+    assert "<h1>" not in loaded.text and "color:red" not in loaded.text
+
+
+def test_load_unknown_binary_extension_fails_clearly():
+    with pytest.raises(ApiError) as exc:
+        load_document("blob.bin", bytes([0x00, 0xFF, 0xFE, 0x81, 0x00]))
+    assert exc.value.status_code == 400
+    assert "支持的格式" in exc.value.message
+
+
+def test_load_empty_document_fails():
+    with pytest.raises(ApiError) as exc:
+        load_document("empty.txt", b"")
+    assert "内容为空" in exc.value.message
+
+
+def test_load_whitespace_document_fails():
+    with pytest.raises(ApiError) as exc:
+        load_document("blank.md", b"   \n\n \t ")
+    assert "未解析出可用文本" in exc.value.message
+
+
+# ============================ 向量库直连 ============================
+
+
+@pytest.mark.asyncio
+async def test_store_upsert_query_delete_roundtrip(kb_store):
+    kb_store.upsert(
+        "chunks",
+        ids=["d:0000", "e:0000"],
+        documents=["关键路径计算", "人员过载削峰"],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+        metadatas=[{"docId": "d", "chunkIndex": 0}, {"docId": "e", "chunkIndex": 0}],
+    )
+    assert kb_store.count("chunks") == 2
+    # 同时支持「别名」与「集合全名」两种寻址方式（调用方分别使用二者）
+    assert kb_store.count(KB_COLLECTION) == 2
+    rows = kb_store.query("chunks", embedding=[1.0, 0.1], top_k=2)
+    assert rows[0]["id"] == "d:0000"
+    assert rows[0]["score"] > rows[1]["score"]
+    assert kb_store.get_by_ids("chunks", ids=["e:0000"])[0]["metadata"]["docId"] == "e"
+    kb_store.update_metadata("chunks", ids=["e:0000"], metadatas=[{"docId": "e", "chunkIndex": 0, "status": "disabled"}])
+    assert kb_store.get_by_ids("chunks", ids=["e:0000"], include_documents=False)[0]["metadata"]["status"] == "disabled"
+    kb_store.delete("chunks", where={"docId": "d"})
+    assert kb_store.count("chunks") == 1
+    kb_store.reset("chunks")
+    assert kb_store.count("chunks") == 0
+
+
+def test_store_rejects_unknown_collection(kb_store):
+    with pytest.raises(ApiError):
+        kb_store.count("unknown")
+
+
+# ============================ 服务层 ============================
+
+
+@pytest.mark.asyncio
+async def test_service_ingest_search_list_delete(kb_service, kb_store):
+    document = await kb_service.ingest(
+        "迭代规范.md",
+        "# 规范\n\n关键路径必须由 AOE 算法计算，禁止手工排期。".encode(),
+        title="迭代规范",
+        source="wiki",
+        tags=["规范", "排期"],
+    )
+    assert document["docId"] and document["chunkCount"] >= 1
+    assert document["tags"] == ["规范", "排期"]
+
+    hits = await kb_service.search("关键路径怎么算")
+    assert hits and hits[0]["docId"] == document["docId"]
+    assert "AOE" in hits[0]["text"]
+    assert hits[0]["title"] == "迭代规范"
+
+    documents = await kb_service.list_documents()
+    assert len(documents) == 1 and documents[0]["chunkCount"] == document["chunkCount"]
+
+    detail = await kb_service.get_document(document["docId"])
+    assert len(detail["chunks"]) == document["chunkCount"]
+    assert detail["chunks"][0]["chunkIndex"] == 0
+
+    stats = await kb_service.stats()
+    assert stats["documentCount"] == 1 and stats["chunkCount"] == document["chunkCount"]
+    assert stats["totalChars"] > 0 and stats["embedder"] == "stub-embedder"
+
+    deleted = await kb_service.delete_document(document["docId"])
+    assert deleted["deletedChunks"] == document["chunkCount"]
+    assert await kb_service.list_documents() == []
+
+
+@pytest.mark.asyncio
+async def test_service_search_requires_query(kb_service):
+    with pytest.raises(ApiError):
+        await kb_service.search("   ")
+
+
+@pytest.mark.asyncio
+async def test_service_search_on_empty_store_returns_empty(kb_service):
+    assert await kb_service.search("任意问题") == []
+
+
+@pytest.mark.asyncio
+async def test_service_get_and_delete_missing_document(kb_service):
+    with pytest.raises(ApiError) as exc:
+        await kb_service.get_document("missing")
+    assert exc.value.status_code == 404
+    with pytest.raises(ApiError):
+        await kb_service.delete_document("missing")
+
+
+@pytest.mark.asyncio
+async def test_service_dense_mode_without_hybrid(kb_store, stub_embedder):
+    from app.kb.pipeline import build_knowledge_base
+
+    service = build_knowledge_base(kb_store, stub_embedder, hybrid=False)
+    await service.ingest("规范.md", "关键路径由 AOE 算法计算。".encode())
+    hits = await service.search("AOE 关键路径")
+    assert hits and hits[0]["docId"]
+
+
+@pytest.mark.asyncio
+async def test_service_context_and_hits_downgrades_on_embedder_failure(kb_store):
+    from app.kb.pipeline import build_knowledge_base
+
+    service = build_knowledge_base(kb_store, FailingEmbedder())
+    context, hits = await service.context_and_hits("任意问题")
+    assert context is None and hits == []
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_oversized_document(kb_store, stub_embedder):
+    from app.kb.pipeline import build_knowledge_base
+
+    service = build_knowledge_base(kb_store, stub_embedder, max_document_bytes=10)
+    with pytest.raises(ApiError) as exc:
+        await service.ingest("big.md", b"x" * 50)
+    assert "体积超限" in exc.value.message
+
+
+# ============================ REST 契约 ============================
+
+
+def test_kb_endpoints_disabled_without_embedder(client):
+    """未配置向量化模型时，知识库端点必须明确返回 503 而不是空列表。"""
+    response = client.get("/api/kb/documents", headers=auth())
+    assert response.status_code == 503
+    assert response.json()["code"] == "EMBEDDING_UNAVAILABLE"
+
+
+def test_kb_health_flags(kb_client):
+    with kb_client() as c:
+        health = c.get("/api/agent/health", headers=auth()).json()["data"]
+        assert health["knowledgeEnabled"] is True
+        assert health["memoryEnabled"] is True
+        assert "kb_search" in health["tools"]
+
+
+def test_kb_full_rest_flow(kb_client):
+    with kb_client() as c:
+        headers = auth()
+        created = c.post(
+            "/api/kb/documents",
+            json={"title": "发布流程", "content": "# 发布\n\n灰度发布必须先内测再全量。", "tags": ["发布"]},
+            headers=headers,
+        )
+        assert created.status_code == 200
+        doc_id = created.json()["data"]["docId"]
+
+        listing = c.get("/api/kb/documents", headers=headers).json()["data"]
+        assert listing["total"] == 1
+
+        uploaded = c.post(
+            "/api/kb/documents/upload",
+            files={"file": ("规范.txt", io.BytesIO("关键路径由 AOE 算法计算。".encode()), "text/plain")},
+            data={"title": "算法规范", "tags": "算法,排期"},
+            headers=headers,
+        )
+        assert uploaded.status_code == 200
+        assert uploaded.json()["data"]["tags"] == ["算法", "排期"]
+
+        search = c.post("/api/kb/search", json={"query": "灰度发布", "topK": 3}, headers=headers)
+        assert search.status_code == 200
+        body = search.json()["data"]
+        assert body["mode"] == "hybrid" and body["items"]
+        assert body["items"][0]["docId"] == doc_id
+
+        detail = c.get(f"/api/kb/documents/{doc_id}", headers=headers)
+        assert detail.status_code == 200
+        assert detail.json()["data"]["chunks"]
+
+        stats = c.get("/api/kb/stats", headers=headers).json()["data"]
+        assert stats["documentCount"] == 2 and stats["hybrid"] is True
+
+        removed = c.delete(f"/api/kb/documents/{doc_id}", headers=headers)
+        assert removed.status_code == 200 and removed.json()["data"]["deleted"] is True
+        assert c.get(f"/api/kb/documents/{doc_id}", headers=headers).status_code == 404
+
+
+def test_kb_search_validation(kb_client):
+    with kb_client() as c:
+        assert c.post("/api/kb/search", json={"query": "  "}, headers=auth()).status_code == 400
+        # 项目统一把 pydantic 校验失败映射为 400（见 main.py 的异常处理器）
+        assert c.post("/api/kb/search", json={"query": "x", "topK": 0}, headers=auth()).status_code == 400
+
+
+def test_kb_upload_rejects_empty_file(kb_client):
+    with kb_client() as c:
+        response = c.post(
+            "/api/kb/documents/upload",
+            files={"file": ("empty.txt", io.BytesIO(b""), "text/plain")},
+            headers=auth(),
+        )
+        assert response.status_code == 400
+
+
+def test_kb_dense_mode_endpoint(kb_client):
+    with kb_client(overrides={"kb_hybrid": False}) as c:
+        c.post("/api/kb/documents", json={"title": "t", "content": "关键路径计算"}, headers=auth())
+        body = c.post("/api/kb/search", json={"query": "关键路径"}, headers=auth()).json()["data"]
+        assert body["mode"] == "dense" and body["items"]
+
+
+# ============================ 辅助 ============================
+
+
+@pytest.fixture
+def kb_service(kb_store, stub_embedder):
+    from app.kb.pipeline import build_knowledge_base
+
+    return build_knowledge_base(kb_store, stub_embedder, chunk_size=200, chunk_overlap=40)

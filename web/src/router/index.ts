@@ -20,6 +20,8 @@ import DashboardView from '@/views/DashboardView.vue'
 import FlowView from '@/views/FlowView.vue'
 import GanttView from '@/views/GanttView.vue'
 import KanbanView from '@/views/KanbanView.vue'
+import KnowledgeView from '@/views/KnowledgeView.vue'
+import MemoryView from '@/views/MemoryView.vue'
 import QualityView from '@/views/QualityView.vue'
 import RiskRegisterView from '@/views/RiskRegisterView.vue'
 import WorkloadView from '@/views/WorkloadView.vue'
@@ -57,6 +59,18 @@ const router = createRouter({
           name: 'portfolio',
           component: PortfolioView,
           meta: { title: '项目组合对比', sheet: 'A-03' },
+        },
+        {
+          path: 'knowledge',
+          name: 'knowledge',
+          component: KnowledgeView,
+          meta: { title: '知识库', sheet: 'E-01' },
+        },
+        {
+          path: 'memory',
+          name: 'memory',
+          component: MemoryView,
+          meta: { title: '长期记忆', sheet: 'E-02' },
         },
         {
           path: 'plans/:planId',

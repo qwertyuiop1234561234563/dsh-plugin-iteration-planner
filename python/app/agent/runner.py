@@ -13,6 +13,10 @@
   ``task_update`` / ``task_delete``）不在编排循环内直接执行，而是登记为
   :class:`PendingAction` 返回前端；用户确认后经 :meth:`AgentRunner.confirm_actions`
   统一落库（只读工具仍在循环内即时执行，保证问答与排查可正常进行）。
+- **检索增强（RAG + 长期记忆）**：每轮自动召回知识库片段与相关长期记忆并作为独立
+  system 区块注入（增强而非必需，检索失败自动降级）；同时向模型暴露 ``kb_search`` /
+  ``kb_list_documents`` / ``memory_search`` 只读工具，支持 agentic 检索；
+  对话结束后**后台**提取本轮长期记忆（不阻塞响应）。
 """
 
 from __future__ import annotations
@@ -24,10 +28,12 @@ import uuid
 from typing import Any
 
 from ..errors import ApiError, bad_request, llm_unavailable, not_found
+from ..kb.pipeline import KnowledgeBaseService
 from ..metrics import METRICS
-from ..models import AgentRunResult, PendingAction, ToolCallRecord
+from ..models import AgentRunResult, KbHit, MemoryItem, PendingAction, ToolCallRecord
 from ..sessions import InMemorySessionStore, SessionStore
 from .llm import LlmClient
+from .memory import MemoryService
 from .prompts import ITERATION_PLANNER_SYSTEM_PROMPT, build_chat_instruction, build_plan_instruction
 from .schemas import TOOL_SPECS, WRITE_TOOLS, describe_action
 from .tools import ToolDispatcher
@@ -42,6 +48,14 @@ _REQUIRED: dict[str, list[str]] = {
     spec["function"]["name"]: list(spec["function"]["parameters"].get("required", [])) for spec in TOOL_SPECS
 }
 _TOOL_NAMES: frozenset[str] = frozenset(_REQUIRED)
+
+#: 依赖「知识库 / 长期记忆」服务才可用的工具 → 所需服务名（服务缺失时不出现在工具清单中，
+#: 避免模型调用一个必然失败的工具而浪费步数）
+_SERVICE_BOUND_TOOLS: dict[str, str] = {
+    "kb_search": "knowledge",
+    "kb_list_documents": "knowledge",
+    "memory_search": "memory",
+}
 
 
 def _content_to_text(content: Any) -> str:
@@ -99,6 +113,11 @@ class AgentRunner:
         temperature: float = 0.2,
         store: SessionStore | None = None,
         max_context_chars: int = 96_000,
+        knowledge: KnowledgeBaseService | None = None,
+        memory: MemoryService | None = None,
+        kb_auto_inject: bool = True,
+        kb_inject_top_k: int = 3,
+        memory_top_k: int = 4,
     ) -> None:
         self._llm = llm
         self._dispatcher = dispatcher
@@ -106,6 +125,28 @@ class AgentRunner:
         self._temperature = temperature
         self._store: SessionStore = store or InMemorySessionStore()
         self._max_context_chars = max_context_chars
+        self._knowledge = knowledge
+        self._memory = memory
+        self._kb_auto_inject = kb_auto_inject
+        self._kb_inject_top_k = kb_inject_top_k
+        self._memory_top_k = memory_top_k
+        # 仅暴露「当前真正可用」的工具：检索类工具在对应服务缺失时会被移除
+        available = {"knowledge": knowledge, "memory": memory}
+        self._tool_specs = [
+            spec
+            for spec in TOOL_SPECS
+            if available.get(_SERVICE_BOUND_TOOLS.get(spec["function"]["name"], ""), True) is not None
+        ]
+
+    @property
+    def tool_specs(self) -> list[dict[str, Any]]:
+        """当前实际可调用的工具定义（检索类工具在服务缺失时已被剔除）。"""
+        return self._tool_specs
+
+    @property
+    def tool_names(self) -> list[str]:
+        """当前实际可调用的工具名（供 ``/agent/health`` 与前端提示）。"""
+        return [spec["function"]["name"] for spec in self._tool_specs]
 
     @property
     def available(self) -> bool:
@@ -122,15 +163,22 @@ class AgentRunner:
         iteration_start_date: str | None = None,
         dev_member_count: int | None = None,
     ) -> AgentRunResult:
-        """自然语言需求 → 完整计划（端到端一次编排）。"""
+        """自然语言需求 → 完整计划（端到端一次编排）。
+
+        同时按需求文本召回知识库片段（若启用）注入上下文：历史迭代文档 / 规范 / 约束
+        往往直接决定拆解粒度与依赖关系，比让模型凭空推断更可靠。
+        """
         instruction = build_plan_instruction(
             requirement,
             iteration_deadline=iteration_deadline,
             iteration_start_date=iteration_start_date,
             dev_member_count=dev_member_count,
         )
-        messages = self._base_messages() + [{"role": "user", "content": instruction}]
-        return await self._loop(messages)
+        kb_context, references = await self._retrieve_knowledge(requirement)
+        messages = self._base_messages(kb_context) + [{"role": "user", "content": instruction}]
+        result = await self._loop(messages)
+        result.references = [KbHit(**hit) for hit in references]
+        return result
 
     async def run_chat(
         self,
@@ -147,12 +195,21 @@ class AgentRunner:
         未确认的动作，避免陈旧提案被误执行）。
 
         ``plan_id`` 为前端上报的「当前计划」，以可信上下文注入本轮指令。
+
+        每轮还会按当前输入召回**长期记忆**与**知识库片段**并注入独立 system 区块，
+        对话结束后在后台提取本轮记忆（不阻塞响应）。
         """
         async with self._store.lock(session_id):
             history = await self._store.get(session_id) or []
             instruction = build_chat_instruction(message, plan_id)
-            messages = self._base_messages() + history + [{"role": "user", "content": instruction}]
+            memory_context, memories = await self._retrieve_memories(message)
+            kb_context, references = await self._retrieve_knowledge(message)
+            messages = (
+                self._base_messages(memory_context, kb_context) + history + [{"role": "user", "content": instruction}]
+            )
             result = await self._loop(messages, defer_writes=defer_writes)
+            result.references = [KbHit(**hit) for hit in references]
+            result.memories = [MemoryItem(**item) for item in memories]
 
             # 仅保留「用户 / 最终助手」两条，工具中间态不入历史，控制上下文体积
             # 历史存原始（已消毒）文本，边界标记仅用于本回合送入模型的即时输入
@@ -163,6 +220,9 @@ class AgentRunner:
             await self._store.set(session_id, updated)
             if defer_writes:
                 await self._store.set_pending(session_id, [item.model_dump() for item in result.pendingActions])
+            # 后台提取长期记忆：LLM 调用有延迟，不占用本轮响应时间
+            if self._memory is not None:
+                self._memory.schedule_extract(session_id, message, result.content)
             return result
 
     async def confirm_actions(
@@ -235,8 +295,29 @@ class AgentRunner:
     # ------------------------------- 内部实现 -------------------------------
 
     @staticmethod
-    def _base_messages() -> list[dict[str, Any]]:
-        return [{"role": "system", "content": ITERATION_PLANNER_SYSTEM_PROMPT}]
+    def _base_messages(*blocks: str | None) -> list[dict[str, Any]]:
+        """系统提示 + 检索增强区块（长期记忆 / 知识库片段）。
+
+        区块作为**独立 system 消息**注入而非拼接进主提示：主提示保持稳定（利于缓存命中），
+        检索结果随每轮变化，且顺序固定（记忆在前、知识库在后），便于排查上下文内容。
+        """
+        messages: list[dict[str, Any]] = [{"role": "system", "content": ITERATION_PLANNER_SYSTEM_PROMPT}]
+        for block in blocks:
+            if block:
+                messages.append({"role": "system", "content": block})
+        return messages
+
+    async def _retrieve_knowledge(self, query: str) -> tuple[str | None, list[dict[str, Any]]]:
+        """召回知识库上下文与命中片段（未启用 / 失败时返回空）。"""
+        if self._knowledge is None or not self._kb_auto_inject:
+            return None, []
+        return await self._knowledge.context_and_hits(query, top_k=self._kb_inject_top_k)
+
+    async def _retrieve_memories(self, query: str) -> tuple[str | None, list[dict[str, Any]]]:
+        """召回长期记忆上下文与记忆列表（未启用 / 失败时返回空）。"""
+        if self._memory is None:
+            return None, []
+        return await self._memory.context_and_memories(query, top_k=self._memory_top_k)
 
     async def _loop(self, messages: list[dict[str, Any]], *, defer_writes: bool = False) -> AgentRunResult:
         if self._llm is None:
@@ -248,7 +329,7 @@ class AgentRunner:
 
         for step in range(1, self._max_steps + 1):
             self._enforce_budget(messages)
-            message = await self._llm.chat(messages, tools=TOOL_SPECS, temperature=self._temperature)
+            message = await self._llm.chat(messages, tools=self._tool_specs, temperature=self._temperature)
             messages.append(self._canonical_assistant(message))
 
             tool_calls = message.get("tool_calls") or []

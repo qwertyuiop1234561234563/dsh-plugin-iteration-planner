@@ -95,6 +95,25 @@ TOOL_SPECS: list[dict[str, Any]] = [
     _fn("schedule_calc", "读取关键路径与总工期（AOE 计算结果）。", {"planId": {"type": "string"}}, ["planId"]),
     _fn("risk_scan", "读取风险清单（循环依赖 / 人员过载 / 关键路径延期 / 孤立任务 / 语义风险）。", {"planId": {"type": "string"}}, ["planId"]),
     _fn("report_generate", "生成迭代报表（Markdown 文本 + 燃尽图原始数据）。", {"planId": {"type": "string"}}, ["planId"]),
+    # ---------------- 知识库 / 长期记忆（agentic RAG：模型按需自行检索，只读） ----------------
+    _fn(
+        "kb_search",
+        "检索企业知识库（历史迭代文档、规范、会议纪要等）。当用户询问与排期无关的规范 / 背景 / 历史决策，"
+        "或需要引用既有文档作为依据时调用。返回命中片段与其来源文档。",
+        {
+            "query": {"type": "string", "description": "检索关键词或问题（自然语言即可）"},
+            "topK": {"type": "integer", "minimum": 1, "maximum": 20, "description": "返回片段数，缺省 4"},
+        },
+        ["query"],
+    ),
+    _fn("kb_list_documents", "列出知识库中已收录的文档清单（用于确认有哪些资料可用）。", {}),
+    _fn(
+        "memory_search",
+        "按语义召回关于当前用户 / 项目的长期记忆（偏好、约定、已拍板决策、硬性约束等）。"
+        "当需要确认用户此前的要求或习惯时调用。",
+        {"query": {"type": "string", "description": "要回忆的主题（自然语言）"}},
+        ["query"],
+    ),
 ]
 
 TOOL_NAMES: list[str] = [spec["function"]["name"] for spec in TOOL_SPECS]

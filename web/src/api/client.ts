@@ -31,6 +31,22 @@ import type {
   HealthResult,
   ImportPayload,
   ImportResult,
+  KbDeleteResult,
+  KbDocument,
+  KbDocumentCreatePayload,
+  KbDocumentDetail,
+  KbDocumentList,
+  KbHitList,
+  KbSearchPayload,
+  KbStats,
+  KbUploadPayload,
+  MemoryClearResult,
+  MemoryCreatePayload,
+  MemoryDeleteResult,
+  MemoryItem,
+  MemoryList,
+  MemorySearchResult,
+  MemoryStats,
   PlanSummary,
   PreferenceBlob,
   ProjectPlan,
@@ -295,6 +311,66 @@ export const api = {
   /** 删除服务端配置备份 */
   deletePreferences: (profile?: string) =>
     http.delete('/workspace/preferences', { params: profile ? { profile } : {} }).then(() => undefined),
+
+  /* --------------------------- 知识库（RAG · /api/kb/**） --------------------------- */
+
+  /** 知识库统计与检索配置 */
+  kbStats: () => unwrap<KbStats>(http.get('/kb/stats')),
+
+  /** 文档清单 */
+  kbDocuments: () => unwrap<KbDocumentList>(http.get('/kb/documents')),
+
+  /** 以粘贴文本的方式新建文档 */
+  kbCreateDocument: (payload: KbDocumentCreatePayload) =>
+    unwrap<KbDocument>(http.post('/kb/documents', payload)),
+
+  /** 上传文件建库（multipart；浏览器自动设置 boundary，故不手工指定 content-type） */
+  kbUploadDocument: (payload: KbUploadPayload) => {
+    const form = new FormData()
+    form.append('file', payload.file)
+    form.append('title', payload.title ?? '')
+    form.append('source', payload.source ?? '')
+    form.append('tags', payload.tags ?? '')
+    return unwrap<KbDocument>(http.post('/kb/documents/upload', form))
+  },
+
+  /** 文档详情（含分块预览） */
+  kbGetDocument: (docId: string) =>
+    unwrap<KbDocumentDetail>(http.get(`/kb/documents/${encodeURIComponent(docId)}`)),
+
+  /** 删除文档及其全部分块 */
+  kbDeleteDocument: (docId: string) =>
+    unwrap<KbDeleteResult>(http.delete(`/kb/documents/${encodeURIComponent(docId)}`)),
+
+  /** 混合检索试跑（稠密向量 + BM25 → RRF） */
+  kbSearch: (payload: KbSearchPayload) => unwrap<KbHitList>(http.post('/kb/search', payload)),
+
+  /* ------------------------ 长期记忆（Mem0 风格 · /api/memories/**） ------------------------ */
+
+  /** 长期记忆统计 */
+  memoryStats: () => unwrap<MemoryStats>(http.get('/memories/stats')),
+
+  /** 记忆清单（可按状态过滤） */
+  memories: (params: { status?: string; limit?: number } = {}) =>
+    unwrap<MemoryList>(http.get('/memories', { params })),
+
+  /** 手工新增一条长期记忆 */
+  createMemory: (payload: MemoryCreatePayload) => unwrap<MemoryItem>(http.post('/memories', payload)),
+
+  /** 按语义召回记忆（试跑） */
+  searchMemory: (query: string, topK?: number) =>
+    unwrap<MemorySearchResult>(http.post('/memories/search', { query, ...(topK ? { topK } : {}) })),
+
+  /** 启用 / 停用一条记忆 */
+  updateMemoryStatus: (memoryId: string, status: string) =>
+    unwrap<MemoryItem>(http.patch(`/memories/${encodeURIComponent(memoryId)}`, { status })),
+
+  /** 删除一条记忆 */
+  deleteMemory: (memoryId: string) =>
+    unwrap<MemoryDeleteResult>(http.delete(`/memories/${encodeURIComponent(memoryId)}`)),
+
+  /** 清空全部记忆（危险操作，前端需二次确认） */
+  clearMemories: () => unwrap<MemoryClearResult>(http.delete('/memories')),
 }
 
 /** 推导 WebSocket 地址（开发环境由 Vite 代理 /ws） */

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -10,7 +11,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.constants import KB_COLLECTION, MEMORY_COLLECTION
 from app.engine_client import EngineClient
+from app.kb import ChromaVectorStore
+from app.kb.retrieval import tokenize
 from app.main import create_app
 
 # 模拟的内部引擎响应：覆盖成功信封、导出文件与典型错误码
@@ -158,13 +162,83 @@ class ScriptedLlm:
         return self._responses.pop(0)
 
 
+class StubEmbedder:
+    """确定性桩向量化器（不触网）。
+
+    以「词元哈希 → 桶计数 → L2 归一化」生成向量：语义相近（共享词元多）的文本向量
+    余弦相似度高，因此可真实驱动**检索排序**与**去重阈值**两类断言，而不是只验证「不报错」。
+    哈希使用 SHA-1（而非内置 ``hash()``）以保证**跨进程可复现**（内置哈希受 PYTHONHASHSEED 影响）。
+    """
+
+    name = "stub-embedder"
+
+    def __init__(self, dimensions: int = 64) -> None:
+        self.dimensions = dimensions
+        self.calls: list[list[str]] = []
+        self.closed = False
+
+    async def embed(self, texts):
+        batch = list(texts)
+        self.calls.append(batch)
+        return [self._vector(text) for text in batch]
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    def _vector(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimensions
+        for token in tokenize(text):
+            vector[self._bucket(token)] += 1.0
+        norm = sum(value * value for value in vector) ** 0.5
+        if norm == 0:
+            vector[0] = 1.0
+            return vector
+        return [value / norm for value in vector]
+
+    def _bucket(self, token: str) -> int:
+        digest = hashlib.sha1(token.encode("utf-8")).digest()
+        return int.from_bytes(digest[:4], "big") % self.dimensions
+
+
+class FailingEmbedder(StubEmbedder):
+    """始终失败的向量化器（用于校验「检索增强降级不阻断主链路」）。"""
+
+    name = "failing-embedder"
+
+    async def embed(self, texts):
+        from app.errors import embedding_unavailable
+
+        raise embedding_unavailable("桩向量化器按预期失败")
+
+
+@pytest.fixture
+def stub_embedder() -> StubEmbedder:
+    return StubEmbedder()
+
+
+@pytest.fixture
+def kb_store(tmp_path) -> ChromaVectorStore:
+    """隔离的临时向量库（每个测试用例独立目录，互不污染）。"""
+    return ChromaVectorStore(
+        str(tmp_path / "chroma"),
+        chunk_collection=KB_COLLECTION,
+        memory_collection=MEMORY_COLLECTION,
+    )
+
+
 @pytest.fixture
 def make_client(settings: Settings, engine: EngineClient):
-    """构建客户端：可注入自定义 LLM 与配置。"""
+    """构建客户端：可注入自定义 LLM / 向量化器 / 向量库与配置。"""
 
-    def _make(llm=None, overrides: dict[str, Any] | None = None) -> TestClient:
+    def _make(
+        llm=None,
+        overrides: dict[str, Any] | None = None,
+        *,
+        embedder: Any | None = None,
+        vector_store: ChromaVectorStore | None = None,
+    ) -> TestClient:
         cfg = settings.model_copy(update=overrides or {})
-        app = create_app(cfg, engine=engine, llm=llm, start_bridge=False)
+        app = create_app(cfg, engine=engine, llm=llm, embedder=embedder, vector_store=vector_store, start_bridge=False)
         return TestClient(app)
 
     return _make
@@ -172,8 +246,28 @@ def make_client(settings: Settings, engine: EngineClient):
 
 @pytest.fixture
 def client(make_client) -> TestClient:
-    """默认客户端（已配置鉴权，无 LLM）。"""
+    """默认客户端（已配置鉴权，无 LLM / 无向量化）。"""
     return make_client()
+
+
+@pytest.fixture
+def kb_client(make_client, stub_embedder: StubEmbedder, kb_store: ChromaVectorStore):
+    """启用知识库 + 长期记忆的客户端（桩向量化器 + 临时向量库，全程无外部依赖）。"""
+
+    def _make(llm=None, overrides: dict[str, Any] | None = None) -> TestClient:
+        cfg = {
+            "embedding_base_url": "http://stub.test/v1",
+            "embedding_api_key": "stub-key",
+            "embedding_model": "stub-embedding",
+            "memory_enabled": True,
+            "kb_hybrid": True,
+            "kb_inject_top_k": 3,
+            "memory_top_k": 4,
+        }
+        cfg.update(overrides or {})
+        return make_client(llm, cfg, embedder=stub_embedder, vector_store=kb_store)
+
+    return _make
 
 
 def auth(token: str = "secret-token") -> dict[str, str]:

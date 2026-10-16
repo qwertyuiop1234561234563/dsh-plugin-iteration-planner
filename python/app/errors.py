@@ -82,6 +82,23 @@ def engine_circuit_open(message: str = "算法引擎连续失败，已触发熔�
     return ApiError(503, "ENGINE_CIRCUIT_OPEN", message)
 
 
+def embedding_unavailable(
+    message: str = "未配置向量化模型（Embedding），知识库与长期记忆不可用；请设置 EMBEDDING_MODEL 与 LLM_API_KEY",
+) -> ApiError:
+    """向量化服务不可用（未配置 / 上游不可达）。"""
+    return ApiError(503, "EMBEDDING_UNAVAILABLE", message)
+
+
+def embedding_gateway_error(message: str, details: Any | None = None) -> ApiError:
+    """向量化上游返回异常状态（与 LLM 网关错误区分，便于按依赖方分流监控）。"""
+    return ApiError(502, "EMBEDDING_GATEWAY_ERROR", message, details)
+
+
+def vector_store_unavailable(message: str, details: Any | None = None) -> ApiError:
+    """向量库不可用（目录不可写 / 依赖缺失）。"""
+    return ApiError(503, "VECTOR_STORE_UNAVAILABLE", message, details)
+
+
 def rate_limited(message: str = "请求过于频繁，请稍后重试", retry_after: int | None = None) -> ApiError:
     """触发速率限制（令牌桶耗尽）。"""
     details = {"retryAfterSeconds": retry_after} if retry_after is not None else None

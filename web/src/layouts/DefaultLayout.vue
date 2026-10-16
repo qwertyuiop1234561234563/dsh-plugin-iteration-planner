@@ -85,6 +85,8 @@ const activeMenu = computed(() => {
   if (PLAN_TAB_MENU[routeName.value]) return PLAN_TAB_MENU[routeName.value]
   if (routeName.value === 'plan-create') return 'plan-create'
   if (routeName.value === 'portfolio') return 'portfolio'
+  if (routeName.value === 'knowledge') return 'knowledge'
+  if (routeName.value === 'memory') return 'memory'
   if (routeName.value === 'audit') return 'audit'
   return 'plan-list'
 })
@@ -162,6 +164,8 @@ function go(name: string): void {
     'plan-list': '/plans',
     'plan-create': '/plans/new',
     portfolio: '/portfolio',
+    knowledge: '/knowledge',
+    memory: '/memory',
     audit: '/audit',
   }
   void router.push(map[name] ?? '/plans')
@@ -396,6 +400,13 @@ onBeforeUnmount(() => {
         <el-menu-item index="portfolio">
           <el-icon><Grid /></el-icon><span>项目组合对比</span>
         </el-menu-item>
+        <el-sub-menu index="knowledge-base">
+          <template #title>
+            <el-icon><Collection /></el-icon><span>知识与记忆</span>
+          </template>
+          <el-menu-item index="knowledge">知识库（RAG）</el-menu-item>
+          <el-menu-item index="memory">长期记忆</el-menu-item>
+        </el-sub-menu>
         <el-sub-menu index="current" :disabled="!currentPlanId">
           <template #title>
             <el-icon><DataAnalysis /></el-icon><span>当前计划</span>

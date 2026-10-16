@@ -17,7 +17,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ApiClientError, api } from '@/api/client'
-import type { AgentHealth, AgentPendingAction, AgentToolCallRecord } from '@/api/types'
+import type { AgentHealth, AgentPendingAction, AgentToolCallRecord, KbHit, MemoryItem } from '@/api/types'
 import { useNotifyStore } from '@/stores/notify'
 import { usePlanStore } from '@/stores/plan'
 import { FAQ_FALLBACK, faqPrompts, matchFaq } from '@/utils/agentFaq'
@@ -52,6 +52,10 @@ interface ChatMessage {
   planId?: string
   /** 规则问答命中的页面跳转建议（路由名） */
   routeName?: string
+  /** 本轮实际引用到的知识库片段（RAG 依据，供用户核对） */
+  references?: KbHit[]
+  /** 本轮注入上下文的长期记忆（供用户纠偏） */
+  memories?: MemoryItem[]
 }
 
 const messages = ref<ChatMessage[]>([])
@@ -176,6 +180,8 @@ async function send(raw?: string): Promise<void> {
       toolCalls: result.toolCalls,
       pending: result.pendingActions.length > 0 ? result.pendingActions : undefined,
       planId: result.planId ?? undefined,
+      references: result.references && result.references.length > 0 ? result.references : undefined,
+      memories: result.memories && result.memories.length > 0 ? result.memories : undefined,
     })
   } catch (error) {
     if (error instanceof ApiClientError && LLM_DOWN_CODES.has(error.code)) {
@@ -326,13 +332,18 @@ watch(visible, (open) => {
           <el-tag v-if="planId" size="small" effect="plain" type="info">
             当前计划：{{ truncate(planLabel || planId, 20) }}
           </el-tag>
+          <el-tag v-if="health?.knowledgeEnabled" size="small" effect="plain" type="success">知识库已启用</el-tag>
+          <el-tag v-if="health?.memoryEnabled" size="small" effect="plain" :type="health?.memoryAutoExtract ? 'success' : 'info'">
+            记忆{{ health?.memoryAutoExtract ? '自动提取' : '已启用' }}
+          </el-tag>
           <span class="ip-agent__spacer" />
           <el-button size="small" :icon="'Delete'" :disabled="messages.length === 0" @click="clearSession">清空会话</el-button>
         </div>
 
         <el-alert v-if="!llmReady && !healthLoading" type="info" :closable="false" class="ip-agent__notice">
           未配置 LLM 网关，当前为<strong>内置规则问答</strong>模式：可回答算法口径与平台功能问题，并给出页面跳转。
-          配置 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL 后重启服务即可启用模型问答与「改计划」能力。
+          配置 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL 后重启服务即可启用模型问答与「改计划」能力；
+          配置 EMBEDDING_API_KEY（或复用 LLM_API_KEY）后可启用知识库引用与长期记忆。
         </el-alert>
 
         <div ref="scroller" class="ip-agent__stream">
@@ -368,6 +379,32 @@ watch(visible, (open) => {
               <!-- 对话结果关联的计划 -->
               <div v-else-if="message.planId" class="ip-agent__actions">
                 <el-button size="small" type="primary" plain @click="openPlan(message.planId)">查看计划总览</el-button>
+              </div>
+
+              <!-- 参考依据：本轮实际命中并注入的知识库片段（便于核对结论来源） -->
+              <div v-if="message.references && message.references.length > 0" class="ip-agent__context">
+                <div class="ip-agent__context-head">
+                  <el-icon><Collection /></el-icon>
+                  <span>参考知识库片段（{{ message.references.length }}）</span>
+                </div>
+                <div v-for="(ref, index) in message.references" :key="ref.chunkId ?? index" class="ip-agent__context-item">
+                  <div class="ip-agent__context-title">
+                    <span class="ip-agent__context-name">{{ ref.title || ref.docId || '未命名文档' }}</span>
+                    <span class="ip-agent__context-score ip-mono">score {{ ref.score.toFixed(4) }}</span>
+                  </div>
+                  <div class="ip-agent__context-text">{{ truncate(ref.text, 200) }}</div>
+                </div>
+              </div>
+
+              <!-- 本轮注入上下文的长期记忆（发现跑偏可去「长期记忆」页停用） -->
+              <div v-if="message.memories && message.memories.length > 0" class="ip-agent__context">
+                <div class="ip-agent__context-head">
+                  <el-icon><Star /></el-icon>
+                  <span>本轮召回记忆（{{ message.memories.length }}）</span>
+                </div>
+                <div v-for="item in message.memories" :key="item.memoryId" class="ip-agent__context-item">
+                  <div class="ip-agent__context-text">{{ truncate(item.text, 200) }}</div>
+                </div>
               </div>
 
               <!-- 工具调用过程（只读工具即时执行；写工具此处显示为待确认） -->
@@ -569,6 +606,61 @@ watch(visible, (open) => {
 
 .ip-agent__actions {
   margin-top: 10px;
+}
+
+/* 参考依据 / 召回记忆卡片 */
+.ip-agent__context {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--ip-border);
+  border-radius: var(--ip-radius);
+  background: var(--ip-surface-sunk);
+}
+
+.ip-agent__context-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ip-text-secondary);
+}
+
+.ip-agent__context-item {
+  padding: 6px 0 0;
+}
+
+.ip-agent__context-item + .ip-agent__context-item {
+  margin-top: 4px;
+  border-top: 1px dashed var(--ip-border);
+  padding-top: 8px;
+}
+
+.ip-agent__context-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.ip-agent__context-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ip-text);
+}
+
+.ip-agent__context-score {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--ip-text-muted);
+}
+
+.ip-agent__context-text {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ip-text-secondary);
+  white-space: normal;
+  word-break: break-word;
 }
 
 /* 工具调用明细 */

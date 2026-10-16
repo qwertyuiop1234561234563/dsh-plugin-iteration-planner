@@ -8,6 +8,9 @@ import type {
   IssueProbability,
   IssueSeverity,
   IssueStatus,
+  MemoryImportance,
+  MemoryStatus,
+  MemoryType,
   Priority,
   RiskLevel,
   TaskStatus,
@@ -255,4 +258,36 @@ export const ISSUE_STATUS_TAG: Record<IssueStatus, TagType> = {
   MONITORING: 'primary',
   CLOSED: 'success',
   ACCEPTED: 'info',
+}
+
+/* ------------------------------ 长期记忆（Agent） ------------------------------ */
+
+/** 记忆类型文案（与后端 `MEMORY_TYPE_LABELS` 对齐） */
+export const MEMORY_TYPE_LABEL: Record<MemoryType, string> = {
+  fact: '事实',
+  preference: '偏好',
+  decision: '决策',
+  constraint: '约束',
+  task: '任务',
+  other: '其他',
+}
+
+/** 记忆重要度文案 */
+export const MEMORY_IMPORTANCE_LABEL: Record<MemoryImportance, string> = {
+  high: '高',
+  medium: '中',
+  low: '低',
+}
+
+/** 记忆重要度标签样式（high 触发告警色，提醒用户该条会优先注入上下文） */
+export const MEMORY_IMPORTANCE_TAG: Record<MemoryImportance, TagType> = {
+  high: 'danger',
+  medium: 'warning',
+  low: 'info',
+}
+
+/** 记忆状态文案 */
+export const MEMORY_STATUS_LABEL: Record<MemoryStatus, string> = {
+  active: '启用中',
+  disabled: '已停用',
 }

@@ -30,15 +30,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .agent import AgentRunner, OpenAiCompatibleClient, ToolDispatcher
+from .agent import AgentRunner, MemoryService, OpenAiCompatibleClient, ToolDispatcher
 from .config import Settings, get_settings
-from .constants import default_store_path
+from .constants import KB_COLLECTION, MEMORY_COLLECTION, default_chroma_dir, default_store_path
 from .engine_client import EngineClient
 from .errors import ApiError, bad_request, internal, rate_limited, unauthorized
+from .kb import BailianEmbedder, ChromaVectorStore, Embedder, build_knowledge_base
 from .logging_config import configure_logging, request_id_var
 from .metrics import METRICS
 from .resilience import CircuitBreaker, RetryPolicy
 from .routes.agent import build_agent_router
+from .routes.kb import build_kb_router
+from .routes.memory import build_memory_router
 from .routes.proxy import register_proxy_and_static
 from .routes.scenario import build_scenario_router
 from .routes.system import register_system_routes
@@ -67,12 +70,16 @@ def create_app(
     *,
     engine: EngineClient | None = None,
     llm=None,
+    embedder: Embedder | None = None,
+    vector_store: ChromaVectorStore | None = None,
     start_bridge: bool = True,
 ) -> FastAPI:
     """构建 FastAPI 应用。
 
     :param engine: 注入的自定义引擎客户端（测试用）；缺省则按配置创建。
     :param llm: 注入的自定义 LLM 客户端（测试用）；缺省则按配置创建。
+    :param embedder: 注入的自定义向量化客户端（测试用桩实现）；缺省则按配置创建。
+    :param vector_store: 注入的自定义向量库（测试用临时目录）；缺省则按配置创建。
     :param start_bridge: 是否启动「引擎事件流 → 前端 WS」的桥接任务（测试可关闭）。
     """
     settings = settings or get_settings()
@@ -107,13 +114,66 @@ def create_app(
             ),
         )
 
+    resolved_embedder = embedder
+    if resolved_embedder is None and settings.embedding_enabled:
+        resolved_embedder = BailianEmbedder(
+            settings.resolved_embedding_base_url,
+            settings.resolved_embedding_api_key,
+            settings.embedding_model,
+            dimensions=settings.embedding_dimensions,
+            batch_size=settings.embedding_batch_size,
+            timeout=settings.embedding_timeout_seconds,
+            retry=RetryPolicy(
+                attempts=settings.embedding_retry_attempts,
+                base_delay=settings.embedding_retry_base_delay,
+                max_delay=max(settings.embedding_retry_base_delay * 4, 2.0),
+            ),
+        )
+
+    knowledge = None
+    memory = None
+    resolved_store = vector_store
+    if resolved_embedder is not None:
+        try:
+            if resolved_store is None:
+                resolved_store = ChromaVectorStore(
+                    settings.chroma_dir or default_chroma_dir(),
+                    chunk_collection=KB_COLLECTION,
+                    memory_collection=MEMORY_COLLECTION,
+                )
+            knowledge = build_knowledge_base(
+                resolved_store,
+                resolved_embedder,
+                chunk_size=settings.kb_chunk_size,
+                chunk_overlap=settings.kb_chunk_overlap,
+                top_k=settings.kb_top_k,
+                hybrid=settings.kb_hybrid,
+                rrf_k=settings.kb_rrf_k,
+                max_document_bytes=settings.kb_max_document_bytes,
+                max_documents=settings.kb_max_documents,
+            )
+            if settings.memory_enabled:
+                memory = MemoryService(
+                    resolved_store,
+                    resolved_embedder,
+                    resolved_llm,
+                    top_k=settings.memory_top_k,
+                    dedup_threshold=settings.memory_dedup_threshold,
+                    max_items=settings.memory_max_items,
+                    extract_enabled=settings.memory_extract,
+                )
+        except Exception as exc:  # noqa: BLE001 - 向量库不可用不应阻断主服务（降级为无检索增强）
+            logger.error("知识库 / 长期记忆初始化失败，已降级为纯算法模式：%s", exc)
+            knowledge = None
+            memory = None
+
     store = build_session_store(
         driver=settings.session_store,
         max_sessions=settings.agent_max_sessions,
         ttl_seconds=settings.agent_session_ttl_seconds,
         redis_url=settings.redis_url,
     )
-    dispatcher = ToolDispatcher(resolved_engine)
+    dispatcher = ToolDispatcher(resolved_engine, knowledge=knowledge, memory=memory)
     runner = AgentRunner(
         resolved_llm,
         dispatcher,
@@ -121,6 +181,11 @@ def create_app(
         temperature=settings.agent_temperature,
         store=store,
         max_context_chars=settings.agent_max_context_chars,
+        knowledge=knowledge,
+        memory=memory,
+        kb_auto_inject=settings.kb_auto_inject,
+        kb_inject_top_k=settings.kb_inject_top_k,
+        memory_top_k=settings.memory_top_k,
     )
     broadcaster = WsBroadcaster(replay_size=settings.ws_replay_size)
     bridge = EngineEventBridge(derive_engine_ws_url(settings.engine_base_url, settings.api_ws_path), broadcaster)
@@ -145,6 +210,8 @@ def create_app(
             await resolved_engine.aclose()
             if isinstance(resolved_llm, OpenAiCompatibleClient):
                 await resolved_llm.aclose()
+            if resolved_embedder is not None and resolved_embedder is not embedder:
+                await resolved_embedder.aclose()
 
     app = FastAPI(
         title="企业级研发迭代规划智能 Agent · Python 开放 API",
@@ -166,6 +233,9 @@ def create_app(
         workspace=workspace,
         started_at=time.monotonic(),
         version=__version__,
+        knowledge=knowledge,
+        memory=memory,
+        embedder=resolved_embedder,
     )
 
     # 注册顺序：先注册的在内层，后注册的在外层（Starlette 语义），CORS 需最外层。
@@ -182,6 +252,9 @@ def create_app(
     app.include_router(build_scenario_router(settings.api_base_path))
     # 治理能力（导入 / 基线 / 登记册 / 负荷 / 燃尽分析 / 变更历史 / 质量 / 配置备份）
     app.include_router(build_workspace_router(settings.api_base_path))
+    # 知识库（RAG）与长期记忆：检索增强能力的治理入口
+    app.include_router(build_kb_router(settings.api_base_path))
+    app.include_router(build_memory_router(settings.api_base_path))
     register_proxy_and_static(app)
     return app
 
