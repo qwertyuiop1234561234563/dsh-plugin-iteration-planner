@@ -803,6 +803,106 @@ def test_agent_definition_question_without_tools_is_not_retried(make_client):
         assert data["steps"] == 1
 
 
+def test_agent_retries_write_intent_ignored_as_state_answer(make_client):
+    """写指令被当成状态查询作答（本轮零写动作、也未反问澄清）：必须纠偏重试。
+
+    这是最隐蔽的一类失败——用户以为修改已被受理，实际什么都没发生（静默空转）。
+    """
+    llm = ScriptedLlm(
+        [
+            # 完全没理会写指令，转而回答上一个问题（模拟轻量模型串轮）
+            {"role": "assistant", "content": "当前计划的迭代工期为 57.67 天，存在一个中等风险项。"},
+            # 纠偏后真正登记写动作
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("task_update", {"planId": "p1", "taskId": "t1", "updateField": "assignee", "newValue": "pm-01"}, "c1")]},
+            {"role": "assistant", "content": "已提交待确认。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把 t1 的责任人改为 pm-01"}, headers=auth()).json()["data"]
+        assert len(data["pendingActions"]) == 1
+        assert data["pendingActions"][0]["arguments"]["updateField"] == "assignee"
+        assert "57.67" not in data["content"]
+        # 纠偏提示确实回填给了模型（第 2 次调用的最后一条消息）
+        assert any(m.get("role") == "user" and "立即调用对应的写工具" in str(m.get("content")) for m in llm.calls[1])
+
+
+def test_agent_write_intent_noop_is_never_reported_as_answer(make_client):
+    """纠偏后模型仍忽略写指令：不得把原答复当结论返回，必须用确定性提示说明「没有任何变更」。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": "当前计划的迭代工期为 57.67 天。"},
+            {"role": "assistant", "content": "当前计划的迭代工期为 57.67 天。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把 t1 的工时改成 12 小时"}, headers=auth()).json()["data"]
+        assert data["pendingActions"] == []
+        assert data["toolCalls"] == []
+        assert "没有任何变更被登记或执行" in data["content"]
+        assert "57.67" not in data["content"]
+
+
+def test_agent_write_intent_guard_ignores_questions_and_failures(make_client):
+    """写意图兜底不得误伤两类合法收敛：①用户本身在提问（含「调整」等字样的疑问句）；
+    ②写工具已调用但报错、模型如实说明失败（不应被覆盖成「没有任何变更」提示）。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": "当前无人员过载，因此不需要调整工时。"},
+            # 第二例：写工具报错后如实说明
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("task_update", {"planId": "p1", "taskId": "t9", "updateField": "assignee", "newValue": "pm-01"}, "c1")]},
+            {"role": "assistant", "content": "修改失败：任务 t9 不存在。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        first = c.post("/api/agent/chat", json={"message": "人员工时需要调整吗？", "planId": "p1"}, headers=auth()).json()["data"]
+        assert first["steps"] == 1, first
+        assert "不需要调整工时" in first["content"]
+
+        second = c.post("/api/agent/chat", json={"message": "把 t9 的责任人改为 pm-01", "planId": "p1"}, headers=auth()).json()["data"]
+        assert second["pendingActions"] == []
+        assert "任务 t9 不存在" in second["content"]
+        assert "没有任何变更被登记或执行" not in second["content"]
+
+
+def test_agent_rejects_state_question_as_requirement(make_client):
+    """模型把上一轮的**状态提问**当作 ``replan_all.requirement`` 提交时必须拒绝登记。
+
+    实测缺陷：这类值一旦确认就会被引擎持久化为需求原文，并经「情景对比」（以基线
+    rawRequirement 复算）扩散到新计划——用问题文本污染需求数据的源头。
+    """
+    llm = ScriptedLlm(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [tool_call("replan_all", {"planId": "p1", "requirement": "当前计划的迭代工期是多少天？是否存在高风险项？"}, "c1")],
+            },
+            {"role": "assistant", "content": "抱歉，我需要确认新的需求描述。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把第一个任务的责任人改为 pm-01", "planId": "p1"}, headers=auth()).json()["data"]
+        assert data["pendingActions"] == []
+        assert [t["name"] for t in data["toolCalls"]] == ["replan_all"]
+        assert data["toolCalls"][0]["ok"] is False
+        assert "需求原文" in str(data["toolCalls"][0]["error"])
+        # 纠偏提示确实回填给了模型（第 2 次调用的最后一条 tool 消息）
+        assert any(m.get("role") == "tool" and "需求原文" in str(m.get("content")) for m in llm.calls[1])
+
+
+def test_agent_scaffold_text_does_not_trip_write_intent(make_client):
+    """回归防线：指令脚手架（``_MISSING_PLAN_HINT`` 含「新增 / 修改 / 删除」字样）不得被当成
+    用户写意图——否则「关键路径怎么算？」这类纯提问会多触发一次无意义的纠偏重试。"""
+    content = "关键路径是项目中耗时最长的任务链。"
+    llm = ScriptedLlm([{"role": "assistant", "content": content}])
+    with make_client(llm=llm) as c:
+        # 不带 planId → 指令里注入含「新增 / 修改 / 删除任务」的可信指引
+        data = c.post("/api/agent/chat", json={"message": "关键路径怎么算？"}, headers=auth()).json()["data"]
+        assert data["content"] == content
+        assert data["steps"] == 1
+        assert len(llm.calls) == 1
+
+
 def test_close_truncated_json_rejects_unbalanced_fragment():
     """括号不配对（非单纯截断）的片段不得被「修复」成合法 JSON。"""
     from app.agent.runner import _close_truncated_json

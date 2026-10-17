@@ -15,7 +15,7 @@ import httpx
 
 from ..errors import ApiError, llm_gateway_error
 from ..metrics import METRICS
-from ..resilience import RetryPolicy, is_retryable_exception
+from ..resilience import RetryPolicy
 
 logger = logging.getLogger("iteration_planner.llm")
 
@@ -23,6 +23,20 @@ logger = logging.getLogger("iteration_planner.llm")
 #: （openai-python 等的 ``_should_retry``）一致：429 限流 + **全部 5xx**（含 500——上游
 #: 内部错误是最常见的瞬时故障，早期实现漏掉 500 会导致一次抖动就整轮失败）。
 _RETRYABLE_LLM_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+#: 可重试的传输层异常。**不复用引擎侧** :func:`~..resilience.is_retryable_exception`：后者按
+#: HTTP 方法幂等性区分（``POST`` 不在幂等白名单，读超时一律不重试），那是为「网关 → 引擎」
+#: 这类可能产生副作用的写操作设计的。``/chat/completions`` 是无副作用的补全调用，重发不会
+#: 造成重复写入，连接失败与读/写超时都应重试——否则一次上游读超时就直接把 502 抛给用户。
+_RETRYABLE_LLM_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
 
 
 class LlmClient(Protocol):
@@ -188,7 +202,7 @@ class OpenAiCompatibleClient:
             try:
                 response = await ctx.__aenter__()
             except httpx.HTTPError as exc:
-                if retry_index < self._retry.attempts and is_retryable_exception(exc, "POST"):
+                if retry_index < self._retry.attempts and isinstance(exc, _RETRYABLE_LLM_ERRORS):
                     METRICS.inc_counter("llm_requests_total", {"outcome": "retry_transport"})
                     await asyncio.sleep(self._retry.delay_for(retry_index))
                     retry_index += 1
@@ -215,13 +229,13 @@ class OpenAiCompatibleClient:
             return ctx, response
 
     async def _post_with_retry(self, payload: dict[str, Any]) -> httpx.Response:
-        """带重试的请求：连接失败与 5xx / 429 可重试，4xx 直接失败。"""
+        """带重试的请求：连接失败、读写超时与 5xx / 429 可重试，其余 4xx 直接失败。"""
         retry_index = 0
         while True:
             try:
                 response = await self._client.post("/chat/completions", json=payload)
             except httpx.HTTPError as exc:
-                if retry_index < self._retry.attempts and is_retryable_exception(exc, "POST"):
+                if retry_index < self._retry.attempts and isinstance(exc, _RETRYABLE_LLM_ERRORS):
                     METRICS.inc_counter("llm_requests_total", {"outcome": "retry_transport"})
                     await asyncio.sleep(self._retry.delay_for(retry_index))
                     retry_index += 1

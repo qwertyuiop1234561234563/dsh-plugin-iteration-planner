@@ -125,6 +125,20 @@ def _has_write_intent(text: str) -> bool:
     """判断用户输入是否明确要求改动（写操作）。"""
     return _WRITE_INTENT_RE.search(text) is not None
 
+
+#: 模型「信息不足 → 反问澄清」的语料特征：命中即视为**合法收敛**（写指令并未被静默忽略），
+#: 不再触发写意图纠偏——否则模型如实说「请提供计划 ID」也会被反复逼着重试。
+_CLARIFY_RE = re.compile(
+    r"[?？]|请(?:再|先)?(?:提供|告知|说明|明确|确认|指明|补充|选择|指定|告诉我|给出)"
+    r"|需要(?:您|你)(?:提供|补充|确认|指定)|无法确定|不清楚|不确定|哪一(?:个|种)"
+)
+
+
+def _is_clarification_request(text: str) -> bool:
+    """判断模型回复是否为「向用户追问缺失信息」而非作答（含反问与显式索取）。"""
+    return _CLARIFY_RE.search(text) is not None
+
+
 #: 答复中是否出现**度量值**（数字 + 量词/单位）。不能只用裸数字判断——任务 ID 形如 ``t1``
 #: 也含数字，会把「关键路径是 t1 → t2」这类正常回答误判为「给出了当前计划的实测值」。
 _HAS_FIGURE_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:天|小时|分钟|万元|人|人次|个|项|条|次|%|h|H)")
@@ -176,6 +190,40 @@ _SERVICE_BOUND_TOOLS: dict[str, str] = {
 #: 以「既有任务」为目标的写类工具：登记待确认动作前必须校验 taskId 真实存在（见
 #: :meth:`AgentRunner._resolve_task_target`），避免模型臆造的 ID 进入确认卡片后才以 404 失败。
 _TASK_TARGET_WRITE_TOOLS: frozenset[str] = frozenset({"task_update", "task_delete"})
+
+#: 以「需求文本」为关键入参的写类工具：``requirement`` 会作为需求原文被引擎持久化
+#: （并可能经「情景对比」以基线 ``rawRequirement`` 复算扩散到新计划），因此登记前必须
+#: 拒绝被模型回填成问句的值（见 :func:`_reject_question_as_requirement`）。
+_REQUIREMENT_WRITE_TOOLS: frozenset[str] = frozenset({"plan_iteration", "replan_all"})
+
+#: 回填给模型的「需求文本非法」纠偏提示
+_REQUIREMENT_REJECTION = (
+    "{tool} 的 requirement 参数必须是**本次要规划 / 重规划的需求原文（陈述句）**，"
+    "而当前填入的值看起来是一个**状态提问**（如「当前计划的迭代工期是多少天？」）——"
+    "这既不是需求，也不该被持久化为需求原文，因此该调用已被系统拒绝。"
+    "请注意区分：\n"
+    "- 只是要**改某个已有任务**（责任人 / 工时 / 状态等）→ 请改用 task_update / task_delete，"
+    "不要用 {tool} 重做整个计划；\n"
+    "- 确实需要**按新需求重新规划** → 请先向用户确认新的需求描述，再以该需求原文调用 {tool}。"
+)
+
+
+def _reject_question_as_requirement(name: str, arguments: dict[str, Any]) -> str | None:
+    """校验「需求文本」类写工具的 ``requirement``：是状态提问则返回纠偏提示。
+
+    实测缺陷：会话上一轮问了「当前计划的迭代工期是多少天？是否存在高风险项？」，下一轮
+    用户要求改任务时，模型把**上一轮的问题原文**当作 ``replan_all.requirement`` 提交——
+    这类值一旦确认落库，就会被引擎当作需求原文保存，并可能经情景对比复算污染后续计划。
+    """
+    requirement = arguments.get("requirement")
+    if not isinstance(requirement, str) or not requirement.strip():
+        return None  # 缺参由必填校验统一处理
+    if _is_state_question(requirement):
+        METRICS.inc_counter("agent_requirement_rejected_total", {"tool": name})
+        logger.warning("拒绝把状态提问当作需求原文提交给 %s：%s", name, requirement[:80])
+        return _REQUIREMENT_REJECTION.format(tool=name)
+    return None
+
 
 #: 纠偏提示里最多回填的任务条数（防止超大计划把提示撑成另一个「计划快照」）
 _MAX_TASK_PREVIEW = 30
@@ -674,6 +722,10 @@ class AgentRunner:
         records: list[ToolCallRecord] = []
         pending: list[PendingAction] = []
         plan_id: str | None = None
+        #: 本轮**真实用户输入**：只在循环开始前取一次。纠偏提示是追加进 ``messages`` 的
+        #: ``role=user`` 消息，若每步都重新取「最后一条 user 消息」，这些提示本身会成为下一轮
+        #: 的判据语料（例如「需要补充什么信息」会被当成状态提问），导致纠偏连环误触发。
+        current_user_text = _last_user_text(messages)
         false_claim_fixes = 0
         state_grounding_fixes = 0
         write_intent_fixes = 0
@@ -744,7 +796,7 @@ class AgentRunner:
                 if not records and not state_grounding_fixes:
                     # 一致性校验（二）：用户问的是**当前计划状态**，模型却一次工具都没调用就给出数字
                     # ——这些数字只能来自长期记忆或历史对话，可能属于别的计划/更早时间点。纠偏一次。
-                    if _is_state_question(_last_user_text(messages)) and _HAS_FIGURE_RE.search(final_text):
+                    if _is_state_question(current_user_text) and _HAS_FIGURE_RE.search(final_text):
                         state_grounding_fixes += 1
                         if step < self._max_steps:
                             METRICS.inc_counter("agent_ungrounded_state_answer_total", {"action": "retry"})
@@ -755,17 +807,19 @@ class AgentRunner:
                         logger.warning("模型重复在无工具调用下回答状态问题，本轮结论未获得工具支撑")
                 if (
                     not pending
+                    # 只看「是否**尝试过**写工具」而不看成败：写工具报错时模型已通过 tool 消息得知失败，
+                    # 此时如实回复「修改失败：任务不存在」是诚实收敛，不应再被判为空转并覆盖掉错误说明。
                     and not any(record.name in WRITE_TOOLS for record in records)
-                    and not write_intent_fixes
-                    and _has_write_intent(_last_user_text(messages))
-                    # 模型反问澄清（如「要改哪个计划？」）是合法收敛，不应判为空转
-                    and "？" not in final_text
-                    and "?" not in final_text
+                    and _has_write_intent(current_user_text)
+                    # 用户消息本身是提问（如「人员负荷需要调整吗？」）时不强制写操作——那是询问而非指令
+                    and not _is_state_question(current_user_text)
+                    # 模型反问澄清（如「请提供计划 ID」）是信息不足时的合法收敛，不应判为空转
+                    and not _is_clarification_request(final_text)
                 ):
                     # 一致性校验（三）：用户本轮明确要求改动，模型却既没登记任何写动作、也没反问澄清，
                     # 而是把写指令当作状态查询作答——修改请求被静默空转（用户以为已受理，实际什么都没发生）。
                     write_intent_fixes += 1
-                    if step < self._max_steps:
+                    if write_intent_fixes == 1 and step < self._max_steps:
                         METRICS.inc_counter("agent_write_intent_noop_total", {"action": "retry"})
                         logger.warning("用户要求改动但本轮无任何写动作且未澄清，回填纠偏提示后重试（第 %d 步）", step)
                         messages.append({"role": "user", "content": _WRITE_INTENT_HINT})
@@ -953,6 +1007,11 @@ class AgentRunner:
         回填给模型令其自纠；目标存在则把任务名写进卡片，让确认环节真正可核对。
         """
         label = describe_action(name, arguments)
+        if name in _REQUIREMENT_WRITE_TOOLS:
+            rejected = _reject_question_as_requirement(name, arguments)
+            if rejected is not None:
+                record, tool_message = self._error_result(call_id, name, arguments, "VALIDATION_ERROR", rejected)
+                return record, tool_message, None, None
         if name in _TASK_TARGET_WRITE_TOOLS:
             task_name, error = await self._resolve_task_target(arguments)
             if error is not None:

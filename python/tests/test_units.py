@@ -264,6 +264,29 @@ async def test_llm_client_does_not_retry_4xx():
     assert info.value.status_code == 502
 
 
+async def test_llm_client_retries_read_timeout_on_post():
+    """LLM 补全的读超时必须重试：早期实现复用引擎侧 ``is_retryable_exception(exc, "POST")``，
+    而 POST 不在幂等白名单里——一次上游读超时就等于把 502 直接抛给用户（实测已发生）。"""
+    attempts: list[int] = []
+
+    class FlakyTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise httpx.ReadTimeout("upstream too slow", request=request)
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+    client = OpenAiCompatibleClient(
+        "http://llm.test/v1", "k", "demo", transport=FlakyTransport(), retry=RetryPolicy(attempts=2, base_delay=0.0)
+    )
+    try:
+        message = await client.chat([{"role": "user", "content": "hi"}])
+    finally:
+        await client.aclose()
+    assert len(attempts) == 2
+    assert message["content"] == "ok"
+
+
 # ---------------------- 配置：向量化端点与密钥的绑定关系 ----------------------
 
 
