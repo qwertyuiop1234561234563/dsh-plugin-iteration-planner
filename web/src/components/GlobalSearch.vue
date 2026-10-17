@@ -12,12 +12,14 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import type { InputInstance } from 'element-plus'
+import { useAuthStore } from '@/stores/auth'
 import { usePlanStore } from '@/stores/plan'
 import { truncate } from '@/utils/format'
 
 const visible = defineModel<boolean>({ default: false })
 
 const store = usePlanStore()
+const auth = useAuthStore()
 const router = useRouter()
 const inputRef = ref<InputInstance>()
 const keyword = ref('')
@@ -38,11 +40,16 @@ interface SearchItem {
 /** 当前计划 ID（既可从路由参数取，也可从 store 取，取其一即可） */
 const planId = computed(() => store.currentPlanId)
 
-/** 页面导航命令：由路由表派生，避免与左侧菜单重复维护 */
+/** 页面导航命令：由路由表派生，避免与左侧菜单重复维护
+ *
+ * 同时按当前角色的权限收敛：只读 / 访客不应在命令面板里看到「新建计划」或
+ * 「账号与权限」这类无权访问的入口（服务端仍会独立拦截，此处仅为体验一致）。
+ */
 const navItems = computed<SearchItem[]>(() => {
   return router
     .getRoutes()
     .filter((record) => typeof record.meta?.sheet === 'string' && typeof record.meta?.title === 'string' && !record.redirect)
+    .filter((record) => !record.meta.permission || auth.can(record.meta.permission))
     .map((record) => {
       const needsPlan = record.path.includes(':planId')
       const sheet = String(record.meta.sheet)

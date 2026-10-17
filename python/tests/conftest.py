@@ -128,9 +128,19 @@ def _engine_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404, json={"code": "NOT_FOUND", "message": f"未模拟的路径：{method} {path}"})
 
 
+#: 测试用引导管理员账号（每个用例的内存库各自引导，不落真实 DB 文件）
+BOOTSTRAP_USERNAME = "admin"
+BOOTSTRAP_PASSWORD = "Admin12345"
+
+
 @pytest.fixture
-def settings() -> Settings:
-    """测试基线配置：显式关闭 ``.env`` 读取，保证用例不受本机配置影响、可复现。"""
+def settings(tmp_path) -> Settings:
+    """测试基线配置：显式关闭 ``.env`` 读取，保证用例不受本机配置影响、可复现。
+
+    所有「落地」类路径一律指向临时目录 / 内存，避免用例写到真实应用数据
+    （``python/.data/auth.db``、``workspace-store.json``）：这既是本机数据污染，
+    也会让「引导管理员只在空库创建」这类断言因残留数据而失效。
+    """
     return Settings(
         _env_file=None,
         api_token="secret-token",
@@ -139,6 +149,11 @@ def settings() -> Settings:
         llm_base_url="",
         llm_model="",
         web_static_dir="",
+        workspace_store_path=str(tmp_path / "workspace-store.json"),
+        chroma_dir=str(tmp_path / "chroma"),
+        auth_store_path=":memory:",
+        auth_bootstrap_admin_username=BOOTSTRAP_USERNAME,
+        auth_bootstrap_admin_password=BOOTSTRAP_PASSWORD,
     )
 
 
@@ -300,6 +315,13 @@ def kb_client(make_client, stub_embedder: StubEmbedder, kb_store: ChromaVectorSt
 
 def auth(token: str = "secret-token") -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def login(client: TestClient, username: str = BOOTSTRAP_USERNAME, password: str = BOOTSTRAP_PASSWORD) -> dict[str, Any]:
+    """以人类账号登录（成功后会话 Cookie 落在 ``client`` 上，后续请求自动携带）。"""
+    response = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200, response.text
+    return response.json()["data"]
 
 
 def tool_call(name: str, arguments: dict[str, Any], call_id: str = "call_1") -> dict[str, Any]:

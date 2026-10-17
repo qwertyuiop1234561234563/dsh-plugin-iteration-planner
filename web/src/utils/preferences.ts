@@ -2,13 +2,11 @@
  * 配置备份与恢复（本地 localStorage ↔ 文件 / 服务端）。
  *
  * 设计要点：
- *  - **不备份访问令牌**：令牌属于凭据，导出为明文文件会扩大泄露面；恢复后需重新填写；
+ *  - **不备份任何凭据**：登录态为服务端会话 Cookie（httpOnly），备份内容只含偏好设置；
  *  - 备份内容为「偏好快照」的键值对（主题、表格密度、通知、保存视图、迭代模板），
  *    结构上带 `version` 与 `exportedAt`，便于后续字段演进时做兼容判断；
  *  - 恢复为**覆盖式**：先做结构与大小校验，再整批写入，避免部分写入造成半坏状态。
  */
-
-import { TOKEN_STORAGE_KEY } from '@/api/client'
 
 /** 备份文件结构版本 */
 export const PREFERENCE_BACKUP_VERSION = 1
@@ -110,11 +108,14 @@ export function parseBackupText(text: string): { backup?: PreferenceBackup; erro
   return { backup: { version: backup.version, exportedAt: String(backup.exportedAt ?? ''), entries: backup.entries } }
 }
 
-/** 应用备份（覆盖式写入；返回实际写入的键数量） */
-export function applyPreferenceBackup(backup: PreferenceBackup, options: { includeToken?: boolean } = {}): number {
+/** 应用备份（覆盖式写入；返回实际写入的键数量）
+ *
+ * 注：登录态已改为服务端会话 Cookie（httpOnly），不再有可导入 / 导出的本地凭据键，
+ * 因此备份内容一律为纯偏好设置。
+ */
+export function applyPreferenceBackup(backup: PreferenceBackup): number {
   let written = 0
   for (const [key, value] of Object.entries(backup.entries)) {
-    if (key === TOKEN_STORAGE_KEY && !options.includeToken) continue
     if (safeSet(key, value)) written += 1
   }
   return written

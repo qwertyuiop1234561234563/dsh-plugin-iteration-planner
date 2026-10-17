@@ -10,6 +10,15 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .constants import (
+    MAX_PLAN_ASSIGNMENTS,
+    PASSWORD_MAX_LEN,
+    PASSWORD_MIN_LEN,
+    ROLES,
+    USERNAME_MAX_LEN,
+    USERNAME_MIN_LEN,
+)
+
 _ISO_DATE = r"^\d{4}-\d{2}-\d{2}$"
 #: 标识符字符集（计划 ID / 会话 ID：引擎与服务端均生成 UUID，仅接受字母数字与 ``-`` / ``_``）。
 #: 限制字符集可避免 ID 被拼进上游 URL 时产生路径穿越，也避免任意形态的键污染会话存储。
@@ -279,6 +288,60 @@ class PreferencesRequest(BaseModel):
 
     profile: str | None = Field(default=None, max_length=64)
     payload: dict[str, Any]
+
+
+# ============================ 访问控制（/api/auth/**） ============================
+
+
+class LoginRequest(BaseModel):
+    """账号口令登录（成功后服务端下发 httpOnly 会话 Cookie）。"""
+
+    username: str = Field(min_length=1, max_length=USERNAME_MAX_LEN, description="用户名（大小写不敏感）")
+    password: str = Field(min_length=1, max_length=PASSWORD_MAX_LEN, description="口令")
+
+
+class ChangePasswordRequest(BaseModel):
+    """当前登录账号修改自身口令（须校验原口令）。"""
+
+    currentPassword: str = Field(min_length=1, max_length=PASSWORD_MAX_LEN, description="当前口令")
+    newPassword: str = Field(
+        min_length=PASSWORD_MIN_LEN,
+        max_length=PASSWORD_MAX_LEN,
+        description="新口令（需同时包含字母与数字）",
+    )
+
+
+class UserCreateRequest(BaseModel):
+    """管理员新建账号。"""
+
+    username: str = Field(min_length=USERNAME_MIN_LEN, max_length=USERNAME_MAX_LEN, description="用户名")
+    password: str = Field(min_length=PASSWORD_MIN_LEN, max_length=PASSWORD_MAX_LEN, description="初始口令")
+    role: str = Field(default="viewer", description=f"角色，可选：{' / '.join(ROLES)}")
+    displayName: str | None = Field(default=None, max_length=64, description="显示名（缺省与用户名相同）")
+
+
+class UserUpdateRequest(BaseModel):
+    """管理员更新账号（仅提交需要变更的字段）。"""
+
+    role: str | None = Field(default=None, description=f"角色，可选：{' / '.join(ROLES)}")
+    status: str | None = Field(default=None, description="账号状态，可选：active / disabled")
+    displayName: str | None = Field(default=None, max_length=64, description="显示名")
+    password: str | None = Field(
+        default=None,
+        min_length=PASSWORD_MIN_LEN,
+        max_length=PASSWORD_MAX_LEN,
+        description="重置口令（提交后该账号的既有会话立即失效）",
+    )
+
+
+class PlanAssignmentsRequest(BaseModel):
+    """设置访客（guest）可见的计划白名单（**全量覆盖**语义）。"""
+
+    planIds: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_PLAN_ASSIGNMENTS,
+        description="可见计划 ID 列表；空数组表示无权查看任何计划",
+    )
 
 
 # ============================ 知识库（RAG） ============================

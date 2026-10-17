@@ -13,6 +13,110 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# ------------------------------ 访问控制：角色 / 权限 ------------------------------
+# 设计口径（对齐 Plane / OpenProject / Vikunja / Focalboard 的共同做法）：
+# **固定少量角色 + 权限表驱动**，权限一律在服务端判定，前端只按权限清单做展示收敛。
+#
+#   admin  控制台管理员：除业务读写外，唯一可管理用户与指派（含 guest 计划白名单）
+#   member 项目成员：计划与治理数据的读写、Agent 对话与写确认
+#   viewer 只读观察者：全量只读（可对话但不可确认写操作）
+#   guest  外部访客：只读，且**仅能看到被指派的计划**，看不到知识库 / 记忆 / 审计
+
+ROLE_ADMIN = "admin"
+ROLE_MEMBER = "member"
+ROLE_VIEWER = "viewer"
+ROLE_GUEST = "guest"
+#: 全部角色（顺序即权限由高到低，用于展示与校验）
+ROLES: tuple[str, ...] = (ROLE_ADMIN, ROLE_MEMBER, ROLE_VIEWER, ROLE_GUEST)
+#: 角色 → 中文名（前端展示；与 :data:`ROLES` 一一对应）
+ROLE_LABELS: dict[str, str] = {
+    ROLE_ADMIN: "管理员",
+    ROLE_MEMBER: "成员",
+    ROLE_VIEWER: "只读",
+    ROLE_GUEST: "访客",
+}
+
+#: 权限标识（``资源:动作``）——后端唯一的判定依据
+PERM_USER_MANAGE = "user:manage"
+PERM_PLAN_READ = "plan:read"
+PERM_PLAN_WRITE = "plan:write"
+PERM_AGENT_CHAT = "agent:chat"
+PERM_AGENT_WRITE = "agent:write"
+PERM_KB_READ = "kb:read"
+PERM_KB_WRITE = "kb:write"
+PERM_MEMORY_READ = "memory:read"
+PERM_MEMORY_WRITE = "memory:write"
+PERM_AUDIT_READ = "audit:read"
+
+#: 全部权限标识（测试与文档遍历用）
+PERMISSIONS: tuple[str, ...] = (
+    PERM_USER_MANAGE,
+    PERM_PLAN_READ,
+    PERM_PLAN_WRITE,
+    PERM_AGENT_CHAT,
+    PERM_AGENT_WRITE,
+    PERM_KB_READ,
+    PERM_KB_WRITE,
+    PERM_MEMORY_READ,
+    PERM_MEMORY_WRITE,
+    PERM_AUDIT_READ,
+)
+
+#: 角色 → 权限集合（单一事实来源，新增角色 / 权限只改这里）
+ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
+    ROLE_ADMIN: frozenset(PERMISSIONS),
+    ROLE_MEMBER: frozenset(
+        (
+            PERM_PLAN_READ,
+            PERM_PLAN_WRITE,
+            PERM_AGENT_CHAT,
+            PERM_AGENT_WRITE,
+            PERM_KB_READ,
+            PERM_KB_WRITE,
+            PERM_MEMORY_READ,
+            PERM_MEMORY_WRITE,
+            PERM_AUDIT_READ,
+        )
+    ),
+    ROLE_VIEWER: frozenset(
+        (
+            PERM_PLAN_READ,
+            PERM_AGENT_CHAT,
+            PERM_KB_READ,
+            PERM_MEMORY_READ,
+            PERM_AUDIT_READ,
+        )
+    ),
+    ROLE_GUEST: frozenset((PERM_PLAN_READ,)),
+}
+
+#: 计划可见范围：全部计划 / 仅被指派的计划（guest）
+PLAN_SCOPE_ALL = "all"
+PLAN_SCOPE_ASSIGNED = "assigned"
+#: 角色 → 计划可见范围
+ROLE_PLAN_SCOPE: dict[str, str] = {
+    ROLE_ADMIN: PLAN_SCOPE_ALL,
+    ROLE_MEMBER: PLAN_SCOPE_ALL,
+    ROLE_VIEWER: PLAN_SCOPE_ALL,
+    ROLE_GUEST: PLAN_SCOPE_ASSIGNED,
+}
+
+#: 账号状态：正常 / 停用（停用后会话立即失效且无法登录）
+USER_STATUS_ACTIVE = "active"
+USER_STATUS_DISABLED = "disabled"
+USER_STATUSES: tuple[str, ...] = (USER_STATUS_ACTIVE, USER_STATUS_DISABLED)
+
+#: 用户名长度与字符集限制（同时用于登录与创建，避免大小写 / 空白导致的歧义）
+USERNAME_MIN_LEN = 3
+USERNAME_MAX_LEN = 64
+#: 口令长度下限与上限（上限防止 scrypt 被超长输入拖慢）
+PASSWORD_MIN_LEN = 8
+PASSWORD_MAX_LEN = 200
+#: 显示名长度上限
+DISPLAY_NAME_MAX_LEN = 64
+#: 单个访客可被指派的计划数量上限
+MAX_PLAN_ASSIGNMENTS = 200
+
 # ------------------------------ 数据导入（/api/workspace/import） ------------------------------
 
 #: 单次导入的最大行数（防止一次请求打爆引擎的重规划流水线）
@@ -133,7 +237,49 @@ def default_store_path() -> str:
     return str(Path(__file__).resolve().parent.parent / ".data" / "workspace-store.json")
 
 
+def default_auth_store_path() -> str:
+    """默认账号 / 会话库位置（可用环境变量 ``AUTH_STORE_PATH`` 覆盖）。
+
+    与工作区存储同放 ``.data`` 目录：运行期数据不进源码目录，且该目录已在
+    ``.gitignore`` 中忽略，避免把账号口令散列误提交。
+    """
+    override = os.environ.get("AUTH_STORE_PATH")
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent.parent / ".data" / "auth.db")
+
+
 __all__ = [
+    "ROLE_ADMIN",
+    "ROLE_MEMBER",
+    "ROLE_VIEWER",
+    "ROLE_GUEST",
+    "ROLES",
+    "ROLE_LABELS",
+    "PERM_USER_MANAGE",
+    "PERM_PLAN_READ",
+    "PERM_PLAN_WRITE",
+    "PERM_AGENT_CHAT",
+    "PERM_AGENT_WRITE",
+    "PERM_KB_READ",
+    "PERM_KB_WRITE",
+    "PERM_MEMORY_READ",
+    "PERM_MEMORY_WRITE",
+    "PERM_AUDIT_READ",
+    "PERMISSIONS",
+    "ROLE_PERMISSIONS",
+    "PLAN_SCOPE_ALL",
+    "PLAN_SCOPE_ASSIGNED",
+    "ROLE_PLAN_SCOPE",
+    "USER_STATUS_ACTIVE",
+    "USER_STATUS_DISABLED",
+    "USER_STATUSES",
+    "USERNAME_MIN_LEN",
+    "USERNAME_MAX_LEN",
+    "PASSWORD_MIN_LEN",
+    "PASSWORD_MAX_LEN",
+    "DISPLAY_NAME_MAX_LEN",
+    "MAX_PLAN_ASSIGNMENTS",
     "IMPORT_MAX_ROWS",
     "IMPORT_NAME_MAX_LEN",
     "IMPORT_MODE_APPEND",
@@ -170,4 +316,5 @@ __all__ = [
     "SSE_RESULT",
     "SSE_HEARTBEAT_SECONDS",
     "default_store_path",
+    "default_auth_store_path",
 ]

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from .agent import AgentRunner
 from .agent.memory import MemoryService
+from .auth import AuthStore
 from .cache import CacheBackend
 from .config import Settings
 from .engine_client import EngineClient
@@ -47,6 +48,8 @@ class AppContext:
     cache: CacheBackend | None = None
     #: 限流后端（Redis / 进程内存）：多副本经 Redis 共享全局配额
     rate_limit: RateLimitBackend | None = None
+    #: 账号 / 会话存储（登录 + 角色鉴权）；``AUTH_ENABLED=false`` 时为 ``None``
+    auth: AuthStore | None = None
     #: 优雅关机标志：置位后 /readyz 返回未就绪，拒绝新请求（在途请求自然排空）
     shutting_down: bool = False
 

@@ -1,10 +1,11 @@
 /**
- * API 客户端：统一封装 REST 调用、令牌注入、错误归一化与文件导出。
+ * API 客户端：统一封装 REST 调用、错误归一化与文件导出。
  *
  * 约定：
- *  - 令牌保存在 localStorage，请求拦截器自动注入 `Authorization: Bearer <token>`；
+ *  - **登录态走服务端会话 Cookie**（httpOnly，JS 不可读），不在 localStorage 存放任何凭据；
  *  - 后端错误响应体统一为 `{ code, message, details }`，这里归一化为 {@link ApiClientError}，
- *    供页面按 code 做差异化处理（例如 CYCLE_DEPENDENCY 高亮环内任务）。
+ *    供页面按 code 做差异化处理（例如 CYCLE_DEPENDENCY 高亮环内任务）；
+ *  - `401` 统一触发 {@link setUnauthorizedHandler} 注册的处理器（路由守卫据此跳登录页）。
  */
 
 import axios, { type AxiosError } from 'axios'
@@ -20,6 +21,12 @@ import type {
   ApiEnvelope,
   ApiErrorBody,
   AuditRecord,
+  AuthAccount,
+  AuthAccountCreatePayload,
+  AuthAccountList,
+  AuthAccountUpdatePayload,
+  AuthRoleInfo,
+  AuthUser,
   BaselineDetail,
   BaselineDiff,
   BaselineSummary,
@@ -69,29 +76,17 @@ import type {
   WorkloadResult,
 } from './types'
 
-/** 令牌本地存储键 */
-export const TOKEN_STORAGE_KEY = 'iteration-planner:token'
-
 /** REST 基地址（同域部署时为 /api） */
 export const API_BASE = import.meta.env.VITE_API_BASE ?? '/api'
 
-/** 读取访问令牌 */
-export function getToken(): string {
-  try {
-    return localStorage.getItem(TOKEN_STORAGE_KEY) ?? ''
-  } catch {
-    return ''
-  }
-}
+/** 401 处理器：由鉴权 Store 注册，用于跳转登录页并清空本地用户态 */
+type UnauthorizedHandler = () => void
 
-/** 写入访问令牌（空字符串表示清除） */
-export function setToken(token: string): void {
-  try {
-    if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token)
-    else localStorage.removeItem(TOKEN_STORAGE_KEY)
-  } catch {
-    // 隐私模式下 localStorage 不可用：降级为内存态（本次会话有效）
-  }
+let onUnauthorized: UnauthorizedHandler | null = null
+
+/** 注册 401 处理器（重复注册以最后一次为准） */
+export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
+  onUnauthorized = handler
 }
 
 /** 归一化后的 API 异常 */
@@ -105,6 +100,16 @@ export class ApiClientError extends Error {
     super(message)
     this.name = 'ApiClientError'
   }
+
+  /** 是否为「未登录 / 会话已失效」（服务端 401） */
+  get isUnauthorized(): boolean {
+    return this.status === 401
+  }
+
+  /** 是否为「已登录但权限不足」（服务端 403；重登无效，须调整角色） */
+  get isForbidden(): boolean {
+    return this.status === 403
+  }
 }
 
 /** axios 实例 */
@@ -112,12 +117,8 @@ export const http = axios.create({
   baseURL: API_BASE,
   timeout: 60_000,
   headers: { 'content-type': 'application/json' },
-})
-
-http.interceptors.request.use((config) => {
-  const token = getToken()
-  if (token) config.headers.Authorization = `Bearer ${token}`
-  return config
+  // 会话 Cookie 需随请求发送；同源请求默认即带 Cookie，跨域开发场景需显式开启
+  withCredentials: true,
 })
 
 http.interceptors.response.use(
@@ -129,6 +130,7 @@ http.interceptors.response.use(
       body?.message ??
       (status === 0 ? '无法连接到服务端，请确认 API 服务已启动' : error.message)
     const code = body?.code ?? (status === 0 ? 'NETWORK_ERROR' : 'HTTP_ERROR')
+    if (status === 401) onUnauthorized?.()
     return Promise.reject(new ApiClientError(message, code, status, body?.details))
   },
 )
@@ -143,6 +145,45 @@ async function unwrap<T>(promise: Promise<{ data: ApiEnvelope<T> }>): Promise<T>
 export const api = {
   /** 健康检查 */
   health: () => unwrap<HealthResult>(http.get('/health')),
+
+  /* ---------------------- 访问控制（/api/auth/**） ---------------------- */
+
+  /** 账号口令登录（成功后服务端下发 httpOnly 会话 Cookie） */
+  login: (username: string, password: string) =>
+    unwrap<AuthUser>(http.post('/auth/login', { username, password })),
+
+  /** 注销当前会话 */
+  logout: () => http.post('/auth/logout').then(() => undefined),
+
+  /** 查询当前登录主体与权限清单（未登录时抛出 401） */
+  session: () => unwrap<AuthUser>(http.get('/auth/session')),
+
+  /** 角色与权限矩阵（只读，用于前端展示） */
+  authRoles: () => unwrap<{ roles: AuthRoleInfo[] }>(http.get('/auth/roles')),
+
+  /** 修改当前账号口令（需校验原口令；改后其它会话立即失效） */
+  changePassword: (currentPassword: string, newPassword: string) =>
+    unwrap<{ ok: boolean }>(http.post('/auth/password', { currentPassword, newPassword })),
+
+  /** 账号清单（仅管理员） */
+  listUsers: () => unwrap<AuthAccountList>(http.get('/auth/users')),
+
+  /** 新建账号（仅管理员） */
+  createUser: (payload: AuthAccountCreatePayload) => unwrap<AuthAccount>(http.post('/auth/users', payload)),
+
+  /** 更新账号（仅管理员） */
+  updateUser: (userId: string, payload: AuthAccountUpdatePayload) =>
+    unwrap<AuthAccount>(http.patch(`/auth/users/${encodeURIComponent(userId)}`, payload)),
+
+  /** 删除账号（仅管理员） */
+  deleteUser: (userId: string) =>
+    http.delete(`/auth/users/${encodeURIComponent(userId)}`).then(() => undefined),
+
+  /** 设置访客可见计划白名单（仅管理员） */
+  setUserPlans: (userId: string, planIds: string[]) =>
+    unwrap<{ userId: string; planIds: string[] }>(
+      http.put(`/auth/users/${encodeURIComponent(userId)}/plans`, { planIds }),
+    ),
 
   /** 枚举元数据（下拉选项与缓冲规则说明） */
   enums: () => unwrap<EnumMeta>(http.get('/meta/enums')),
@@ -470,8 +511,6 @@ export async function agentChatStream(
     'content-type': 'application/json',
     accept: 'text/event-stream',
   }
-  const token = getToken()
-  if (token) headers.Authorization = `Bearer ${token}`
 
   let response: Response
   try {
@@ -479,6 +518,8 @@ export async function agentChatStream(
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
+      // 会话 Cookie 需随流式请求发送（同源默认携带，跨域需与服务端 CORS 凭证配置一致）
+      credentials: 'include',
       signal,
     })
   } catch {
@@ -528,9 +569,15 @@ export async function agentChatStream(
   }
 }
 
-/** 推导 WebSocket 地址（开发环境由 Vite 代理 /ws） */
+/** 推导 WebSocket 地址（开发环境由 Vite 代理 /ws）
+ *
+ * 浏览器侧的 `WebSocket` 构造函数**不支持自定义请求头**，因此无法像 REST 那样注入
+ * `Authorization`。但浏览器在发起同源 WebSocket 握手时会**自动带上 Cookie**，而服务端
+ * `/ws` 已改为按会话 Cookie 鉴权（见 `app/routes/system.py::_resolve_ws_principal`），
+ * 所以此处无需再拼接任何凭据，也避免了把令牌暴露在 URL（会被代理与访问日志留存）上。
+ *
+ * 注意：Cookie 路径须为 `/`，否则 `/ws` 无法携带——服务端写入时已按 `path="/"` 设置。
+ */
 export function resolveWsUrl(): string {
-  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/ws`
+  return import.meta.env.VITE_WS_URL ?? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`
 }

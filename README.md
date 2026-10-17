@@ -426,13 +426,13 @@ WEB_STATIC_DIR=web/dist npm run api:start                # 访问 http://localho
 ### 10.4 Docker Compose 一键部署（app + PostgreSQL）
 
 ```bash
-# 1) 准备环境变量（至少设置 API_TOKEN，生产务必开启鉴权）
+# 1) 准备环境变量（账号体系默认开启；引导管理员口令留空会自动生成并打印一次）
 Copy-Item .env.example .env      # 按需修改 DATABASE_URL 之外的项
 
 # 2) 构建并启动
 docker compose up -d --build
 
-# 3) 访问控制台
+# 3) 访问控制台（首次启动日志里会打印引导管理员账号与随机口令）
 #    控制台 / API： http://localhost:8080
 #    Swagger 文档： http://localhost:8080/api/docs
 #    健康检查：     http://localhost:8080/api/health
@@ -451,7 +451,12 @@ docker compose up -d --build
 |---|---|---|
 | `API_HOST` / `API_PORT` | `0.0.0.0` / `8080` | 监听地址与端口 |
 | `API_BASE_PATH` | `/api` | REST 路由前缀（Swagger UI 位于 `<前缀>/docs`） |
-| `API_TOKEN` | 空 | Bearer 令牌；**留空表示不鉴权**（健康检查、文档、静态资源始终放行） |
+| `API_TOKEN` | 空 | **机器 / CI 令牌**（服务账号语义，等价管理员但无人类身份）；**留空表示不启用机器令牌**（健康检查、文档、静态资源始终放行）。人类用户一律走登录 + 会话 Cookie，见 §10.10 |
+| `AUTH_ENABLED` | `true` | 登录 + 角色鉴权总开关；关闭后 `/api/**` 与 `/ws` 整体不鉴权（仅用于本地排障） |
+| `AUTH_STORE_PATH` | 空 | 账号 / 会话库（sqlite3）路径；留空用 `python/.data/auth.db`（已 gitignore），`:memory:` 为进程内存库（重启即丢，仅演示 / 测试） |
+| `AUTH_SESSION_COOKIE` / `AUTH_SESSION_TTL_SECONDS` | `ip_session` / `28800` | 会话 Cookie 名 / 有效期（秒）；过期自动失效，管理员可即时吊销 |
+| `AUTH_COOKIE_SECURE` / `AUTH_COOKIE_SAMESITE` | `false` / `lax` | Cookie 是否仅经 HTTPS 传输（**生产经 HTTPS 务必 `true`**）/ SameSite 策略（填 `none` 时浏览器要求 `secure=true`） |
+| `AUTH_BOOTSTRAP_ADMIN_USERNAME` / `AUTH_BOOTSTRAP_ADMIN_PASSWORD` | `admin` / 空 | 首启引导管理员；账号库非空时**忽略**（不会重置既有口令）。口令留空则自动生成随机口令并以 WARNING 日志打印**一次**，登录后请立即更换 |
 | `API_CORS_ORIGIN` | `*` | 允许来源，多个以英文逗号分隔 |
 | `STORAGE_DRIVER` | `memory` | `memory`（演示）或 `postgres`（生产） |
 | `DATABASE_URL` | — | PostgreSQL 连接串（优先于离散 `PG*` 参数） |
@@ -486,10 +491,11 @@ docker compose up -d --build
 | `GET` | `/api/plans/:planId/{critical-path,risks,burndown,report,export}` | 关键路径 / 风险 / 燃尽 / 报表 / 导出 |
 | `GET` / `POST` | `/api/audit`、`/api/plans/:planId/dag-check` | 审计查询 / 手动校验 DAG |
 | `*` | `/api/kb/**`、`/api/memories/**` | 知识库（RAG）与长期记忆（Python 服务提供，详见 §10.9） |
-| `WS` | `/ws` | 计划创建/更新/删除事件推送（含 30s 心跳） |
+| `*` | `/api/auth/**` | 登录 / 注销 / 会话查询 / 改口令 / 账号管理 / 计划指派（Python 服务提供，详见 §10.10） |
+| `WS` | `/ws` | 计划创建/更新/删除事件推送（含 30s 心跳）。**握手需鉴权**：浏览器自动携带会话 Cookie（同源）；机器 / CI 用 `?token=<API_TOKEN>`（`WebSocket` 构造函数无法自定义请求头）。未通过即在握手阶段被拒（close code `1008`，HTTP 403），不下发任何事件。**访客（guest）只收到被指派计划的事件**，其余事件在扇出前即被过滤 |
 
 成功响应统一为 `{ "data": ... }`；错误统一为 `{ "code", "message", "details" }`，并映射到稳定错误码：
-`CYCLE_DEPENDENCY`(409)、`VALIDATION_ERROR`(400)、`LLM_FORMAT_ERROR`(422)、`STORAGE_UNAVAILABLE`(503)、`UNAUTHORIZED`(401)。
+`CYCLE_DEPENDENCY`(409)、`VALIDATION_ERROR`(400)、`LLM_FORMAT_ERROR`(422)、`STORAGE_UNAVAILABLE`(503)、`UNAUTHORIZED`(401)、`FORBIDDEN`(403)。
 
 ### 10.7 控制台页面功能
 
@@ -503,8 +509,12 @@ docker compose up -d --build
 | 知识库 | 文档清单（格式 / 分块数 / 字符数 / 标签）、上传文件或粘贴文本入库、分块预览、删除；检索试跑展示命中片段与得分，并可切换混合 / 纯向量模式 |
 | 长期记忆 | 记忆清单（类型 / 重要度 / 状态 / 来源 / 最近使用）、按状态与类型过滤、关键词搜索、启用停用、删除与清空、手工新增（写入前自动去重）；语义召回试跑展示相似度排序 |
 | 审计日志 | 按计划过滤、条数上限、成功/失败与耗时统计、展开查看入参与返回值完整 JSON |
+| 账号与权限 | **仅管理员可见**：账号清单（角色 / 状态 / 最近登录）、新建账号、变更角色与状态、重置口令、删除；为访客（guest）指派可见计划白名单 |
+| 登录页 | 账号口令登录；登录态为服务端会话 Cookie，成功后跳回被守卫拦下的目标页 |
 
-> 前端令牌保存在浏览器 `localStorage`，与后端 `API_TOKEN` 一致即可；未开启鉴权时留空。
+> **登录态不在浏览器本地存凭据**：服务端下发 `httpOnly` 会话 Cookie（脚本不可读，防 XSS 窃取），
+> 页面刷新经 `GET /api/auth/session` 复原；菜单与入口按角色权限收敛，但**权限判定一律在服务端**完成。
+> WebSocket 因浏览器 API 无法自定义请求头，改为由浏览器自动携带同源 Cookie（见 §10.10）。
 > 计划切换、页面刷新、WebSocket 断线重连（5s 自动重试）均已在布局层统一处理。
 
 ---
@@ -637,10 +647,12 @@ Python 新增：`ENGINE_UNAVAILABLE`(502，引擎不可达)、`ENGINE_CIRCUIT_OP
 npm run py:test          # 等价于 python -m pytest -c python/pyproject.toml
 ```
 
-206 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
+304 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
 Agent 工具调度、工具失败容忍、会话上下文、步数上限，企业级加固能力（限流 / 请求体上限 / 安全头 / 关联 ID /
 指标 / 就绪探针 / 断路器 / 重试 / 并行工具调用 / 上下文裁剪 / 会话存储 / LLM 调用重试 / WS 断线重放 /
-工具异常兜底 / 错误响应脱敏 / 输入边界包裹 / 会话 ID 白名单），以及**知识库全链路**（分块 / 文档解析 /
+工具异常兜底 / 错误响应脱敏 / 输入边界包裹 / 会话 ID 白名单），**访问控制全链路**（scrypt 口令 / 角色权限矩阵 /
+账号 CRUD 与最后管理员保护 / 会话创建吊销过期 / 改角色与停用即时踢下线 / 访客计划作用域 404 与列表过滤 /
+WS 握手 Cookie 鉴权与广播过滤），以及**知识库全链路**（分块 / 文档解析 /
 BM25 / RRF / 向量库增删查 / 入库-检索-删除 REST）与**长期记忆**（候选解析 / 去重 / 语义召回 / 停用治理 /
 自动提取 / 后台提取失败消费 / agentic RAG 工具）。
 
@@ -664,7 +676,10 @@ BM25 / RRF / 向量库增删查 / 入库-检索-删除 REST）与**长期记忆*
 
 | 能力 | 实现 | 说明 |
 |---|---|---|
-| 鉴权 | [`security.py`](./python/app/security.py) | Bearer 令牌**常量时间比较**（防时序侧信道） |
+| 鉴权（人类） | [`auth/`](./python/app/auth) | 登录 + 角色 + 服务端会话：口令用 **scrypt**（内存硬，抵御 GPU 爆破）加盐散列；会话 Cookie 为 `httpOnly` 随机令牌，落库只存其 `sha256` 摘要（库被读走也无法回放伪造），**可即时吊销**（管理员踢下线 / 改口令即失效）；登录失败统一返回同一句文案，避免账号枚举（账号不存在时也做一次等价耗时校验，防时序枚举） |
+| 鉴权（机器） | [`security.py`](./python/app/security.py) | `API_TOKEN` Bearer 令牌**常量时间比较**（防时序侧信道），视为内部服务账号；人类用户不再共享此令牌 |
+| 授权 | [`auth/permissions.py`](./python/app/auth/permissions.py) | 角色 → 权限、请求「方法 + 路径」→ 所需权限的**单一映射表**；权限不足 `403 FORBIDDEN`（区别于 401：重登无效，须调整角色）。访客越权访问计划按 `404` 处理，不泄露计划存在性 |
+| WebSocket 鉴权与作用域 | [`routes/system.py`](./python/app/routes/system.py)、[`ws.py`](./python/app/ws.py) | WS 走独立 ASGI scope，`BaseHTTPMiddleware` 式鉴权**不覆盖**它——必须在端点内显式校验（会话 Cookie 或 `?token=`，常量时间比较），否则任意客户端直连 `/ws` 即可拿到 `plan.created` 全量载荷（需求原文 + 任务明细）。**访客连接只接收被指派计划的事件**，其余事件在扇出前过滤（无 `planId` 的事件同样不下发，避免推断系统中有哪些计划） |
 | 限流 | [`security.py`](./python/app/security.py) | 按客户端 IP 令牌桶，超限 `429 RATE_LIMITED` + `Retry-After`（`API_RATE_LIMIT_PER_MINUTE`，默认关闭）。分桶键**只认 TCP 对端地址**：`X-Forwarded-For` 仅在直连对端命中 `API_TRUSTED_PROXIES` 清单时才采信（否则伪造该头即可换桶绕过限流）。注意 `run.py` 已显式关闭 uvicorn 的 `--proxy-headers`（其默认把 `127.0.0.1` 当可信代理并用 XFF 改写 `request.client`，会绕过上述判断）；用 uvicorn CLI 启动时请加 `--no-proxy-headers`。后端可插拔：配置 `REDIS_URL` 时自动切换为 **Redis 共享令牌桶**（判定与扣减在同一段 Lua 内原子完成，桶键带 TTL），`API_WORKERS>1` / 多副本下得到**真正的全局配额**；未配置则为单进程内存实现（全局配额 ≈ 配置值 × worker 数），可用 `RATE_LIMIT_BACKEND=memory/redis` 显式指定 |
 | 安全响应头 | [`security.py`](./python/app/security.py) | `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` 等，含错误与限流响应 |
 | 请求体上限 | [`security.py`](./python/app/security.py) | **纯 ASGI** 中间件 `BodySizeLimitMiddleware`（`API_MAX_BODY_BYTES`，默认 32 MiB）：已声明超限 `Content-Length` 时**不读 body** 直接 `413 PAYLOAD_TOO_LARGE`；未声明长度（chunked）时**读到越界块即中断**，绝不把整个 body 读进内存。限流按「请求数/分钟」计量，防不住单请求体积，二者互补 |
@@ -682,6 +697,7 @@ BM25 / RRF / 向量库增删查 / 入库-检索-删除 REST）与**长期记忆*
 | 多进程 | `run.py`、`API_WORKERS` | 多 worker 需 `SESSION_STORE=redis` + 网关层 WS 粘性会话；配置 `REDIS_URL` 后限流与缓存亦自动切换为共享实现（断路器仍为进程内状态，必要时可上移到网关） |
 
 运维端点：`http://<host>/healthz`、`/readyz`、`/metrics`（均免鉴权，便于 k8s 探针与 Prometheus 抓取）。
+`/ws` **不在豁免之列**：它与 `/api/**` 同样要求「会话 Cookie 或 `API_TOKEN`」，详见 §10.6 / §10.8 / §10.11。
 
 ### 10.9 知识库（RAG）与长期记忆
 
@@ -758,6 +774,52 @@ Agent 侧新增三个**只读**检索工具（写类工具仍走两阶段确认�
 > `CACHE_BACKEND=redis` / `RATE_LIMIT_BACKEND=redis` 为**显式选择**，此时缺 `REDIS_URL` 或未安装
 > `redis` 依赖会直接报错启动失败，不做静默降级（避免「以为共享了其实各存各的」）。
 > 可选 Redis 依赖已单独声明：`python -m pip install -r python/requirements-redis.txt`。
+
+### 10.11 访问控制（登录 + 角色）
+
+> 目标：把「一把全局密钥人人共用」改成「一人一账号 + 按角色授权」，同时保持算法层零改动。
+
+**四档角色（对齐 Plane / OpenProject / Vikunja / Focalboard 的通行做法：固定少量角色 + 权限表驱动）**：
+
+| 角色 | 用户管理 | 计划读写 | Agent 对话 | 写确认 | 知识库 | 长期记忆 | 审计 | 计划可见范围 |
+|---|---|---|---|---|---|---|---|---|
+| `admin` 管理员 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 全部 |
+| `member` 成员 | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 全部 |
+| `viewer` 只读 | — | 只读 | ✅ | — | 只读 | 只读 | ✅ | 全部 |
+| `guest` 访客 | — | 只读 | — | — | — | — | — | **仅被指派计划** |
+
+权限标识（`资源:动作`）与角色映射集中在 [`python/app/constants.py`](./python/app/constants.py)，请求路径 → 所需权限的映射集中在
+[`python/app/auth/permissions.py`](./python/app/auth/permissions.py)：新增角色或权限**只改这两处**，不散落到各路由。
+
+**人类登录态 = 服务端会话 + `httpOnly` Cookie**（同源 SPA，`SameSite=lax`）：
+
+- 浏览器**不存任何凭据**（无 localStorage 令牌），因此不存在 XSS「一把梭」拖走长期凭据的问题；
+- 服务端可**即时吊销**：管理员停用 / 删除账号或重置口令、用户改自己口令，相关会话立刻失效（无需等待过期）；
+- WebSocket 与 SSE 天然受益：浏览器自动携带同源 Cookie，无需再把令牌拼进 URL（避免被代理与访问日志留存）。
+
+**账号生命周期接口**（`/api/auth/**`）：
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| `POST` | `/api/auth/login` | 免鉴权 | 账号口令登录，下发会话 Cookie；失败统一文案，不区分「账号不存在 / 口令错」 |
+| `POST` | `/api/auth/logout` | 免鉴权 | 注销当前会话（幂等） |
+| `GET` | `/api/auth/session` | 需登录 | 返回当前主体：`userId` / `username` / `role` / `permissions` / `planScope` / `planIds` |
+| `GET` | `/api/auth/roles` | 需登录 | 角色与权限矩阵（前端展示 / 排障） |
+| `POST` | `/api/auth/password` | 需登录 | 修改自身口令（须校验原口令；成功后吊销该账号全部会话） |
+| `GET` `POST` `PATCH` `DELETE` | `/api/auth/users`、`/api/auth/users/{id}` | `user:manage` | 账号清单 / 新建 / 更新（角色 / 状态 / 显示名 / 重置口令）/ 删除 |
+| `PUT` | `/api/auth/users/{id}/plans` | `user:manage` | 设置访客可见计划白名单（**全量覆盖**，空数组即「无权查看任何计划」） |
+
+**关键约束**：
+
+- **引导管理员**：账号库为空时按 `AUTH_BOOTSTRAP_ADMIN_USERNAME` 创建；口令留空则随机生成并在启动日志以 WARNING 打印**一次**（不落盘明文、绝不写进响应体）。库非空时该配置被忽略，不会重置既有口令。
+- **最后一名管理员保护**：把唯一「启用中的管理员」降权、停用或删除会被拒绝（`400`），否则控制台将永久失去管理入口。
+- **计划作用域**：访客的可见计划白名单由 Python 网关维护并在两处生效——列表接口在转发后过滤未授权计划；单计划接口在鉴权中间件按 `404` 拦下（不泄露计划存在性）；WebSocket 亦按白名单过滤事件。
+- **账号存储**：`sqlite3`（单文件，WAL 模式），启用唯一索引与事务，避免「同名账号并发创建」这类读改写竞态；全过程经 `asyncio.Lock` + 线程卸载，不阻塞事件循环。
+- **多副本部署**：账号库为单文件，多副本请挂载共享卷；会话表会随之共享，任一副本吊销即时全副本生效。若要接企业 SSO，替换 `app/auth/store.py` 即可，算法与前端不受影响。
+- **前端收敛不等于授权**：页面与菜单按 `permissions` 隐藏入口（避免无谓 403 往返），但本地篡改只会得到一个能渲染、取不到数据的空页面。
+
+> 生产部署务必开启 HTTPS 并设 `AUTH_COOKIE_SECURE=true`；跨站场景请同时收紧 `AUTH_COOKIE_SAMESITE`。
+> 若只是想跑通演示，可临时 `AUTH_ENABLED=false`（等同于全部请求按机器主体放行），**切勿带入生产**。
 
 ---
 

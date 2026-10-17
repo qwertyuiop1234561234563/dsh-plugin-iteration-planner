@@ -32,16 +32,26 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .agent import AgentRunner, MemoryService, OpenAiCompatibleClient, ToolDispatcher
+from .auth import (
+    AuthStore,
+    Principal,
+    build_principal,
+    is_public_endpoint,
+    machine_principal,
+    plan_id_from_path,
+    required_permission,
+)
 from .cache import build_cache
 from .config import Settings, get_settings
 from .constants import KB_COLLECTION, MEMORY_COLLECTION, default_chroma_dir, default_store_path
 from .engine_client import EngineClient
-from .errors import ApiError, bad_request, internal, rate_limited, unauthorized
+from .errors import ApiError, bad_request, forbidden, internal, not_found, rate_limited, unauthorized
 from .kb import CachedEmbedder, ChromaVectorStore, Embedder, OpenAiEmbedder, build_knowledge_base
 from .logging_config import configure_logging, request_id_var
 from .metrics import METRICS
 from .resilience import CircuitBreaker, RetryPolicy
 from .routes.agent import build_agent_router
+from .routes.auth import build_auth_router
 from .routes.kb import build_kb_router
 from .routes.memory import build_memory_router
 from .routes.proxy import register_proxy_and_static
@@ -226,11 +236,33 @@ def create_app(
         driver=settings.rate_limit_backend,
     )
     workspace = WorkspaceStore(settings.workspace_store_path or default_store_path())
+    #: 账号 / 会话存储；``AUTH_ENABLED=false`` 时整套访问控制关闭（仅保留机器令牌语义）
+    auth_store = (
+        AuthStore(
+            settings.resolved_auth_store_path,
+            session_ttl_seconds=settings.auth_session_ttl_seconds,
+        )
+        if settings.auth_enabled
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await store.start()
         await workspace.start()
+        if auth_store is not None:
+            await auth_store.start()
+            generated = await auth_store.ensure_bootstrap_admin(
+                settings.auth_bootstrap_admin_username,
+                settings.auth_bootstrap_admin_password,
+            )
+            if generated:
+                # 一次性随机口令只在此处打印：不落盘明文，也绝不写进响应体
+                logger.warning(
+                    "已创建引导管理员「%s」，随机口令：%s —— 请立即登录并修改口令",
+                    settings.auth_bootstrap_admin_username,
+                    generated,
+                )
         if start_bridge:
             bridge.start()
         try:
@@ -240,6 +272,8 @@ def create_app(
             _app.state.ctx.shutting_down = True
             if start_bridge:
                 await bridge.stop()
+            if auth_store is not None:
+                await auth_store.close()
             await store.close()
             await workspace.close()
             await cache.close()
@@ -275,6 +309,7 @@ def create_app(
         embedder=resolved_embedder,
         cache=cache,
         rate_limit=limiter,
+        auth=auth_store,
     )
 
     # 注册顺序：先注册的在内层，后注册的在外层（Starlette 语义），CORS 需最外层。
@@ -290,6 +325,8 @@ def create_app(
     _register_cors(app, settings)
 
     register_system_routes(app)
+    # 访问控制端点必须最先注册（登录 / 会话查询），且早于 catch-all 静态与代理路由
+    app.include_router(build_auth_router(settings.api_base_path))
     app.include_router(build_agent_router(settings.api_base_path))
     # 情景对比必须先于 catch-all 静态/代理路由注册（Starlette 先注册先匹配）
     app.include_router(build_scenario_router(settings.api_base_path))
@@ -326,27 +363,90 @@ def _register_cors(app: FastAPI, settings: Settings) -> None:
 
 
 def _register_auth(app: FastAPI, settings: Settings) -> None:
-    """Bearer 鉴权中间件（与引擎规则一致，采用常量时间比较防时序侧信道）。"""
+    """访问控制中间件：会话 Cookie（人类用户）或 ``API_TOKEN``（机器 / CI 令牌）。
+
+    判定分三步，全部在服务端完成：
+
+    1. **身份**：``Authorization: Bearer <API_TOKEN>``（内部服务账号）优先；否则读会话
+       Cookie，向 :class:`app.auth.store.AuthStore` 换取用户（含状态与过期校验）；
+    2. **权限**：按「方法 + 路径」查 :func:`app.auth.permissions.required_permission`，
+       不满足即 403（与 401 区分：重登无效，须调整角色）；
+    3. **计划作用域**：访客（guest）仅能看到被指派的计划，越权访问按 **404** 处理，
+       避免通过状态码探测出未授权计划是否存在。
+
+    ``AUTH_ENABLED=false`` 时整体不鉴权，但仍注入机器主体，保证下游依赖可用。
+    """
+    base = settings.api_base_path
 
     @app.middleware("http")
-    async def auth_middleware(request: Request, call_next):
-        token = settings.api_token
-        if not token:
-            return await call_next(request)
-
+    async def access_middleware(request: Request, call_next):
         path = request.url.path
-        base = settings.api_base_path
         # 非 API 路径（静态资源 / 文档 / 探测端点）不参与鉴权
         if not path.startswith(base):
             return await call_next(request)
         if path.startswith(f"{base}/health") or path.startswith(f"{base}/docs"):
             return await call_next(request)
+        # CORS 预检不带凭证，必须先放行，否则浏览器侧跨域请求全数失败
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        # 免鉴权端点（登录 / 登出）：否则「未登录就永远无法登录」
+        if is_public_endpoint(request.method, path, base):
+            return await call_next(request)
 
-        header = request.headers.get("authorization", "")
-        provided = header[len("Bearer ") :] if header.startswith("Bearer ") else ""
-        if not provided or not constant_time_equals(provided, token):
+        if not settings.auth_enabled:
+            request.state.principal = machine_principal()
+            return await call_next(request)
+
+        principal = await _resolve_principal(request, settings)
+        if principal is None:
             return JSONResponse(status_code=401, content=unauthorized().to_body())
+
+        permission = required_permission(request.method, path, base)
+        if permission and not principal.has(permission):
+            METRICS.inc_counter("http_forbidden_total", {"path": _metric_path(request)})
+            logger.warning(
+                "权限不足：role=%s user=%s %s %s 需要 %s",
+                principal.role,
+                principal.username,
+                request.method,
+                path,
+                permission,
+            )
+            return JSONResponse(status_code=403, content=forbidden().to_body())
+
+        plan_id = plan_id_from_path(path, base)
+        if plan_id and not principal.can_see_plan(plan_id):
+            # 用 404 而非 403：不向访客泄露「该计划存在但不归你」这一信息
+            METRICS.inc_counter("http_plan_scope_denied_total", {"plan": "hidden"})
+            logger.warning("计划越权访问：user=%s plan=%s", principal.username, plan_id)
+            return JSONResponse(status_code=404, content=not_found("计划不存在").to_body())
+
+        request.state.principal = principal
         return await call_next(request)
+
+
+async def _resolve_principal(request: Request, settings: Settings) -> Principal | None:
+    """解析访问主体：机器令牌 → 会话 Cookie；都无法识别时返回 ``None``。"""
+    header = request.headers.get("authorization", "")
+    provided = header[len("Bearer ") :] if header.startswith("Bearer ") else ""
+    if settings.api_token and provided and constant_time_equals(provided, settings.api_token):
+        return machine_principal()
+
+    ctx = getattr(request.app.state, "ctx", None)
+    store = getattr(ctx, "auth", None) if ctx is not None else None
+    if store is None:
+        return None
+    token = request.cookies.get(settings.auth_session_cookie, "")
+    user = await store.load_session(token)
+    if user is None:
+        return None
+    return build_principal(
+        user_id=user["userId"],
+        username=user["username"],
+        display_name=user["displayName"],
+        role=user["role"],
+        plan_ids=tuple(await store.plan_ids(user["userId"])),
+    )
 
 
 def _register_rate_limit(app: FastAPI, settings: Settings, limiter: RateLimitBackend) -> None:

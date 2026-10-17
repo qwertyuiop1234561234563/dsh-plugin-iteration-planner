@@ -213,6 +213,7 @@ def client(tmp_path, monkeypatch):
         llm_model="",
         web_static_dir="",
         workspace_store_path=store_path,
+        auth_store_path=str(tmp_path / "auth.db"),
     )
     app = create_app(cfg, engine=engine, llm=None, start_bridge=False)
     with TestClient(app) as test_client:
@@ -599,7 +600,7 @@ def test_workspace_persists_across_app_restart(tmp_path, monkeypatch) -> None:
 
     def build():
         engine = EngineClient("http://engine.test", "/api", 5.0, transport=httpx.MockTransport(_handler))
-        cfg = Settings(_env_file=None, api_token="secret-token", engine_base_url="http://engine.test", llm_base_url="", llm_model="", web_static_dir="", workspace_store_path=store_path)
+        cfg = Settings(_env_file=None, api_token="secret-token", engine_base_url="http://engine.test", llm_base_url="", llm_model="", web_static_dir="", workspace_store_path=store_path, auth_store_path=str(tmp_path / "auth.db"))
         return create_app(cfg, engine=engine, llm=None, start_bridge=False)
 
     with TestClient(build()) as first:
@@ -618,7 +619,7 @@ def test_corrupted_store_degrades_gracefully(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("WORKSPACE_STORE_PATH", str(store_path))
     _reset_state()
     engine = EngineClient("http://engine.test", "/api", 5.0, transport=httpx.MockTransport(_handler))
-    cfg = Settings(_env_file=None, api_token="secret-token", engine_base_url="http://engine.test", llm_base_url="", llm_model="", web_static_dir="", workspace_store_path=str(store_path))
+    cfg = Settings(_env_file=None, api_token="secret-token", engine_base_url="http://engine.test", llm_base_url="", llm_model="", web_static_dir="", workspace_store_path=str(store_path), auth_store_path=str(tmp_path / "auth.db"))
     with TestClient(create_app(cfg, engine=engine, llm=None, start_bridge=False)) as client:
         listed = client.get("/api/workspace/plans/p1/baselines", headers=AUTH)
         assert listed.status_code == 200

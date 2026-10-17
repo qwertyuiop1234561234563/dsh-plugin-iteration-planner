@@ -6,7 +6,8 @@
 失败：``{"code": str, "message": str, "details": Any}``
 
 基础错误码（与引擎一致）：``CYCLE_DEPENDENCY``(409) / ``VALIDATION_ERROR``(400) /
-``LLM_FORMAT_ERROR``(422) / ``STORAGE_UNAVAILABLE``(503) / ``UNAUTHORIZED``(401)。
+``LLM_FORMAT_ERROR``(422) / ``STORAGE_UNAVAILABLE``(503) / ``UNAUTHORIZED``(401) /
+``FORBIDDEN``(403) / ``NOT_FOUND``(404)。
 
 Python 对外服务扩展错误码：``ENGINE_UNAVAILABLE``(502) / ``ENGINE_CIRCUIT_OPEN``(503) /
 ``LLM_UNAVAILABLE``(503) / ``LLM_GATEWAY_ERROR``(502) / ``EMBEDDING_UNAVAILABLE``(503) /
@@ -53,6 +54,11 @@ def bad_request(message: str, details: Any | None = None) -> ApiError:
 
 def unauthorized(message: str = "缺少或无效的访问令牌") -> ApiError:
     return ApiError(401, "UNAUTHORIZED", message)
+
+
+def forbidden(message: str = "当前账号无权执行该操作") -> ApiError:
+    """已通过身份鉴权，但角色权限不足（与 401 区分：重登无法解决，须调整角色 / 指派）。"""
+    return ApiError(403, "FORBIDDEN", message)
 
 
 def not_found(message: str) -> ApiError:

@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from ..constants import PLAN_SCOPE_ASSIGNED
 from ..errors import ApiError
 
 logger = logging.getLogger("iteration_planner.gateway")
@@ -66,6 +68,40 @@ def register_proxy_and_static(app: FastAPI) -> None:
         return _serve_static(static_dir, full_path, request)
 
 
+def _plan_scope_filter(request: Request, path: str, base: str) -> frozenset[str] | None:
+    """判断本次转发是否需要按「可见计划白名单」过滤，需要时返回该白名单。
+
+    仅针对计划**列表**接口：引擎按 ID 取单条计划的接口已在鉴权中间件按 404 拦掉，
+    但列表接口不在计划作用域路径上，若不在此过滤，访客会看到全部计划的需求原文摘要。
+    """
+    principal = getattr(request.state, "principal", None)
+    if principal is None or principal.plan_scope != PLAN_SCOPE_ASSIGNED:
+        return None
+    if request.method != "GET" or path.rstrip("/") != f"{base}/plans":
+        return None
+    return frozenset(principal.plan_ids)
+
+
+def _filter_plan_list(content: bytes, visible: frozenset[str]) -> bytes | None:
+    """从 ``{data: PlanSummary[]}`` 信封中剔除未授权计划；解析失败返回 ``None``（不改动）。"""
+    try:
+        envelope = json.loads(content)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("data"), list):
+        return None
+    envelope["data"] = [item for item in envelope["data"] if _plan_id_of(item) in visible]
+    return json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+
+
+def _plan_id_of(item: object) -> str:
+    if isinstance(item, dict):
+        value = item.get("planId")
+        if isinstance(value, str):
+            return value
+    return ""
+
+
 async def _forward(ctx, request: Request, path: str) -> Response:
     """把请求透传给内部算法引擎。"""
     body = await request.body()
@@ -92,10 +128,17 @@ async def _forward(ctx, request: Request, path: str) -> Response:
             content={"code": "ENGINE_UNAVAILABLE", "message": "算法引擎暂不可达，请稍后重试"},
         )
 
-    if upstream.status_code == 204 or not upstream.content:
+    content = upstream.content
+    visible = _plan_scope_filter(request, path, ctx.settings.api_base_path)
+    if visible is not None and upstream.status_code < 400 and content:
+        filtered = _filter_plan_list(content, visible)
+        if filtered is not None:
+            content = filtered
+
+    if upstream.status_code == 204 or not content:
         return Response(status_code=upstream.status_code, headers=_response_headers(upstream))
     return Response(
-        content=upstream.content,
+        content=content,
         status_code=upstream.status_code,
         headers=_response_headers(upstream),
         media_type=upstream.headers.get("content-type"),

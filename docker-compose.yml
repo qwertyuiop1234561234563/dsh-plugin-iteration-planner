@@ -66,8 +66,19 @@ services:
       API_WS_PATH: /ws
       # 同域部署时 CORS 可收紧；此处默认放开，便于前后端分离联调
       API_CORS_ORIGIN: ${API_CORS_ORIGIN:-*}
-      # 对外统一鉴权（留空表示不鉴权；生产环境务必配置）
+      # 机器 / CI 访问令牌（Bearer，服务账号语义；人类用户走登录 + 会话 Cookie）
       API_TOKEN: ${API_TOKEN:-}
+      # 访问控制（登录 + 角色）：账号库与 Chroma 共用 /app/.data 卷，重建镜像不丢账号
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      AUTH_STORE_PATH: /app/.data/auth.db
+      AUTH_SESSION_COOKIE: ${AUTH_SESSION_COOKIE:-ip_session}
+      AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-28800}
+      # 生产环境经 HTTPS 部署时务必置为 true；同时按需将 SameSite 收紧为 strict
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      AUTH_COOKIE_SAMESITE: ${AUTH_COOKIE_SAMESITE:-lax}
+      AUTH_BOOTSTRAP_ADMIN_USERNAME: ${AUTH_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      # 留空则首启自动生成随机口令并以 WARNING 日志打印一次，登录后请立即更换
+      AUTH_BOOTSTRAP_ADMIN_PASSWORD: ${AUTH_BOOTSTRAP_ADMIN_PASSWORD:-}
       # 内部算法引擎地址（容器名解析）
       ENGINE_BASE_URL: http://engine:8080
       ENGINE_TIMEOUT_SECONDS: ${ENGINE_TIMEOUT_SECONDS:-60}

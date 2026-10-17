@@ -6,20 +6,21 @@
  *  - 首次进入时加载枚举元数据与计划列表；
  *  - 建立 WebSocket 长连接，实时接收计划变更（其他会话/其他端触发的重规划）；
  *  - 提供全局计划切换、主题切换、通知中心、全局搜索与快捷键体系；
- *  - 提供访问令牌配置入口。
+ *  - 按当前角色 / 权限收敛导航与入口，并提供账号菜单（改口令 / 退出登录）。
  *
  * 视觉：布局承担「制图台框景」的角色——左侧墨蓝图签栏、顶部图纸抬头（图纸编号 +
  * 标题）、下方计划概况带（等宽数据条），内容区透出纸面网格。
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '@/api/client'
+import { ApiClientError, api } from '@/api/client'
 import AgentDrawer from '@/components/AgentDrawer.vue'
 import GlobalSearch from '@/components/GlobalSearch.vue'
 import ImportDialog from '@/components/ImportDialog.vue'
 import NotifyCenter from '@/components/NotifyCenter.vue'
 import ShortcutHelp from '@/components/ShortcutHelp.vue'
+import { ROLE_LABELS, ROLE_TAG_TYPES, useAuthStore } from '@/stores/auth'
 import { usePlanStore } from '@/stores/plan'
 import { useSettingsStore } from '@/stores/settings'
 import { detectMilestones } from '@/utils/analytics'
@@ -36,12 +37,15 @@ import {
 
 const store = usePlanStore()
 const settings = useSettingsStore()
+const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 
-/** 令牌配置抽屉 */
-const tokenDialogVisible = ref(false)
-const tokenDraft = ref(settings.token)
+/** 配置备份抽屉 / 修改口令弹窗 */
+const backupDialogVisible = ref(false)
+const passwordDialogVisible = ref(false)
+const passwordLoading = ref(false)
+const passwordForm = reactive({ current: '', next: '', confirm: '' })
 
 /** 全局搜索 / 快捷键帮助面板 / 数据导入 / AI 助手 */
 const searchVisible = ref(false)
@@ -88,6 +92,7 @@ const activeMenu = computed(() => {
   if (routeName.value === 'knowledge') return 'knowledge'
   if (routeName.value === 'memory') return 'memory'
   if (routeName.value === 'audit') return 'audit'
+  if (routeName.value === 'admin-users') return 'admin-users'
   return 'plan-list'
 })
 
@@ -99,6 +104,18 @@ const pageTitle = computed(() => String(route.meta.title ?? '迭代规划控制�
 
 /** 当前计划 ID（优先取路由参数，其次取 store 中已加载的计划） */
 const currentPlanId = computed(() => (route.params.planId as string | undefined) ?? store.currentPlanId)
+
+/** 当前角色中文名（账号菜单展示） */
+const roleLabel = computed(() => (auth.role ? ROLE_LABELS[auth.role] : ''))
+/** 当前角色标签样式 */
+const roleTagType = computed(() => (auth.role ? ROLE_TAG_TYPES[auth.role] : 'info'))
+/** 账号菜单标题：显示名 + 角色 */
+const accountTitle = computed(() => `${auth.displayName}（${roleLabel.value}）`)
+
+/** 是否可写（控制「新建计划」「导入数据」等写入口的可见性） */
+const canWrite = computed(() => auth.can('plan:write'))
+/** 是否可治理知识库 */
+const canManageKnowledge = computed(() => auth.canAny(['kb:write', 'memory:write']))
 
 /** WebSocket 状态文案（图签 LINK 行） */
 const wsText = computed(() => {
@@ -126,9 +143,6 @@ const selectedPlan = computed({
     if (planId && planId !== currentPlanId.value) void router.push({ name: 'plan-overview', params: { planId } })
   },
 })
-
-/** 访问令牌状态文案（图签 ACCESS 行） */
-const tokenText = computed(() => (settings.token ? '令牌已配置' : '未配置令牌'))
 
 /** 主题切换按钮提示文案 */
 const themeText = computed(() => (settings.isDark ? '切换到日间蓝晒' : '切换到夜间台面'))
@@ -167,26 +181,67 @@ function go(name: string): void {
     knowledge: '/knowledge',
     memory: '/memory',
     audit: '/audit',
+    'admin-users': '/admin/users',
   }
   void router.push(map[name] ?? '/plans')
-}
-
-function openTokenDialog(): void {
-  tokenDraft.value = settings.token
-  tokenDialogVisible.value = true
-}
-
-function saveToken(): void {
-  settings.saveToken(tokenDraft.value)
-  tokenDialogVisible.value = false
-  ElMessage.success('访问令牌已保存')
-  void store.loadPlans()
 }
 
 async function manualRefresh(): Promise<void> {
   await store.loadPlans()
   if (currentPlanId.value) await store.loadPlan(currentPlanId.value)
   ElMessage.success('已刷新')
+}
+
+/* ------------------------------- 账号操作 ------------------------------ */
+
+function openPasswordDialog(): void {
+  passwordForm.current = ''
+  passwordForm.next = ''
+  passwordForm.confirm = ''
+  passwordDialogVisible.value = true
+}
+
+async function submitPassword(): Promise<void> {
+  if (!passwordForm.current) {
+    ElMessage.warning('请输入当前口令')
+    return
+  }
+  if (passwordForm.next !== passwordForm.confirm) {
+    ElMessage.warning('两次输入的新口令不一致')
+    return
+  }
+  passwordLoading.value = true
+  try {
+    await api.changePassword(passwordForm.current, passwordForm.next)
+    passwordDialogVisible.value = false
+    ElMessage.success('口令已修改，其它会话已失效')
+  } catch (error) {
+    ElMessage.error(error instanceof ApiClientError ? error.message : '修改口令失败')
+  } finally {
+    passwordLoading.value = false
+  }
+}
+
+async function logout(): Promise<void> {
+  try {
+    await ElMessageBox.confirm('确认退出当前登录？', '退出登录', {
+      type: 'warning',
+      confirmButtonText: '退出',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  await auth.logout()
+  // 断开实时连接，避免已注销的会话继续接收推送
+  store.disconnect()
+  ElMessage.success('已退出登录')
+  await router.replace({ name: 'login' })
+}
+
+function onAccountCommand(command: string): void {
+  if (command === 'password') openPasswordDialog()
+  else if (command === 'logout') void logout()
 }
 
 /* ------------------------------- 快捷键体系 ------------------------------ */
@@ -231,11 +286,11 @@ async function onImported(result: { planId: string; createdPlan: boolean; addedC
   await store.refreshCurrent()
 }
 
-/** 导出本地配置备份为 JSON 文件（不含访问令牌） */
+/** 导出本地配置备份为 JSON 文件（不含任何凭据） */
 function exportPreferences(): void {
   const backup = collectPreferenceBackup()
   downloadText(`iteration-planner-preferences-${fileStamp()}.json`, backupToJson(backup), 'application/json;charset=utf-8')
-  ElMessage.success(`已导出 ${describeBackup(backup).length} 项配置（不含访问令牌）`)
+  ElMessage.success(`已导出 ${describeBackup(backup).length} 项配置`)
 }
 
 /** 立即同步「肉眼可见」的偏好项；其余项在其模块下次读取时生效（刷新页面） */
@@ -342,6 +397,11 @@ function onGlobalKeydown(event: KeyboardEvent): void {
   }
   if (mod && event.shiftKey && key === 'i') {
     event.preventDefault()
+    // 只读角色没有 plan:write，导入入口对他们是隐藏的，快捷键也须一致
+    if (!canWrite.value) {
+      ElMessage.warning('当前角色无写入权限，无法导入数据')
+      return
+    }
     importVisible.value = true
     return
   }
@@ -362,6 +422,17 @@ watch(
   () => route.params.planId,
   (planId) => {
     if (typeof planId === 'string' && planId) void store.loadPlan(planId)
+  },
+  { immediate: true },
+)
+
+/** 被守卫拦下的越权访问：给出明确提示（否则用户只看到「莫名回到列表页」） */
+watch(
+  () => route.query.denied,
+  (denied) => {
+    if (typeof denied === 'string' && denied) {
+      ElMessage.warning('当前角色无权访问该页面或该计划，已返回计划列表')
+    }
   },
   { immediate: true },
 )
@@ -394,18 +465,18 @@ onBeforeUnmount(() => {
         <el-menu-item index="plan-list">
           <el-icon><List /></el-icon><span>计划列表</span>
         </el-menu-item>
-        <el-menu-item index="plan-create">
+        <el-menu-item v-if="canWrite" index="plan-create">
           <el-icon><MagicStick /></el-icon><span>新建计划</span>
         </el-menu-item>
         <el-menu-item index="portfolio">
           <el-icon><Grid /></el-icon><span>项目组合对比</span>
         </el-menu-item>
-        <el-sub-menu index="knowledge-base">
+        <el-sub-menu v-if="canManageKnowledge" index="knowledge-base">
           <template #title>
             <el-icon><Collection /></el-icon><span>知识与记忆</span>
           </template>
-          <el-menu-item index="knowledge">知识库（RAG）</el-menu-item>
-          <el-menu-item index="memory">长期记忆</el-menu-item>
+          <el-menu-item v-if="auth.can('kb:read')" index="knowledge">知识库（RAG）</el-menu-item>
+          <el-menu-item v-if="auth.can('memory:read')" index="memory">长期记忆</el-menu-item>
         </el-sub-menu>
         <el-sub-menu index="current" :disabled="!currentPlanId">
           <template #title>
@@ -444,12 +515,15 @@ onBeforeUnmount(() => {
           </template>
           <el-menu-item index="current-print">报告打印</el-menu-item>
         </el-sub-menu>
-        <el-menu-item index="audit">
+        <el-menu-item v-if="auth.can('audit:read')" index="audit">
           <el-icon><Tickets /></el-icon><span>审计日志</span>
+        </el-menu-item>
+        <el-menu-item v-if="auth.can('user:manage')" index="admin-users">
+          <el-icon><UserFilled /></el-icon><span>账号与权限</span>
         </el-menu-item>
       </el-menu>
 
-      <!-- 图签：连接状态与访问配置（制图纸右下角的签署栏） -->
+      <!-- 图签：连接状态与账号（制图纸右下角的签署栏） -->
       <div class="ip-aside__foot">
         <div class="ip-foot__row">
           <span class="ip-foot__label">Link</span>
@@ -457,9 +531,16 @@ onBeforeUnmount(() => {
             <i class="ip-foot__dot" :class="`is-${store.wsStatus}`" />{{ wsText }}
           </span>
         </div>
-        <button type="button" class="ip-foot__row is-action" @click="openTokenDialog">
-          <span class="ip-foot__label">Access</span>
-          <span class="ip-foot__value">{{ tokenText }}</span>
+        <div class="ip-foot__row">
+          <span class="ip-foot__label">User</span>
+          <span class="ip-foot__value">
+            {{ auth.displayName }}
+            <el-tag size="small" :type="roleTagType" effect="plain">{{ roleLabel }}</el-tag>
+          </span>
+        </div>
+        <button type="button" class="ip-foot__row is-action" @click="backupDialogVisible = true">
+          <span class="ip-foot__label">Config</span>
+          <span class="ip-foot__value">配置备份</span>
         </button>
         <button type="button" class="ip-foot__row is-action" @click="helpVisible = true">
           <span class="ip-foot__label">Keys</span>
@@ -483,7 +564,7 @@ onBeforeUnmount(() => {
             <span>搜索</span>
             <span class="ip-search-trigger__keys">Ctrl K</span>
           </el-button>
-          <el-tooltip content="批量导入任务（Ctrl / ⌘ + Shift + I）" placement="bottom">
+          <el-tooltip v-if="canWrite" content="批量导入任务（Ctrl / ⌘ + Shift + I）" placement="bottom">
             <el-button class="ip-search-trigger" @click="importVisible = true">
               <el-icon><Upload /></el-icon>
               <span>导入数据</span>
@@ -515,9 +596,18 @@ onBeforeUnmount(() => {
           <el-tooltip content="刷新当前数据" placement="bottom">
             <el-button :icon="'Refresh'" circle @click="manualRefresh" />
           </el-tooltip>
-          <el-tooltip content="配置访问令牌 / 打开接口文档" placement="bottom">
-            <el-button :icon="'Key'" circle @click="openTokenDialog" />
-          </el-tooltip>
+          <el-dropdown trigger="click" @command="onAccountCommand">
+            <el-button class="ip-account" :icon="'User'">
+              <span class="ip-account__name">{{ accountTitle }}</span>
+              <el-icon class="ip-account__caret"><ArrowDown /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="password" :icon="'Key'">修改口令</el-dropdown-item>
+                <el-dropdown-item command="logout" :icon="'SwitchButton'" divided>退出登录</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </el-header>
 
@@ -547,29 +637,48 @@ onBeforeUnmount(() => {
     <!-- 恢复配置：隐藏的文件选择器（避免引入额外依赖） -->
     <input ref="restoreInput" type="file" accept="application/json,.json" class="ip-hidden-file" @change="onRestoreFile" />
 
-    <el-dialog v-model="tokenDialogVisible" title="访问配置" width="520px">
+    <el-dialog v-model="passwordDialogVisible" title="修改口令" width="460px">
       <el-form label-width="96px">
-        <el-form-item label="访问令牌">
-          <el-input v-model="tokenDraft" type="password" show-password placeholder="与后端 API_TOKEN 一致；未启用鉴权时留空" />
+        <el-form-item label="当前口令">
+          <el-input v-model="passwordForm.current" type="password" show-password autocomplete="current-password" />
         </el-form-item>
-        <el-form-item label="接口文档">
-          <el-link type="primary" :href="'/api/docs'" target="_blank">在新标签打开 Swagger UI</el-link>
+        <el-form-item label="新口令">
+          <el-input v-model="passwordForm.next" type="password" show-password autocomplete="new-password" placeholder="至少 8 位，含字母与数字" />
         </el-form-item>
-        <el-form-item label="配置备份">
+        <el-form-item label="确认新口令">
+          <el-input v-model="passwordForm.confirm" type="password" show-password autocomplete="new-password" />
+        </el-form-item>
+      </el-form>
+      <p class="ip-muted ip-backup__note">修改成功后，该账号在其它端 / 其它标签页的会话将立即失效。</p>
+      <template #footer>
+        <el-button @click="passwordDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="passwordLoading" @click="submitPassword">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="backupDialogVisible" title="配置备份" width="560px">
+      <el-form label-width="96px">
+        <el-form-item label="本地备份">
           <div class="ip-backup">
             <el-button size="small" :icon="'Download'" @click="exportPreferences">导出到本地文件</el-button>
             <el-button size="small" :icon="'Upload'" @click="restoreInput?.click()">从文件恢复</el-button>
+          </div>
+        </el-form-item>
+        <el-form-item label="服务端备份">
+          <div class="ip-backup">
             <el-button size="small" :icon="'Cloudy'" @click="backupToServer">备份到服务端</el-button>
             <el-button size="small" :icon="'RefreshLeft'" @click="restoreFromServer">从服务端恢复</el-button>
           </div>
         </el-form-item>
+        <el-form-item label="接口文档">
+          <el-link type="primary" :href="'/api/docs'" target="_blank">在新标签打开 Swagger UI</el-link>
+        </el-form-item>
       </el-form>
       <p class="ip-muted ip-backup__note">
-        备份包含主题、表格密度、通知、保存的筛选视图与自定义模板，不包含访问令牌。恢复为覆盖式写入，部分配置需刷新页面后生效。
+        备份包含主题、表格密度、通知、保存的筛选视图与自定义模板，不含任何账号凭据。恢复为覆盖式写入，部分配置需刷新页面后生效。
       </p>
       <template #footer>
-        <el-button @click="tokenDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="saveToken">保存</el-button>
+        <el-button type="primary" @click="backupDialogVisible = false">关闭</el-button>
       </template>
     </el-dialog>
   </el-container>
@@ -796,6 +905,23 @@ onBeforeUnmount(() => {
 /* 搜索触发按钮：仿命令面板的样式 */
 .ip-search-trigger {
   gap: 6px;
+}
+
+/* 账号菜单：显示名过长时省略，避免顶栏被撑开 */
+.ip-account {
+  gap: 6px;
+}
+
+.ip-account__name {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ip-account__caret {
+  margin-left: 2px;
+  color: var(--ip-text-muted);
 }
 
 .ip-search-trigger__keys {

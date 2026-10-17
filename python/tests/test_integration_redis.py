@@ -118,6 +118,11 @@ def _replica(
         rate_limit_backend=rate_limit_backend,
         api_rate_limit_per_minute=per_minute,
         api_rate_limit_burst=per_minute,
+        workspace_store_path=str(tmp_path / "workspace-store.json"),
+        # 账号存储固定走内存：本文件聚焦缓存 / 限流 / 会话共享，避免污染真实账号库
+        auth_store_path=":memory:",
+        auth_bootstrap_admin_username="admin",
+        auth_bootstrap_admin_password="Admin12345",
         embedding_base_url="http://stub.test/v1",
         embedding_api_key="stub-key",
         embedding_model="stub-embedding",

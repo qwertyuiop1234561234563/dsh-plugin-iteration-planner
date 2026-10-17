@@ -22,6 +22,14 @@ from .metrics import METRICS
 logger = logging.getLogger("iteration_planner.ws")
 
 
+def _visible(payload: dict[str, Any], plan_ids: frozenset[str] | None) -> bool:
+    """事件对某可见范围是否可见（``plan_ids`` 为 ``None`` 表示不受限）。"""
+    if plan_ids is None:
+        return True
+    plan_id = payload.get("planId")
+    return isinstance(plan_id, str) and plan_id in plan_ids
+
+
 class WsBroadcaster:
     """前端 WebSocket 连接管理与广播（含断线重连事件重放缓冲）。
 
@@ -49,6 +57,8 @@ class WsBroadcaster:
     ) -> None:
         #: 客户端 → 发送锁（保证同一连接上的帧串行下发，不交错）
         self._clients: dict[Any, asyncio.Lock] = {}
+        #: 客户端 → 事件可见的计划集合；``None`` 表示不受限（全部计划）
+        self._scopes: dict[Any, frozenset[str] | None] = {}
         #: 最近 N 条已广播事件，供新连接补齐断线期间遗漏的变更
         self._replay: deque[dict[str, Any]] = deque(maxlen=max(0, replay_size))
         self._send_timeout = max(0.0, send_timeout)
@@ -62,8 +72,13 @@ class WsBroadcaster:
     def max_clients(self) -> int:
         return self._max_clients
 
-    async def connect(self, websocket: Any) -> bool:
-        """接入客户端；超过上限时拒绝并返回 ``False``（调用方应直接结束处理）。"""
+    async def connect(self, websocket: Any, *, plan_ids: frozenset[str] | None = None) -> bool:
+        """接入客户端；超过上限时拒绝并返回 ``False``（调用方应直接结束处理）。
+
+        :param plan_ids: 该连接可见的计划集合；``None`` 表示不受限。访客（guest）只应
+            看到被指派的计划，而 ``/ws`` 推送的是**全量载荷**（含需求原文与任务明细），
+            因此在扇出时按此集合过滤，而不是把未授权计划的事件推到连接上。
+        """
         await websocket.accept()
         if self._max_clients and len(self._clients) >= self._max_clients:
             METRICS.inc_counter("ws_connections_total", {"outcome": "rejected"})
@@ -72,15 +87,17 @@ class WsBroadcaster:
                 await websocket.close(code=1013, reason="连接数已达上限，请稍后重试")
             return False
         self._clients[websocket] = asyncio.Lock()
+        self._scopes[websocket] = plan_ids
         METRICS.inc_counter("ws_connections_total", {"outcome": "accepted"})
         return True
 
     def disconnect(self, websocket: Any) -> None:
         self._clients.pop(websocket, None)
+        self._scopes.pop(websocket, None)
 
-    def replay_payloads(self) -> list[dict[str, Any]]:
-        """返回重放缓冲中的事件快照（断线重连时下发）。"""
-        return list(self._replay)
+    def replay_payloads(self, *, plan_ids: frozenset[str] | None = None) -> list[dict[str, Any]]:
+        """返回重放缓冲中的事件快照（断线重连时下发，按连接可见范围过滤）。"""
+        return [payload for payload in self._replay if _visible(payload, plan_ids)]
 
     async def send(self, websocket: Any, payload: dict[str, Any]) -> None:
         """向单个客户端下发（经该连接的发送锁串行化，避免与广播并发写同一 socket）。"""
@@ -93,16 +110,22 @@ class WsBroadcaster:
             await websocket.send_text(text)
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
-        """向全部客户端**并发**推送；单个客户端异常 / 超时不影响其它客户端。"""
+        """向全部客户端**并发**推送；单个客户端异常 / 超时不影响其它客户端。
+
+        受限连接（访客）只收到其被指派计划的事件：无 ``planId`` 的事件（如 ``connected``、
+        引擎级广播）同样不下发，避免通过事件类型推断出系统中存在哪些计划。
+        """
         self._replay.append(payload)
         clients = list(self._clients.items())
         if not clients:
             return
+        scopes = self._scopes
+        targets = [(websocket, lock) for websocket, lock in clients if _visible(payload, scopes.get(websocket))]
+        if not targets:
+            return
         text = json.dumps(payload, ensure_ascii=False, default=str)
-        results = await asyncio.gather(
-            *(self._deliver(websocket, lock, text) for websocket, lock in clients)
-        )
-        for websocket, ok in zip((item[0] for item in clients), results):
+        results = await asyncio.gather(*(self._deliver(websocket, lock, text) for websocket, lock in targets))
+        for websocket, ok in zip((item[0] for item in targets), results):
             if not ok:
                 self.disconnect(websocket)
 

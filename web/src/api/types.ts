@@ -845,3 +845,84 @@ export interface MemoryDeleteResult {
 export interface MemoryClearResult {
   deleted: number
 }
+
+/* ---------------------- 访问控制（登录 / 角色 · /api/auth/**） ---------------------- */
+
+/** 角色标识（与后端 app/constants.py 的 ROLES 一致） */
+export type AuthRole = 'admin' | 'member' | 'viewer' | 'guest'
+
+/** 权限标识（后端唯一的判定依据；前端仅用于展示收敛，不得据此代替服务端判定） */
+export type AuthPermission =
+  | 'user:manage'
+  | 'plan:read'
+  | 'plan:write'
+  | 'agent:chat'
+  | 'agent:write'
+  | 'kb:read'
+  | 'kb:write'
+  | 'memory:read'
+  | 'memory:write'
+  | 'audit:read'
+
+/** 计划可见范围：全部计划 / 仅被指派的计划（访客） */
+export type PlanScope = 'all' | 'assigned'
+
+/** 当前登录主体（服务端下发，绝不含口令散列等敏感字段） */
+export interface AuthUser {
+  userId: string
+  username: string
+  displayName: string
+  role: AuthRole
+  permissions: AuthPermission[]
+  planScope: PlanScope
+  /** 访客可见的计划白名单；其余角色为空数组 */
+  planIds: string[]
+  /** 是否由机器令牌（API_TOKEN）鉴权而来 */
+  machine: boolean
+}
+
+/** 账号状态 */
+export type UserStatus = 'active' | 'disabled'
+
+/** 账号条目（管理员视角） */
+export interface AuthAccount {
+  userId: string
+  username: string
+  displayName: string
+  role: AuthRole
+  status: UserStatus
+  createdAt: string
+  updatedAt: string
+  lastLoginAt: string | null
+  /** 访客可见计划白名单；其余角色为空数组 */
+  planIds: string[]
+}
+
+export interface AuthAccountList {
+  items: AuthAccount[]
+  total: number
+}
+
+/** 角色与权限矩阵条目 */
+export interface AuthRoleInfo {
+  role: AuthRole
+  label: string
+  permissions: AuthPermission[]
+  planScope: PlanScope
+}
+
+/** 新建账号载荷 */
+export interface AuthAccountCreatePayload {
+  username: string
+  password: string
+  role: AuthRole
+  displayName?: string
+}
+
+/** 更新账号载荷（仅提交需要变更的字段） */
+export interface AuthAccountUpdatePayload {
+  role?: AuthRole
+  status?: UserStatus
+  displayName?: string
+  password?: string
+}

@@ -1,5 +1,7 @@
 /**
- * 设置 Store：访问令牌、主题模式与偏好项（持久化到 localStorage）。
+ * 设置 Store：主题模式与偏好项（持久化到 localStorage）。
+ *
+ * 注：登录态由 `stores/auth.ts` 管理（服务端会话 Cookie，不在本地存凭据）。
  *
  * 主题只影响**展示层**：通过 `data-theme` 属性驱动 CSS 变量切换（见 `styles/main.css`
  * 的「夜间蓝晒」令牌块），并同步 ECharts 主题（`utils/palette.ts`）。不涉及任何业务口径。
@@ -7,7 +9,6 @@
 
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { getToken, setToken } from '@/api/client'
 import { applyChartTheme } from '@/utils/palette'
 
 /** 主题模式 */
@@ -42,8 +43,6 @@ function initialTheme(): ThemeMode {
 }
 
 export const useSettingsStore = defineStore('settings', () => {
-  /** API 访问令牌（与后端 API_TOKEN 对应） */
-  const token = ref<string>(getToken())
   /** 是否开启高对比风险高亮 */
   const highlightRisk = ref(true)
   /** 主题模式 */
@@ -51,8 +50,6 @@ export const useSettingsStore = defineStore('settings', () => {
   /** 紧凑表格模式 */
   const compactTable = ref(readStorage(`${THEME_STORAGE_KEY}:compact`) === '1')
 
-  /** 是否已配置令牌 */
-  const hasToken = computed(() => token.value.length > 0)
   /** 是否为深色主题 */
   const isDark = computed(() => theme.value === 'dark')
 
@@ -74,11 +71,6 @@ export const useSettingsStore = defineStore('settings', () => {
     setTheme(isDark.value ? 'light' : 'dark')
   }
 
-  function saveToken(value: string): void {
-    token.value = value.trim()
-    setToken(token.value)
-  }
-
   function toggleCompact(value: boolean): void {
     compactTable.value = value
     writeStorage(`${THEME_STORAGE_KEY}:compact`, value ? '1' : '0')
@@ -88,13 +80,10 @@ export const useSettingsStore = defineStore('settings', () => {
   applyTheme()
 
   return {
-    token,
-    hasToken,
     highlightRisk,
     compactTable,
     theme,
     isDark,
-    saveToken,
     toggleCompact,
     setTheme,
     toggleTheme,

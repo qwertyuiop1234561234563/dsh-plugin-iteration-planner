@@ -62,6 +62,26 @@ class Settings(BaseSettings):
     #: uvicorn 进程数；>1 时需共享会话存储（Redis）与网关层粘性（详见 README）
     api_workers: int = 1
 
+    # ------------------------------ 访问控制（登录 / 角色） ------------------------------
+    #: 是否启用「登录 + 角色」鉴权。开启后所有 /api/** 请求需携带会话 Cookie，
+    #: 或使用 API_TOKEN（机器 / CI 令牌，视为内部服务账号）。留空 API_TOKEN 且关闭本项时整体不鉴权。
+    auth_enabled: bool = True
+    #: 账号 / 会话库路径（sqlite3）；留空使用 ``app.constants.default_auth_store_path()``，
+    #: 特殊值 ``:memory:`` 表示进程内存库（仅测试 / 演示用，重启即丢）
+    auth_store_path: str = ""
+    #: 会话 Cookie 名
+    auth_session_cookie: str = "ip_session"
+    #: 会话有效期（秒）；过期自动失效，可在用户管理中即时吊销
+    auth_session_ttl_seconds: int = 8 * 3600
+    #: 会话 Cookie 是否仅经 HTTPS 传输（生产环境务必设为 true）
+    auth_cookie_secure: bool = False
+    #: 会话 Cookie 的 SameSite 策略（lax / strict / none）
+    auth_cookie_samesite: str = "lax"
+    #: 首次启动时引导管理员的用户名（仅在账号库为空时创建）
+    auth_bootstrap_admin_username: str = "admin"
+    #: 引导管理员口令；留空则自动生成随机口令并**以告警日志打印一次**，请立即登录后修改
+    auth_bootstrap_admin_password: str = ""
+
     # --------------------------- 内部算法引擎 ---------------------------
     #: TypeScript 引擎（Fastify）基地址；Python 仅作为对外网关转发 REST 调用
     engine_base_url: str = "http://127.0.0.1:8080"
@@ -259,6 +279,21 @@ class Settings(BaseSettings):
         if self.api_cors_origin.strip() == "*":
             return ["*"]
         return [item.strip() for item in self.api_cors_origin.split(",") if item.strip()]
+
+    @property
+    def resolved_auth_store_path(self) -> str:
+        """账号 / 会话库路径：未显式配置时落到仓库 ``python/.data/auth.db``。"""
+        if self.auth_store_path:
+            return self.auth_store_path
+        from .constants import default_auth_store_path
+
+        return default_auth_store_path()
+
+    @property
+    def resolved_cookie_samesite(self) -> str:
+        """Cookie SameSite（归一化并校验，非法值静默回落 ``lax``）。"""
+        value = (self.auth_cookie_samesite or "lax").strip().lower()
+        return value if value in ("lax", "strict", "none") else "lax"
 
     @property
     def ws_url_suffix(self) -> str:
