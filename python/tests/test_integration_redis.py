@@ -102,6 +102,7 @@ def _replica(
         memory_collection=MEMORY_COLLECTION,
     )
     settings = Settings(
+        _env_file=None,  # 测试不读本机 .env，保证可复现
         api_token="secret-token",
         api_base_path="/api",
         engine_base_url="http://engine.test",

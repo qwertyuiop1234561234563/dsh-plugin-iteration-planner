@@ -234,8 +234,8 @@ onMounted(load)
     <el-alert v-if="disabled" type="warning" :closable="false" class="ip-kb__alert">
       <template #title>向量化模型未启用，知识库不可用</template>
       <div class="ip-kb__alert-body">
-        {{ disabledReason || '请配置 EMBEDDING_API_KEY 或复用 LLM_API_KEY 后重启服务。' }}
-        支持阿里云百炼 text-embedding-v4（兼容 OpenAI /embeddings 协议），向量库使用 Chroma 本地持久化。
+        {{ disabledReason || '请配置 EMBEDDING_API_KEY 后重启服务；若向量化与 LLM 是同一端点，可留空 EMBEDDING_BASE_URL 以复用 LLM_API_KEY。' }}
+        支持任意 OpenAI 兼容 /embeddings 端点（默认硅基流动 BAAI/bge-m3，长期免费），向量库使用 Chroma 本地持久化。
       </div>
     </el-alert>
 

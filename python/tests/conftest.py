@@ -130,7 +130,9 @@ def _engine_handler(request: httpx.Request) -> httpx.Response:
 
 @pytest.fixture
 def settings() -> Settings:
+    """测试基线配置：显式关闭 ``.env`` 读取，保证用例不受本机配置影响、可复现。"""
     return Settings(
+        _env_file=None,
         api_token="secret-token",
         engine_base_url="http://engine.test",
         api_base_path="/api",

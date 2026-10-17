@@ -220,7 +220,9 @@ async def test_schedule_extract_is_skipped_when_disabled(kb_store, stub_embedder
 def test_memory_endpoints_disabled_without_embedder(client):
     response = client.get("/api/memories", headers=auth())
     assert response.status_code == 503
-    assert response.json()["code"] == "EMBEDDING_UNAVAILABLE"
+    body = response.json()
+    assert body["code"] == "EMBEDDING_UNAVAILABLE"
+    assert "EMBEDDING_API_KEY" in body["message"]
 
 
 def test_memory_full_rest_flow(kb_client):

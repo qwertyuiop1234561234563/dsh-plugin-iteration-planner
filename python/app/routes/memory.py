@@ -11,7 +11,7 @@
 - ``POST   /memories/search``：按语义召回试跑（查看「模型当前会想起什么」）；
 - ``GET    /memories/stats``：统计。 
 
-未配置向量化模型时统一返回 ``503 EMBEDDING_UNAVAILABLE``。
+未配置向量化模型时统一返回 ``503 EMBEDDING_UNAVAILABLE``（附当前配置的待补齐项指引）。
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from ..state import AppContext
 
 def _require_memory(ctx: AppContext) -> MemoryService:
     if ctx.memory is None:
-        raise embedding_unavailable()
+        raise embedding_unavailable(hint=ctx.settings.embedding_setup_hint)
     return ctx.memory
 
 

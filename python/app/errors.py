@@ -84,11 +84,16 @@ def engine_circuit_open(message: str = "算法引擎连续失败，已触发熔�
     return ApiError(503, "ENGINE_CIRCUIT_OPEN", message)
 
 
-def embedding_unavailable(
-    message: str = "未配置向量化模型（Embedding），知识库与长期记忆不可用；请设置 EMBEDDING_MODEL 与 LLM_API_KEY",
-) -> ApiError:
-    """向量化服务不可用（未配置 / 上游不可达）。"""
-    return ApiError(503, "EMBEDDING_UNAVAILABLE", message)
+def embedding_unavailable(message: str = "", *, hint: str = "") -> ApiError:
+    """向量化服务不可用（未配置 / 上游不可达）。
+
+    ``hint`` 由调用方按实际配置状态生成（:attr:`Settings.embedding_setup_hint`）并拼接，
+    避免在错误文案里写死服务商或写死「待补齐项」——那会把用户引向必然失败的配置。
+    """
+    detail = message or "未配置向量化模型（Embedding），知识库与长期记忆不可用"
+    if hint:
+        detail = f"{detail}；{hint}"
+    return ApiError(503, "EMBEDDING_UNAVAILABLE", detail)
 
 
 def embedding_gateway_error(message: str, details: Any | None = None) -> ApiError:

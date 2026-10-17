@@ -457,9 +457,9 @@ docker compose up -d --build
 | `DATABASE_URL` | — | PostgreSQL 连接串（优先于离散 `PG*` 参数） |
 | `WEB_STATIC_DIR` | 空 | 前端产物目录；存在则同域托管 SPA |
 | `PLANNER_FALLBACK_TO_RULE` | `true` | LLM 输出异常时是否降级规则实现 |
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 空 | OpenAI 兼容网关；三项齐全才启用 LLM 主路径。智谱 GLM 示例：`https://open.bigmodel.cn/api/paas/v4` + `glm-4.7-flash`（**长期免费**，支持流式输出与 Function Calling） |
-| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | 空 / 空 / `embedding-3` | 向量化网关；端点与密钥留空则回落 `LLM_BASE_URL` / `LLM_API_KEY`（智谱同一端点兼做 embeddings） |
-| `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE` | `1024` / `10` | 向量维度（embedding-3 支持 256–2048）/ 单次请求条数（上限 64） |
+| `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | 空 / 空 / 空 | OpenAI 兼容网关；**配置端点与模型即启用** LLM 主路径（密钥可选，兼容无鉴权的自建网关 vLLM / Ollama）。智谱 GLM 示例：`https://open.bigmodel.cn/api/paas/v4` + `glm-4.7-flash`（**文本模型长期免费**，支持流式输出与 Function Calling） |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_API_KEY` | `https://api.siliconflow.cn/v1` / `BAAI/bge-m3` / 空 | 向量化网关；默认硅基流动 `BAAI/bge-m3`（**长期免费**，固定 1024 维）。**端点与密钥绑定**：`EMBEDDING_BASE_URL` 非空时只认 `EMBEDDING_API_KEY`，不会拿 `LLM_API_KEY` 去请求别家（避免 401 污染指标）；两行都留空才回落 `LLM_BASE_URL` / `LLM_API_KEY`（如智谱 `embedding-3`，按量计费） |
+| `EMBEDDING_DIMENSIONS` / `EMBEDDING_SEND_DIMENSIONS` / `EMBEDDING_BATCH_SIZE` | `1024` / `false` / `10` | 期望向量维度（校验与缓存键）/ 是否下发 `dimensions` 字段（仅支持自定义维度的模型如智谱 `embedding-3`、`Qwen/Qwen3-Embedding` 需开启；`bge-m3` 等固定维度模型下发会被上游判为非法参数）/ 单次请求条数（上游普遍上限 64） |
 | `VECTOR_STORE` / `CHROMA_DIR` | `chroma` / 空 | 向量库驱动 / 持久化目录（留空用 `python/.data/chroma`，已 gitignore） |
 | `KB_CHUNK_SIZE` / `KB_CHUNK_OVERLAP` / `KB_TOP_K` | `800` / `120` / `4` | 分块字符数 / 重叠字符数 / 默认召回条数 |
 | `KB_HYBRID` / `KB_RRF_K` / `KB_AUTO_INJECT` / `KB_INJECT_TOP_K` | `true` / `60` / `true` / `3` | 混合检索开关 / RRF 平滑常数 / 对话自动注入开关 / 注入条数 |
@@ -520,7 +520,7 @@ docker compose up -d --build
 |---|---|---|
 | 对外网关（Python） | [`python/app/routes/proxy.py`](./python/app/routes/proxy.py) | `/api/**` 原样透传（信封 / 状态码 / 导出文件），统一 Bearer 鉴权、CORS、SPA 托管 |
 | Agent 编排（Python） | [`python/app/agent/`](./python/app/agent) | 系统提示词 + function calling 循环；每个工具通过 HTTP 调用 TS 引擎 |
-| 知识库 RAG（Python） | [`python/app/kb/`](./python/app/kb) | 文档解析 → 递归分块 → 批量向量化（智谱 `embedding-3`）→ Chroma 持久化；检索走稠密向量 + BM25 → RRF 融合 |
+| 知识库 RAG（Python） | [`python/app/kb/`](./python/app/kb) | 文档解析 → 递归分块 → 批量向量化（默认硅基流动 `BAAI/bge-m3`）→ Chroma 持久化；检索走稠密向量 + BM25 → RRF 融合 |
 | 长期记忆（Python） | [`python/app/agent/memory.py`](./python/app/agent/memory.py) | 每轮对话后自动提取（Mem0 风格）→ 向量去重 → 语义召回 top-k 注入上下文 |
 | 内部算法引擎（TS） | [`src/api/`](./src/api)、[`src/service/`](./src/service)、[`src/algorithm/`](./src/algorithm) | Kahn 拓扑 / AOE 关键路径 / 缓冲 / 风险 / 燃尽 / 报表，**算法零改动** |
 | 控制台（Vue3） | [`web/`](./web) | 仅把 base URL 指向 Python 服务，**页面代码零改动** |
@@ -549,9 +549,9 @@ ENGINE_BASE_URL=http://127.0.0.1:8080 API_PORT=8000 python python/run.py
 
 ### 10.3 Agent 原生端点（`/api/agent/*`）
 
-需配置 `LLM_BASE_URL / LLM_API_KEY / LLM_MODEL`（OpenAI 兼容网关）后启用；未配置时明确返回 `503 LLM_UNAVAILABLE`。
+需配置 `LLM_BASE_URL / LLM_MODEL`（OpenAI 兼容网关）后启用；未配置时明确返回 `503 LLM_UNAVAILABLE`（前端自动回落内置规则问答）。
 
-以智谱 GLM（BigModel 开放平台，有免费额度）为例：把密钥写入仓库根目录 `.env`（已被 `.gitignore` 忽略，不会入库），重启服务即生效。
+以智谱 GLM（BigModel 开放平台，**文本模型长期免费**）为例：把配置写入仓库根目录 `.env`（已被 `.gitignore` 忽略，不会入库），重启服务即生效。
 
 ```ini
 # 对话与 Agent 编排：glm-4.7-flash 为长期免费文本模型（支持流式输出 + Function Calling）
@@ -559,13 +559,16 @@ LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 LLM_API_KEY=xxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxx
 LLM_MODEL=glm-4.7-flash
 
-# 知识库向量化：同一端点兼做 embeddings；留空则自动回落上面两项
-EMBEDDING_MODEL=embedding-3
-EMBEDDING_DIMENSIONS=1024
+# 知识库向量化（可选）：推荐硅基流动 BAAI/bge-m3（长期免费，1024 维）
+EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+EMBEDDING_API_KEY=sk-xxxxxxxxxxxxxxxx
+EMBEDDING_MODEL=BAAI/bge-m3
 ```
 
 `glm-4.7-flash` / `glm-4.5-flash` / `glm-4-flash` 为智谱**长期免费**文本模型（不消耗额度，支持流式输出与 Function Calling）；
-`embedding-3` 按量计费（0.5 元/百万 Tokens，新注册账号赠送免费 Token 额度），单次最多 64 条、单条 3072 Tokens。
+向量化默认的硅基流动 `BAAI/bge-m3` 同样**长期免费**。若希望向量化与 LLM 共用同一端点（智谱 `embedding-3`，按量计费
+0.5 元/百万 Tokens，支持 256–2048 维自定义、单次最多 64 条），把 `EMBEDDING_BASE_URL` 与 `EMBEDDING_API_KEY`
+留空以回落 LLM 配置，并设置 `EMBEDDING_MODEL=embedding-3`、`EMBEDDING_SEND_DIMENSIONS=true`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -686,7 +689,8 @@ BM25 / RRF / 向量库增删查 / 入库-检索-删除 REST）与**长期记忆*
 返回 `false`，控制台对应页面展示配置引导，主对话链路不受影响。
 
 **技术选型（当前主流方案）**：向量库 [Chroma](https://www.trychroma.com/)（本地持久化，生产可换远端客户端）；
-向量化用智谱 `embedding-3`（OpenAI 兼容 `/embeddings`，维度 256–2048 可自定义，默认 1024）；
+向量化默认用硅基流动 `BAAI/bge-m3`（OpenAI 兼容 `/embeddings`，**长期免费**，固定 1024 维）；也可换成支持自定义维度的模型
+（智谱 `embedding-3`、`Qwen/Qwen3-Embedding` 系列，需开启 `EMBEDDING_SEND_DIMENSIONS`）；
 检索用**混合检索**——稠密向量召回 + `BM25`（中文按 unigram + bigram 切分，零分词依赖）→ **RRF 融合**（`k=60`）。
 
 **入库流水线**（`python/app/kb/`）：

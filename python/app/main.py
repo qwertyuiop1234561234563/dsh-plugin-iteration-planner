@@ -133,6 +133,7 @@ def create_app(
             settings.resolved_embedding_api_key,
             settings.embedding_model,
             dimensions=settings.embedding_dimensions,
+            send_dimensions=settings.embedding_send_dimensions,
             batch_size=settings.embedding_batch_size,
             timeout=settings.embedding_timeout_seconds,
             retry=RetryPolicy(

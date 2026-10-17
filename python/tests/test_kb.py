@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 
+import httpx
 import pytest
 
 from app.errors import ApiError
@@ -269,10 +270,16 @@ async def test_service_rejects_oversized_document(kb_store, stub_embedder):
 
 
 def test_kb_endpoints_disabled_without_embedder(client):
-    """未配置向量化模型时，知识库端点必须明确返回 503 而不是空列表。"""
+    """未配置向量化模型时，知识库端点必须明确返回 503 而不是空列表。
+
+    且文案必须指向**真实待补齐项**（``EMBEDDING_API_KEY``）——写死「LLM_API_KEY」会把用户
+    引向一个必然失败的配置（拿 A 家密钥请求 B 家端点），前端据此渲染的配置引导也会误导。
+    """
     response = client.get("/api/kb/documents", headers=auth())
     assert response.status_code == 503
-    assert response.json()["code"] == "EMBEDDING_UNAVAILABLE"
+    body = response.json()
+    assert body["code"] == "EMBEDDING_UNAVAILABLE"
+    assert "EMBEDDING_API_KEY" in body["message"]
 
 
 def test_kb_health_flags(kb_client):
@@ -356,3 +363,79 @@ def kb_service(kb_store, stub_embedder):
     from app.kb.pipeline import build_knowledge_base
 
     return build_knowledge_base(kb_store, stub_embedder, chunk_size=200, chunk_overlap=40)
+
+
+# ================== 向量化请求体：dimensions 按模型能力下发 ==================
+
+
+def _embedding_handler(seen: dict):
+    """记录请求体，并按输入条数回填同序向量（8 维）。"""
+
+    def handler(_request):
+        seen.update(json.loads(_request.content))
+        count = len(seen.get("input") or [])
+        return httpx.Response(200, json={"data": [{"index": i, "embedding": [0.5] * 8} for i in range(count)]})
+
+    return handler
+
+
+async def test_embedder_omits_dimensions_for_fixed_dim_models():
+    """固定维度模型（默认的 BAAI/bge-m3）不得下发 dimensions 字段：上游不认该参数会直接 400。"""
+    from app.kb.embedder import OpenAiEmbedder
+
+    seen: dict = {}
+    embedder = OpenAiEmbedder(
+        "http://stub.test/v1",
+        "stub-key",
+        "BAAI/bge-m3",
+        dimensions=8,
+        send_dimensions=False,
+        transport=httpx.MockTransport(_embedding_handler(seen)),
+    )
+    vectors = await embedder.embed(["灰度发布", "关键路径"])
+    await embedder.aclose()
+
+    assert len(vectors) == 2 and len(vectors[0]) == 8
+    assert "dimensions" not in seen
+
+
+async def test_embedder_sends_dimensions_when_model_supports_it():
+    """支持自定义维度的模型（智谱 embedding-3 等）必须显式下发 dimensions，否则会拿到默认维度。"""
+    from app.kb.embedder import OpenAiEmbedder
+
+    seen: dict = {}
+    embedder = OpenAiEmbedder(
+        "http://stub.test/v1",
+        "stub-key",
+        "embedding-3",
+        dimensions=8,
+        send_dimensions=True,
+        transport=httpx.MockTransport(_embedding_handler(seen)),
+    )
+    await embedder.embed(["灰度发布"])
+    await embedder.aclose()
+
+    assert seen["dimensions"] == 8
+
+
+async def test_embedder_dimension_mismatch_hint_is_actionable():
+    """维度与配置不符时显式失败，并给出可操作提示（区分固定维度 / 可自定义维度）。"""
+    from app.kb.embedder import OpenAiEmbedder
+
+    def handler(_request):
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.5] * 4}]})
+
+    embedder = OpenAiEmbedder(
+        "http://stub.test/v1",
+        "stub-key",
+        "BAAI/bge-m3",
+        dimensions=8,
+        send_dimensions=False,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(ApiError) as exc:
+        await embedder.embed(["x"])
+    await embedder.aclose()
+
+    assert "向量维度与配置不一致" in exc.value.message
+    assert "EMBEDDING_SEND_DIMENSIONS" in exc.value.message

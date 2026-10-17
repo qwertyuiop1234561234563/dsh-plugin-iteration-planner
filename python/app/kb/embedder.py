@@ -4,9 +4,11 @@
 
 - **协议化**：``Embedder`` 为 ``Protocol``，生产用 :class:`OpenAiEmbedder`，
   测试可注入桩实现（不触网、可复现）；
-- **OpenAI 兼容**：调用 ``POST {base}/embeddings``，请求体 ``{model, input, dimensions}``，
-  与智谱 GLM「OpenAI 兼容」端点一致（``embedding-3``，维度 256–2048 可自定义）；
-- **分批**：embedding-3 单次请求最多 64 条文本，按 ``batch_size``（默认 10）分批，避免 400；
+- **OpenAI 兼容**：调用 ``POST {base}/embeddings``，请求体 ``{model, input[, dimensions]}``；
+  ``dimensions`` 仅在 ``send_dimensions=True``（模型支持自定义维度，如智谱 ``embedding-3``、
+  ``Qwen/Qwen3-Embedding`` 系列）时下发——默认对接的硅基流动 ``BAAI/bge-m3`` 是固定
+  1024 维、不认该字段，下发会被上游判为非法参数；
+- **分批**：上游普遍限制单次请求条数（多数为 64），按 ``batch_size``（默认 10）分批，避免 400；
 - **韧性**：连接失败 / 429 / 5xx 指数退避重试，其余 4xx 立即失败（不放大错误）；
 - **可观测**：按结果埋点 ``embedding_requests_total``，并统计耗时直方图。
 """
@@ -45,7 +47,7 @@ class Embedder(Protocol):
 
 
 class OpenAiEmbedder:
-    """OpenAI 兼容向量化客户端（默认对接智谱 ``embedding-3``）。"""
+    """OpenAI 兼容向量化客户端（默认对接硅基流动 ``BAAI/bge-m3``，免费）。"""
 
     def __init__(
         self,
@@ -54,6 +56,7 @@ class OpenAiEmbedder:
         model: str,
         *,
         dimensions: int = 1024,
+        send_dimensions: bool = False,
         batch_size: int = 10,
         timeout: float = 60.0,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -64,6 +67,7 @@ class OpenAiEmbedder:
     ) -> None:
         self.name = f"openai-embedding:{model}"
         self.dimensions = max(1, dimensions)
+        self._send_dimensions = send_dimensions
         self._model = model
         self._batch_size = max(1, min(batch_size, 64))
         self._retry = retry or RetryPolicy()
@@ -96,8 +100,8 @@ class OpenAiEmbedder:
             "model": self._model,
             "input": batch,
         }
-        # embedding-3 支持显式指定输出维度（256–2048），按配置下发；不指定则用模型默认维度
-        if self.dimensions:
+        # 仅当模型支持自定义维度时才下发 ``dimensions``（bge-m3 等固定维度模型不认该字段）
+        if self._send_dimensions and self.dimensions:
             payload["dimensions"] = self.dimensions
 
         started = asyncio.get_running_loop().time()
@@ -125,9 +129,14 @@ class OpenAiEmbedder:
             if not isinstance(embedding, list) or not embedding:
                 raise embedding_gateway_error("向量化返回缺少 embedding 字段")
             if self.dimensions and len(embedding) != self.dimensions:
+                hint = (
+                    "该模型支持自定义维度，请核对 EMBEDDING_DIMENSIONS 与模型支持的档位"
+                    if self._send_dimensions
+                    else "该模型为固定维度，请把 EMBEDDING_DIMENSIONS 调整为模型实际维度"
+                    "（需要自定义维度请改用支持该字段的模型并开启 EMBEDDING_SEND_DIMENSIONS）"
+                )
                 raise embedding_gateway_error(
-                    f"向量维度与配置不一致（配置 {self.dimensions}，实际 {len(embedding)}）；"
-                    "请核对 EMBEDDING_DIMENSIONS 与模型支持的维度档位"
+                    f"向量维度与配置不一致（配置 {self.dimensions}，实际 {len(embedding)}）；{hint}"
                 )
             vectors.append([float(value) for value in embedding])
         return vectors

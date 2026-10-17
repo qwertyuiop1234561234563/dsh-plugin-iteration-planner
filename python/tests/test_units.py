@@ -164,3 +164,103 @@ async def test_llm_client_stream_surfaces_upstream_error():
         assert exc.value.code == "LLM_GATEWAY_ERROR"
     finally:
         await client.aclose()
+
+
+# ---------------------- 配置：向量化端点与密钥的绑定关系 ----------------------
+
+
+def test_embedding_key_never_leaks_across_providers():
+    """显式指定向量端点时只能用它自己的密钥，不得拿 LLM 密钥去请求别家（否则必然 401）。
+
+    典型场景：LLM 走智谱 GLM（免费文本模型），向量化走硅基流动（免费 BAAI/bge-m3），
+    两者账号不同；此时忘填 ``EMBEDDING_API_KEY`` 应当明确「未启用向量化」并降级纯算法模式。
+    """
+    from app.config import Settings
+
+    cfg = Settings(
+        _env_file=None,
+        llm_base_url="https://open.bigmodel.cn/api/paas/v4",
+        llm_api_key="llm-key",
+        llm_model="glm-4.7-flash",
+        embedding_base_url="https://api.siliconflow.cn/v1",
+        embedding_api_key="",
+    )
+    assert cfg.resolved_embedding_base_url == "https://api.siliconflow.cn/v1"
+    assert cfg.resolved_embedding_api_key == ""
+    assert cfg.embedding_enabled is False
+
+
+def test_embedding_falls_back_to_llm_key_only_when_endpoint_shared():
+    """向量端点留空表示与 LLM 共用同一端点，此时才允许复用 LLM 密钥。"""
+    from app.config import Settings
+
+    cfg = Settings(
+        _env_file=None,
+        llm_base_url="https://open.bigmodel.cn/api/paas/v4",
+        llm_api_key="llm-key",
+        llm_model="glm-4.7-flash",
+        embedding_base_url="",
+        embedding_api_key="",
+        embedding_model="embedding-3",
+        embedding_send_dimensions=True,
+    )
+    assert cfg.resolved_embedding_base_url == "https://open.bigmodel.cn/api/paas/v4"
+    assert cfg.resolved_embedding_api_key == "llm-key"
+    assert cfg.embedding_enabled is True
+
+
+def test_embedding_defaults_target_free_model():
+    """默认值必须指向真正免费的向量模型（硅基流动 BAAI/bge-m3），且不下发 dimensions 字段。"""
+    from app.config import Settings
+
+    cfg = Settings(_env_file=None)
+    assert cfg.embedding_base_url == "https://api.siliconflow.cn/v1"
+    assert cfg.embedding_model == "BAAI/bge-m3"
+    assert cfg.embedding_send_dimensions is False
+    # 未提供向量密钥即视为未启用 → 降级纯算法模式（清晰降级，不是带着错密钥去撞 401）
+    assert cfg.embedding_enabled is False
+
+
+def test_embedding_setup_hint_points_at_the_actually_missing_item(monkeypatch):
+    """降级文案必须指向**真实待补齐项**：显式配置了向量端点时只认 ``EMBEDDING_API_KEY``。
+
+    历史文案写死「请设置 EMBEDDING_MODEL 与 LLM_API_KEY」——在默认配置（默认端点为硅基流动、
+    默认模型为 ``BAAI/bge-m3``）下这句话是错的：照做仍然拿 A 家密钥请求 B 家，只会得到 401。
+    """
+    from app.config import Settings
+
+    for key in ("EMBEDDING_API_KEY", "EMBEDDING_BASE_URL", "EMBEDDING_MODEL", "LLM_API_KEY", "LLM_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+
+    default_cfg = Settings(_env_file=None)
+    hint = default_cfg.embedding_setup_hint
+    assert "EMBEDDING_API_KEY" in hint
+    assert "https://api.siliconflow.cn/v1" in hint
+    assert "BAAI/bge-m3" in hint
+
+    # 向量端点留空（与 LLM 共用端点）时，才应该引导用户去设置 LLM_API_KEY
+    shared = Settings(
+        _env_file=None,
+        llm_base_url="https://open.bigmodel.cn/api/paas/v4",
+        llm_api_key="",
+        embedding_base_url="",
+    )
+    assert "LLM_API_KEY" in shared.embedding_setup_hint
+
+    # 已启用时不再给出指引（避免把「尚未配置」的文案带到正常路径）
+    enabled = Settings(_env_file=None, embedding_api_key="sk-test")
+    assert enabled.embedding_enabled is True
+    assert enabled.embedding_setup_hint == ""
+
+
+def test_env_file_with_bom_still_reads_first_entry(tmp_path, monkeypatch):
+    """Windows 上用 PowerShell 5.1（``Set-Content -Encoding utf8``）或记事本保存的 ``.env``
+    会带 UTF-8 BOM；若按普通 utf-8 解析，BOM 会粘在首个键名上，用户写的第一行配置会被
+    静默忽略（例如 ``LLM_MODEL`` 丢失导致 LLM 永远不启用）。"""
+    from app.config import Settings
+
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_bytes("\ufeffLLM_MODEL=bom-model\n".encode("utf-8"))
+
+    assert Settings(_env_file=str(env_file)).llm_model == "bom-model"

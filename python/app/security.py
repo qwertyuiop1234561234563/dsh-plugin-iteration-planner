@@ -130,6 +130,21 @@ class _BodyTooLarge(Exception):
     """
 
 
+def _carries_body_too_large(exc: BaseException) -> bool:
+    """异常（或异常组）中是否包含请求体越界哨兵。
+
+    必须递归判定：``BaseHTTPMiddleware`` 会在 anyio TaskGroup 内消费请求体（同时监听客户端
+    断连），从 ``receive`` 抛出的哨兵会被 TaskGroup 包装成（可能多层嵌套的）
+    ``BaseExceptionGroup``——普通 ``except _BodyTooLarge`` 捕获不到，结果就是本该回 413 的请求
+    变成未捕获异常（500 + 连接中断 + 日志里一堆 Traceback）。
+    """
+    if isinstance(exc, _BodyTooLarge):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_carries_body_too_large(item) for item in exc.exceptions)
+    return False
+
+
 class BodySizeLimitMiddleware:
     """请求体大小上限（纯 ASGI 实现）。
 
@@ -189,7 +204,9 @@ class BodySizeLimitMiddleware:
 
         try:
             await self._app(scope, limited_receive, guarded_send)
-        except _BodyTooLarge:
+        except (_BodyTooLarge, BaseExceptionGroup) as exc:
+            if not _carries_body_too_large(exc):
+                raise
             if started:  # 已开始响应，无法再补发 413；交由上层关闭连接
                 logger.warning("请求体越界但响应已开始，无法回 413（path=%s）", scope.get("path"))
                 raise

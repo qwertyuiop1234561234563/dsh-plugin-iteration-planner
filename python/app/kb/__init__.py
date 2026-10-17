@@ -2,7 +2,7 @@
 
 分层（与项目「严格分层」约束一致）：
 
-- ``embedder``：文本向量化（OpenAI 兼容 ``/embeddings`` 端点，默认智谱 ``embedding-3``）与结果缓存包装；
+- ``embedder``：文本向量化（OpenAI 兼容 ``/embeddings`` 端点，默认硅基流动 ``BAAI/bge-m3``）与结果缓存包装；
 - ``store``：向量库抽象与 Chroma 实现（分块正文 / 长期记忆两个集合）；
 - ``chunking``：递归字符分块（标题 → 段落 → 句子 → 硬切）；
 - ``loader``：文档解析（md/txt/csv/json/html/pdf/docx）；

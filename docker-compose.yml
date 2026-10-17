@@ -93,7 +93,7 @@ services:
       # 单客户端事件下发超时（秒，防慢客户端拖住扇出）与在线客户端上限（0 不限）
       WS_SEND_TIMEOUT_SECONDS: ${WS_SEND_TIMEOUT_SECONDS:-5.0}
       WS_MAX_CLIENTS: ${WS_MAX_CLIENTS:-512}
-      # Agent 编排（LLM 三项齐全才启用 /api/agent/*）
+      # Agent 编排（配置 LLM 端点与模型即启用 /api/agent/*；密钥可选，兼容无鉴权自建网关）
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-}
@@ -108,11 +108,15 @@ services:
       CACHE_BACKEND: ${CACHE_BACKEND:-auto}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}
       CACHE_MAX_ENTRIES: ${CACHE_MAX_ENTRIES:-2048}
-      # 知识库（RAG）与长期记忆：留空 EMBEDDING_* 则回落 LLM_*（智谱同一端点兼做 embeddings）
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      # 知识库（RAG）与长期记忆：默认硅基流动 BAAI/bge-m3（长期免费，固定 1024 维）；
+      # 两行 EMBEDDING_BASE_URL / EMBEDDING_API_KEY 均留空时才回落 LLM_*（智谱同一端点兼做 embeddings）
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embedding-3}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      # 仅支持自定义维度的模型（智谱 embedding-3 / Qwen3-Embedding 系列）才需开启：
+      # bge-m3 等固定维度模型下发 dimensions 会被上游判为非法参数
+      EMBEDDING_SEND_DIMENSIONS: ${EMBEDDING_SEND_DIMENSIONS:-false}
       VECTOR_STORE: ${VECTOR_STORE:-chroma}
       CHROMA_DIR: /app/.data/chroma
       KB_CHUNK_SIZE: ${KB_CHUNK_SIZE:-800}

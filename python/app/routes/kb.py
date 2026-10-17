@@ -9,8 +9,9 @@
 - ``POST /kb/search``：混合检索试跑（查看命中了哪些片段，便于调参 / 校验资料质量）；
 - ``GET  /kb/stats``：统计与检索配置。
 
-未配置向量化模型（``EMBEDDING_MODEL``）时统一返回 ``503 EMBEDDING_UNAVAILABLE``，
-提示如何开启，而不是静默返回空结果（避免用户误判为「知识库里没有」）。
+未配置向量化模型（缺少 ``EMBEDDING_API_KEY`` / 向量端点不可用）时统一返回
+``503 EMBEDDING_UNAVAILABLE``，并按当前配置给出「待补齐项」指引，而不是静默返回空结果
+（避免用户误判为「知识库里没有」）。
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ _MAX_TAGS = 10
 
 def _require_knowledge(ctx: AppContext) -> KnowledgeBaseService:
     if ctx.knowledge is None:
-        raise embedding_unavailable()
+        raise embedding_unavailable(hint=ctx.settings.embedding_setup_hint)
     return ctx.knowledge
 
 

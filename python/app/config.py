@@ -7,17 +7,32 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: 仓库根目录（本文件位于 ``<repo>/python/app/config.py``）
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: 环境变量文件候选（列表中靠后的文件优先级更高）：
+#: 1) 仓库根 ``.env``——与 TS 引擎、docker compose 共用同一份配置（单一事实来源）；
+#: 2) 当前工作目录下的 ``.env``——本地覆盖；按 README 在 ``python/`` 目录启动时为 ``python/.env``。
+#: 之所以要显式写出仓库根路径：``env_file`` 按 CWD 解析，而本服务在 ``python/`` 目录下启动，
+#: 只写相对路径 ``.env`` 会读不到仓库根配置，导致根 ``.env`` 里配置的 LLM / 向量化密钥
+#: 对 Agent 层完全不生效（Agent 静默退回内置规则问答，用户却以为已启用了大模型）。
+_ENV_FILES = (str(_REPO_ROOT / ".env"), ".env")
 
 
 class Settings(BaseSettings):
     """Python 对外 API 服务配置。"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
+        env_file=_ENV_FILES,
+        # 用 utf-8-sig：Windows 上用 PowerShell 5.1（Set-Content -Encoding utf8）或记事本
+        # 保存的 .env 会带 UTF-8 BOM，按普通 utf-8 解析时 BOM 会粘在首个键名上，
+        # 导致文件里的第一项配置被静默忽略（例如 LLM_MODEL 丢失 → LLM 未启用）。
+        env_file_encoding="utf-8-sig",
         extra="ignore",
         case_sensitive=False,
     )
@@ -124,15 +139,20 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 0.5
 
     # ------------------------ 向量化模型（Embedding） ------------------------
-    #: 兼容端点基地址；留空则回落 ``LLM_BASE_URL``（智谱同一端点既做 chat 也做 embeddings）
-    embedding_base_url: str = ""
-    #: 密钥；留空则回落 ``LLM_API_KEY``
+    #: 兼容端点基地址；默认指向硅基流动（``BAAI/bge-m3`` 长期免费），
+    #: 留空则回落 ``LLM_BASE_URL``（同一端点兼做 chat 与 embeddings，如智谱）
+    embedding_base_url: str = "https://api.siliconflow.cn/v1"
+    #: 向量化密钥；留空且 ``EMBEDDING_BASE_URL`` 也为空时回落 ``LLM_API_KEY``
     embedding_api_key: str = ""
-    #: 向量化模型名（智谱 embedding-3 支持 256–2048 维，默认 1024）
-    embedding_model: str = "embedding-3"
-    #: 输出维度（需与模型支持的档位一致；默认 1024 兼顾效果与体积）
+    #: 向量化模型名（默认硅基流动 ``BAAI/bge-m3``：免费、固定 1024 维、单条上限 8192 tokens）
+    embedding_model: str = "BAAI/bge-m3"
+    #: 期望输出维度（用于契约校验与缓存键，须与模型实际输出一致；bge-m3 固定 1024）
     embedding_dimensions: int = 1024
-    #: 单次请求的文本条数（embedding-3 单次上限 64 条，保守按 10 条分批）
+    #: 是否在请求体下发 ``dimensions`` 字段：仅支持自定义维度的模型（智谱 ``embedding-3``、
+    #: ``Qwen/Qwen3-Embedding`` 系列）需要开启；``bge-m3`` 等固定维度模型不支持该字段，
+    #: 下发会被上游判为非法参数（400），故默认关闭。
+    embedding_send_dimensions: bool = False
+    #: 单次请求的文本条数（上游普遍限制 64 条以内，保守按 10 条分批）
     embedding_batch_size: int = 10
     embedding_timeout_seconds: float = 60.0
     #: 向量化调用额外重试次数（连接失败 / 429 / 5xx 生效）
@@ -178,23 +198,60 @@ class Settings(BaseSettings):
 
     @property
     def llm_enabled(self) -> bool:
-        """LLM 网关三项齐全才启用 Agent 的模型主路径。"""
+        """配置了端点与模型即启用 Agent 的模型主路径。
+
+        刻意不强制密钥：自建 OpenAI 兼容网关（vLLM / Ollama 等）通常无鉴权，客户端在
+        ``LLM_API_KEY`` 为空时不发送 ``Authorization`` 头，照常可用；反之若强制要求密钥，
+        这类部署会被误判为「未启用」而永远走不到模型主路径。云端网关缺密钥会在调用时
+        返回 401 并降级到内置规则问答，错误会以 ``LLM_GATEWAY_ERROR`` 明确暴露，不会静默。
+        """
         return bool(self.llm_base_url and self.llm_model)
 
     @property
     def resolved_embedding_base_url(self) -> str:
-        """向量化端点：优先独立配置，否则回落 LLM 网关（智谱同一端点）。"""
+        """向量化端点：优先独立配置，否则回落 LLM 网关（同一端点兼做 embeddings）。"""
         return self.embedding_base_url or self.llm_base_url
 
     @property
     def resolved_embedding_api_key(self) -> str:
-        """向量化密钥：优先独立配置，否则回落 LLM 密钥。"""
-        return self.embedding_api_key or self.llm_api_key
+        """向量化密钥：优先独立配置；仅在未单独指定向量端点时才回落 LLM 密钥。
+
+        回落必须与端点绑定：显式配置了 ``EMBEDDING_BASE_URL`` 说明向量化走的是另一家
+        （例如免费的硅基流动与大模型端的智谱并非同一账号），此时沿用 ``LLM_API_KEY``
+        会拿 A 家密钥请求 B 家，得到 401 并污染错误指标。因此这种情况下未配置
+        ``EMBEDDING_API_KEY`` 即视为「未启用向量化」，降级为纯算法模式。
+        """
+        if self.embedding_api_key:
+            return self.embedding_api_key
+        return "" if self.embedding_base_url else self.llm_api_key
 
     @property
     def embedding_enabled(self) -> bool:
         """向量化三项齐全（端点 + 模型 + 密钥）才启用知识库与长期记忆。"""
         return bool(self.resolved_embedding_base_url and self.embedding_model and self.resolved_embedding_api_key)
+
+    @property
+    def embedding_setup_hint(self) -> str:
+        """按**当前配置状态**给出「如何启用知识库 / 长期记忆」的可执行指引（直接展示给用户）。
+
+        指引必须与 :attr:`resolved_embedding_api_key` 的**端点绑定**规则保持一致：显式配置了
+        ``EMBEDDING_BASE_URL``（默认即指向硅基流动）时只认 ``EMBEDDING_API_KEY``，此时提示用户
+        去设置 ``LLM_API_KEY`` 会把用户引向一个必然失败的配置（拿 A 家密钥请求 B 家 → 401），
+        文案与真实待补齐项必须一一对应。
+        """
+        if not self.resolved_embedding_base_url:
+            return "请配置 EMBEDDING_BASE_URL（默认 https://api.siliconflow.cn/v1）后重启服务"
+        if not self.embedding_model:
+            return "请配置 EMBEDDING_MODEL（默认 BAAI/bge-m3，长期免费）后重启服务"
+        if self.embedding_api_key:
+            return ""
+        if self.embedding_base_url:
+            return (
+                f"端点已指向 {self.embedding_base_url}，请设置 EMBEDDING_API_KEY 后重启服务"
+                f"（模型 {self.embedding_model} 长期免费）；"
+                "若希望向量化与 LLM 共用同一端点，请把 EMBEDDING_BASE_URL 一并留空以复用 LLM_API_KEY"
+            )
+        return "请设置 EMBEDDING_API_KEY（未单独配置向量端点时也可用 LLM_API_KEY）后重启服务"
 
     @property
     def cors_origins(self) -> list[str]:
