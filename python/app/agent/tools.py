@@ -103,6 +103,16 @@ class ToolDispatcher:
         task_id = _require_str(args, "taskId")
         return await self._engine.request("DELETE", f"/plans/{plan_id}/tasks/{task_id}")
 
+    async def fetch_tasks(self, plan_id: str) -> list[dict[str, Any]]:
+        """读取计划当前的任务明细（供 :class:`AgentRunner` 在登记待确认写操作前校验目标）。
+
+        仅返回 ``taskList``：调用方需要的是「计划里到底有哪些 taskId」，整份计划（含风险、
+        燃尽等）没有用处。
+        """
+        plan = await self._engine.request("GET", f"/plans/{plan_id}")
+        tasks = (plan or {}).get("taskList") if isinstance(plan, dict) else None
+        return list(tasks) if isinstance(tasks, list) else []
+
     # ---------------------- 视图 / 校验 / 报表（只读或校验） ----------------------
 
     async def _tool_dag_build(self, args: dict[str, Any]) -> Any:

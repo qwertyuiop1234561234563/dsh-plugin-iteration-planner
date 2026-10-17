@@ -50,6 +50,28 @@ def constant_time_equals(provided: str, expected: str) -> bool:
     return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
+#: WebSocket 握手携带访问令牌的查询参数名
+WS_TOKEN_QUERY_PARAM = "token"
+
+
+def websocket_token(websocket: Any, *, param: str = WS_TOKEN_QUERY_PARAM) -> str:
+    """从 WebSocket 握手请求中提取访问令牌。
+
+    浏览器侧的 ``WebSocket`` 构造函数**无法自定义请求头**，所以除标准
+    ``Authorization: Bearer <token>``（非浏览器客户端 / 测试用）外，还必须支持把令牌挂在
+    查询串上的 ``?token=<token>``，否则前端页面将无从鉴权。两者皆无时返回空串，
+    由调用方决定是否拒绝握手。
+
+    注意：``BaseHTTPMiddleware`` 风格的应用级鉴权中间件**不覆盖 WebSocket scope**，
+    WS 端点的令牌校验必须在端点内显式完成（见 :func:`app.routes.system.ws_endpoint`）。
+    """
+    header = str(websocket.headers.get("authorization") or "")
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
+    return str(websocket.query_params.get(param) or "")
+
+
 def parse_trusted_proxies(value: str | Iterable[str] | None) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
     """解析可信反代地址清单（``10.0.0.0/8,192.168.1.5`` 形式的逗号分隔字符串）。
 
@@ -515,7 +537,9 @@ __all__ = [
     "RedisRateLimiter",
     "RateLimitBackend",
     "build_rate_limiter",
+    "WS_TOKEN_QUERY_PARAM",
     "client_ip",
     "constant_time_equals",
     "parse_trusted_proxies",
+    "websocket_token",
 ]

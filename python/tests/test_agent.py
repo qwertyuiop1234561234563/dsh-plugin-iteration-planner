@@ -125,7 +125,13 @@ def test_agent_health_reports_write_tools(make_client):
 
 
 def test_agent_chat_defers_write_action_without_touching_engine(make_client):
-    llm = ScriptedLlm([{"role": "assistant", "content": None, "tool_calls": [_task_add_call()]}])
+    # 登记待确认动作后编排会继续一步（好让模型补齐同一轮的其余改动），故脚本需给出收尾文本
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_task_add_call()]},
+            {"role": "assistant", "content": "已登记待确认。"},
+        ]
+    )
     with make_client(llm=llm) as c:
         data = c.post("/api/agent/chat", json={"message": "给 p1 加一个任务"}, headers=auth()).json()["data"]
         assert len(data["pendingActions"]) == 1
@@ -135,13 +141,19 @@ def test_agent_chat_defers_write_action_without_touching_engine(make_client):
         assert "新增任务" in action["label"]
         # 工具记录标记为待确认，而不是已执行（引擎未被写入）
         assert data["toolCalls"][0]["result"]["status"] == "PENDING_CONFIRMATION"
-        assert data["steps"] == 1
+        assert data["steps"] == 2
         # 服务端确定性摘要（不依赖模型输出）
         assert "需您确认后才会真正落库" in data["content"]
 
 
 def test_agent_confirm_executes_pending_action(make_client):
-    llm = ScriptedLlm([{"role": "assistant", "content": None, "tool_calls": [_task_add_call()]}])
+    # 登记待确认动作后编排会继续一步（好让模型补齐同一轮的其余改动），故脚本需给出收尾文本
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_task_add_call()]},
+            {"role": "assistant", "content": "已登记待确认。"},
+        ]
+    )
     with make_client(llm=llm) as c:
         first = c.post("/api/agent/chat", json={"message": "给 p1 加一个任务"}, headers=auth()).json()["data"]
         session_id = first["sessionId"]
@@ -166,7 +178,12 @@ def test_agent_confirm_partial_selection_keeps_remaining(make_client):
         tool_call("task_add", {"planId": "p1", "taskName": "任务甲"}, "call_a"),
         tool_call("task_add", {"planId": "p1", "taskName": "任务乙"}, "call_b"),
     ]
-    llm = ScriptedLlm([{"role": "assistant", "content": None, "tool_calls": calls}])
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": calls},
+            {"role": "assistant", "content": "已登记两个任务，请确认。"},
+        ]
+    )
     with make_client(llm=llm) as c:
         first = c.post("/api/agent/chat", json={"message": "加两个任务"}, headers=auth()).json()["data"]
         session_id = first["sessionId"]
@@ -183,7 +200,10 @@ def test_agent_confirm_partial_selection_keeps_remaining(make_client):
 
 def test_agent_chat_dedupes_identical_write_actions(make_client):
     llm = ScriptedLlm(
-        [{"role": "assistant", "content": None, "tool_calls": [_task_add_call("call_a"), _task_add_call("call_b")]}]
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_task_add_call("call_a"), _task_add_call("call_b")]},
+            {"role": "assistant", "content": "已登记待确认。"},
+        ]
     )
     with make_client(llm=llm) as c:
         data = c.post("/api/agent/chat", json={"message": "加两个同名任务"}, headers=auth()).json()["data"]
@@ -191,7 +211,13 @@ def test_agent_chat_dedupes_identical_write_actions(make_client):
 
 
 def test_agent_confirm_unknown_action_id_returns_400(make_client):
-    llm = ScriptedLlm([{"role": "assistant", "content": None, "tool_calls": [_task_add_call()]}])
+    # 登记待确认动作后编排会继续一步（好让模型补齐同一轮的其余改动），故脚本需给出收尾文本
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_task_add_call()]},
+            {"role": "assistant", "content": "已登记待确认。"},
+        ]
+    )
     with make_client(llm=llm) as c:
         session_id = c.post("/api/agent/chat", json={"message": "加任务"}, headers=auth()).json()["data"]["sessionId"]
         response = c.post(
@@ -243,7 +269,13 @@ def test_agent_chat_defer_disabled_executes_writes_immediately(make_client):
 
 
 def test_agent_confirm_reject_discards_actions_without_executing(make_client):
-    llm = ScriptedLlm([{"role": "assistant", "content": None, "tool_calls": [_task_add_call()]}])
+    # 登记待确认动作后编排会继续一步（好让模型补齐同一轮的其余改动），故脚本需给出收尾文本
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_task_add_call()]},
+            {"role": "assistant", "content": "已登记待确认。"},
+        ]
+    )
     with make_client(llm=llm) as c:
         session_id = c.post("/api/agent/chat", json={"message": "加任务"}, headers=auth()).json()["data"]["sessionId"]
 
@@ -315,6 +347,105 @@ def test_describe_action_labels():
     update = describe_action("task_update", {"planId": "p1", "taskId": "t1", "updateField": "estimatedHours", "newValue": 6})
     assert "预估工时" in update and "6" in update
     assert describe_action("task_delete", {"planId": "p1", "taskId": "t1"}) == "删除任务 t1（计划 p1）"
+
+
+def test_describe_action_shows_resolved_task_name():
+    """确认卡片必须能让人核对「改的是哪个任务」，而不是只给一串 taskId。"""
+    from app.agent.schemas import describe_action
+
+    label = describe_action(
+        "task_update",
+        {"planId": "p1", "taskId": "t1", "updateField": "assignee", "newValue": "pm-01"},
+        task_name="数据库设计",
+    )
+    assert "数据库设计" in label and "t1" in label and "责任人" in label
+    deleted = describe_action("task_delete", {"planId": "p1", "taskId": "t1"}, task_name="数据库设计")
+    assert "数据库设计" in deleted and "t1" in deleted
+
+
+def test_agent_pending_task_update_resolves_name_and_executes(make_client):
+    """既有任务的写操作：登记前查计划取任务名，确认后落库。"""
+    llm = ScriptedLlm(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    tool_call(
+                        "task_update",
+                        {"planId": "p1", "taskId": "t1", "updateField": "estimatedHours", "newValue": 12},
+                        "call_u",
+                    )
+                ],
+            },
+            {"role": "assistant", "content": "已登记待确认。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把 t1 的工时改成 12"}, headers=auth()).json()["data"]
+        assert len(data["pendingActions"]) == 1
+        action = data["pendingActions"][0]
+        assert action["tool"] == "task_update"
+        # 任务名来自引擎真实数据（Mock 引擎：t1 → 数据库设计），用户才能核对
+        assert "数据库设计" in action["label"] and "t1" in action["label"]
+
+        confirmed = c.post("/api/agent/confirm", json={"sessionId": data["sessionId"]}, headers=auth())
+        assert confirmed.status_code == 200
+        assert confirmed.json()["data"]["executed"][0]["ok"] is True
+
+
+def test_agent_pending_task_update_with_unknown_id_self_corrects(make_client):
+    """模型臆造 taskId 时不得进入确认卡片：应回填真实任务清单让模型自纠（而不是等用户确认后 404）。"""
+    llm = ScriptedLlm(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    tool_call(
+                        "task_update",
+                        {"planId": "p1", "taskId": "t_不存在", "updateField": "estimatedHours", "newValue": 12},
+                        "call_u",
+                    )
+                ],
+            },
+            {"role": "assistant", "content": "未找到该任务，计划中实际是「数据库设计」(t1)。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把工时改成 12"}, headers=auth()).json()["data"]
+        # 未登记任何待确认动作（不拿用户的确认去撞 404）
+        assert data["pendingActions"] == []
+        failed = data["toolCalls"][0]
+        assert failed["ok"] is False and "不在计划" in failed["error"]
+        # 纠偏提示里带上「名称(ID)」清单，模型下一步即可改用真实 taskId
+        tool_messages = [m for m in llm.calls[-1] if m.get("role") == "tool"]
+        assert tool_messages and "数据库设计(t1)" in tool_messages[-1]["content"]
+
+
+def test_agent_pending_task_update_for_missing_plan_self_corrects(make_client):
+    """planId 本身不存在时同样自纠（不生成待确认动作）。"""
+    llm = ScriptedLlm(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    tool_call(
+                        "task_delete",
+                        {"planId": "no-such-plan", "taskId": "t1"},
+                        "call_d",
+                    )
+                ],
+            },
+            {"role": "assistant", "content": "该计划不存在。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "删掉 t1"}, headers=auth()).json()["data"]
+        assert data["pendingActions"] == []
+        assert data["toolCalls"][0]["ok"] is False
+        assert "不存在" in data["toolCalls"][0]["error"]
 
 
 # ---------------------- SSE 流式输出（POST /api/agent/chat/stream） ----------------------
@@ -394,7 +525,12 @@ def test_agent_chat_stream_reports_tool_call_events(make_client):
 
 def test_agent_chat_stream_defers_write_action(make_client):
     """流式链路同样遵守两阶段写操作：本轮只登记待确认动作，不落库。"""
-    llm = StreamingScriptedLlm([{"role": "assistant", "content": "准备新增任务。", "tool_calls": [_task_add_call()]}])
+    llm = StreamingScriptedLlm(
+        [
+            {"role": "assistant", "content": "准备新增任务。", "tool_calls": [_task_add_call()]},
+            {"role": "assistant", "content": "已登记待确认。"},
+        ]
+    )
     with make_client(llm=llm) as c:
         response = c.post("/api/agent/chat/stream", json={"message": "补一个任务"}, headers=auth())
         frames = _parse_sse(response.text)
@@ -408,7 +544,7 @@ def test_agent_chat_stream_defers_write_action(make_client):
         assert "新增任务" in final["content"]
         # 只登记未落库：工具记录标记为待确认状态（引擎未被写入）
         assert final["toolCalls"][0]["result"]["status"] == "PENDING_CONFIRMATION"
-        assert final["steps"] == 1
+        assert final["steps"] == 2
 
 
 def test_agent_chat_stream_falls_back_when_model_not_streamable(make_client):
@@ -433,3 +569,281 @@ def test_agent_chat_stream_reports_error_event(make_client):
         frames = _parse_sse(response.text)
         assert frames[-1][0] == "error"
         assert frames[-1][1]["code"] and frames[-1][1]["message"]
+
+
+def test_agent_recovers_tool_call_written_as_text(make_client):
+    """模型把工具调用写成正文（并混入上游泄漏的协议信封）时，兜底还原为真实调用并继续编排。"""
+    content = (
+        "以下是调用：\n```json\n"
+        '{"name": "get_plan", "parameters": {"planId": "p1"}}\n'
+        "```\n"
+        '{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant","content":null}}'
+    )
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": content},
+            {"role": "assistant", "content": "计划 p1 共 1 个任务（t1）。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat", json={"message": "计划 p1 里有哪些任务"}, headers=auth())
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert [item["name"] for item in data["toolCalls"]] == ["get_plan"]
+        assert data["toolCalls"][0]["ok"] is True
+        # 伪调用正文与协议字节都不得出现在最终答复里
+        assert data["content"] == "计划 p1 共 1 个任务（t1）。"
+        assert "finish_reason" not in data["content"]
+        assert data["steps"] == 2
+
+
+def test_agent_recovers_truncated_text_tool_call(make_client):
+    """模型把工具调用写成正文且中途被截断（JSON 未闭合）时，补全闭合符后仍应还原为真实调用。"""
+    content = '以下是调用：\n\n{\n  "name": "get_plan",\n  "parameters": {\n    "planId": "p1'
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": content},
+            {"role": "assistant", "content": "计划 p1 共 1 个任务（t1）。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat", json={"message": "计划 p1 里有哪些任务"}, headers=auth())
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert [item["name"] for item in data["toolCalls"]] == ["get_plan"]
+        assert data["toolCalls"][0]["ok"] is True
+        assert data["content"] == "计划 p1 共 1 个任务（t1）。"
+        assert data["steps"] == 2
+
+
+def test_agent_retries_unparsable_text_tool_attempt(make_client):
+    """模型把调用写成无法还原的正文（仅参数对象 + 正文提及工具名）：不得作为最终答复，
+    应回填纠偏提示让模型改用结构化 tool_calls 重新输出。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": '我将使用get_plan工具来获取计划信息。\n\n{"planId": "p1'},
+            {"role": "assistant", "content": None, "tool_calls": [tool_call("get_plan", {"planId": "p1"}, "call_a")]},
+            {"role": "assistant", "content": "计划 p1 共 1 个任务（t1）。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat", json={"message": "计划 p1 里有哪些任务"}, headers=auth())
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert [item["name"] for item in data["toolCalls"]] == ["get_plan"]
+        assert data["content"] == "计划 p1 共 1 个任务（t1）。"
+        assert data["steps"] == 3
+
+
+def test_agent_registers_all_changes_in_compound_request(make_client):
+    """复合请求（同一任务改两个字段）必须**全部**登记为待确认动作。
+
+    早期实现只要出现写操作就立刻结束本回合，导致模型没有机会登记第二条改动，
+    「改责任人 + 改工时」只会登记其中一条、其余被静默丢弃。"""
+    llm = ScriptedLlm(
+        [
+            # 第 1 步：先查真实 taskId
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("get_plan", {"planId": "p1"}, "c1")]},
+            # 第 2 步：只登记第一条改动
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [tool_call("task_update", {"planId": "p1", "taskId": "t1", "updateField": "assignee", "newValue": "pm-01"}, "c2")],
+            },
+            # 第 3 步：登记第二条改动（早期实现在第 2 步就 return，这一步永远不会发生）
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [tool_call("task_update", {"planId": "p1", "taskId": "t1", "updateField": "estimatedHours", "newValue": 12}, "c3")],
+            },
+            {"role": "assistant", "content": "已登记两项变更，请确认。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        response = c.post(
+            "/api/agent/chat",
+            json={"message": "把第一个任务的责任人改为 pm-01，工时改为 12 小时"},
+            headers=auth(),
+        )
+        assert response.status_code == 200
+        data = response.json()["data"]
+        fields = [item["arguments"].get("updateField") for item in data["pendingActions"]]
+        assert fields == ["assignee", "estimatedHours"]
+        assert data["steps"] == 4
+        # 摘要由服务端确定性生成，逐条列出待确认项
+        assert "assignee" in data["content"] or "责任人" in data["content"]
+        assert "2 项写操作" in data["content"]
+
+
+def test_agent_pending_tool_result_is_refilled_to_model(make_client):
+    """登记待确认动作后必须回填规范的 tool 结果（OpenAI 协议要求），否则下一轮历史非法。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("task_update", {"planId": "p1", "taskId": "t1", "updateField": "status", "newValue": "DONE"}, "c1")]},
+            {"role": "assistant", "content": "已登记。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat", json={"message": "把 t1 标记为完成"}, headers=auth())
+        assert response.status_code == 200
+        # 第 2 次调用模型时，历史里必须带上 role=tool 且 tool_call_id 匹配的消息
+        tool_msgs = [m for m in llm.calls[1] if m.get("role") == "tool"]
+        assert tool_msgs and tool_msgs[0]["tool_call_id"] == "c1"
+        assert "已登记为待确认动作" in tool_msgs[0]["content"]  # 面向模型的是可读中文说明
+
+
+def test_agent_max_steps_with_pending_returns_confirmation(make_client):
+    """未收敛但已登记变更：应返回确认卡片而不是抛 AGENT_MAX_STEPS（避免用户白等）。"""
+    same_step = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [tool_call("task_update", {"planId": "p1", "taskId": "t1", "updateField": "status", "newValue": "DONE"}, "c1")],
+    }
+    llm = ScriptedLlm([dict(same_step) for _ in range(8)])
+    with make_client(llm=llm, overrides={"agent_max_steps": 2}) as c:
+        response = c.post("/api/agent/chat", json={"message": "把 t1 标记为完成"}, headers=auth())
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data["pendingActions"]) == 1
+        assert "需您确认后才会真正落库" in data["content"]
+
+
+def test_agent_rejects_false_write_completion(make_client):
+    """本轮没有任何写操作，模型却宣称「已改为…操作后的详情…」：必须纠偏重试，不得当结论返回。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": "我已将第一个任务的责任人改为 pm-01，工时改为 12 小时。以下是操作后的任务详情：责任人 pm-01、工时 12 小时。"},
+            # 纠偏后模型仍未真的调用写工具，继续谎报 → 应被确定性提示覆盖
+            {"role": "assistant", "content": "已修改完成。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把第一个任务的责任人改为 pm-01"}, headers=auth()).json()["data"]
+        assert data["pendingActions"] == []
+        assert data["toolCalls"] == []
+        assert "没有任何变更被登记或执行" in data["content"]
+        assert "已修改完成" not in data["content"]
+        # 纠偏提示确实回填给了模型（第 2 次调用的最后一条消息）
+        assert any(m.get("role") == "user" and "不得宣称已经完成" in str(m.get("content")) for m in llm.calls[1])
+
+
+def test_agent_false_completion_fixed_by_retry(make_client):
+    """纠偏后模型真的调用了写工具：正常登记待确认动作，用户不会被虚假结论误导。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": "我已修改该任务。"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("task_update", {"planId": "p1", "taskId": "t1", "updateField": "assignee", "newValue": "pm-01"}, "c1")]},
+            {"role": "assistant", "content": "已提交待确认。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把 t1 的责任人改为 pm-01"}, headers=auth()).json()["data"]
+        assert len(data["pendingActions"]) == 1
+        assert data["pendingActions"][0]["arguments"]["updateField"] == "assignee"
+        assert "没有任何变更被登记或执行" not in data["content"]
+
+
+def test_agent_asking_clarification_is_not_treated_as_false_claim(make_client):
+    """模型在信息不足时如实反问（不提「已完成」）不得被误判为谎报完成。"""
+    content = "我无法确定您想修改哪个计划，请提供计划 ID。"
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("list_plans", {}, "c1")]},
+            {"role": "assistant", "content": content},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把第一个任务工时改成 12"}, headers=auth()).json()["data"]
+        assert data["content"] == content
+        assert data["pendingActions"] == []
+
+
+def test_agent_grounds_state_question_by_retrying_without_tools(make_client):
+    """问「当前计划状态」却一次工具都没调用就给出数字：必须纠偏重试，促使其真正取数。"""
+    llm = ScriptedLlm(
+        [
+            # 不调用任何工具，直接凭记忆给出数字（可能属于别的计划）
+            {"role": "assistant", "content": "当前计划的迭代工期为 57.67 天，存在 2 个高风险项。"},
+            # 纠偏后改为真正调用工具
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("get_plan", {"planId": "p1"}, "c1")]},
+            {"role": "assistant", "content": "依据计划 p1 的实时数据，工期为 30 天，高风险 0 项。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "当前计划的迭代工期是多少天？有没有高风险？", "planId": "p1"}, headers=auth()).json()["data"]
+        assert [item["name"] for item in data["toolCalls"]] == ["get_plan"]
+        assert "57.67" not in data["content"]
+        assert "30 天" in data["content"]
+        # 纠偏提示确实回填给了模型
+        assert any(m.get("role") == "user" and "没有调用任何工具" in str(m.get("content")) for m in llm.calls[1])
+
+
+def test_agent_state_question_with_tools_is_not_retried(make_client):
+    """正常路径（先调工具再回答）不得被误触发纠偏重试。"""
+    content = "依据计划 p1 的实时数据，工期为 30 天。"
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("get_plan", {"planId": "p1"}, "c1")]},
+            {"role": "assistant", "content": content},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "这个计划工期多少天？", "planId": "p1"}, headers=auth()).json()["data"]
+        assert data["content"] == content
+        assert data["steps"] == 2
+
+
+def test_agent_definition_question_without_tools_is_not_retried(make_client):
+    """纯概念性问题（无状态特征词）即使不调工具也不得触发纠偏。"""
+    content = "关键路径是项目中耗时最长的任务链。"
+    llm = ScriptedLlm([{"role": "assistant", "content": content}])
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "什么是关键路径？", "planId": "p1"}, headers=auth()).json()["data"]
+        assert data["content"] == content
+        assert data["steps"] == 1
+
+
+def test_close_truncated_json_rejects_unbalanced_fragment():
+    """括号不配对（非单纯截断）的片段不得被「修复」成合法 JSON。"""
+    from app.agent.runner import _close_truncated_json
+
+    assert _close_truncated_json('{"a": 1}') is None
+    assert _close_truncated_json('{"a": "b"}}') is None
+    assert _close_truncated_json('{"a": [1, 2') is not None
+
+
+def test_agent_ignores_text_tool_call_with_unknown_name(make_client):
+    """正文里的 JSON 若声明的不是已知工具，不得被误判为调用（避免普通说明被当成工具执行）。"""
+    content = '这段说明不会被当成调用：{"name": "poweroff", "parameters": {}}'
+    llm = ScriptedLlm([{"role": "assistant", "content": content}])
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat", json={"message": "怎么用"}, headers=auth())
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["toolCalls"] == []
+        assert data["content"] == content
+        assert data["steps"] == 1
+
+
+def test_agent_chat_strips_leaked_protocol_envelope(make_client):
+    """流式链路下正文尾部混入的协议信封必须被剥离（分片切分也要在聚合阶段截断）。"""
+    leak = '{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant","content":null}}'
+    llm = StreamingScriptedLlm([{"role": "assistant", "content": f"结果如下。{leak}"}], chunk_size=4)
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat", json={"message": "帮我看看"}, headers=auth())
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["content"] == "结果如下。"
+        assert "finish_reason" not in data["content"]
+
+
+def test_agent_empty_reply_gets_explicit_hint(make_client):
+    """既无工具调用也无文本：给出明确提示而不是空白，避免用户以为请求被静默吞掉。"""
+    llm = ScriptedLlm([{"role": "assistant", "content": ""}])
+    with make_client(llm=llm) as c:
+        response = c.post("/api/agent/chat", json={"message": "你好"}, headers=auth())
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["toolCalls"] == []
+        assert data["content"].strip() != ""
+        assert data["steps"] == 1

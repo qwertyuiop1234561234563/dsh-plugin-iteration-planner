@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import Any, AsyncIterator
 
@@ -41,7 +42,7 @@ from ..kb.pipeline import KnowledgeBaseService
 from ..metrics import METRICS
 from ..models import AgentChatResponse, AgentRunResult, KbHit, MemoryItem, PendingAction, ToolCallRecord
 from ..sessions import InMemorySessionStore, SessionStore
-from .llm import LlmClient
+from .llm import LlmClient, strip_protocol_leak
 from .memory import MemoryService
 from .prompts import ITERATION_PLANNER_SYSTEM_PROMPT, build_chat_instruction, build_plan_instruction
 from .sanitize import unwrap_arguments
@@ -59,6 +60,111 @@ _REQUIRED: dict[str, list[str]] = {
 }
 _TOOL_NAMES: frozenset[str] = frozenset(_REQUIRED)
 
+#: 全部已声明的工具名（含因服务缺失而未暴露者），用于识别「模型试图调用但没写成 tool_calls」
+_ALL_TOOL_NAMES: frozenset[str] = frozenset(spec["function"]["name"] for spec in TOOL_SPECS)
+
+#: 匹配正文里 JSON 形式的 ``"name": "<工具名>"``（模型把调用写成文本时的常见形状）
+_TOOL_ATTEMPT_RE = re.compile(r'"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+
+#: 模型把工具调用写成不可解析正文时回填的纠偏提示（对齐主流框架的输出格式重试）
+_TOOL_RETRY_HINT = (
+    "你上一条回复不是有效的工具调用：它把对 {tool} 的调用写成了普通文本，系统无法解析。"
+    "请**直接以结构化 tool_calls 重新发出该调用**，不要在正文里书写 JSON 或代码块。"
+)
+
+#: 写操作登记为待确认动作后回填给模型的 tool 结果（同时承担「别漏掉其余改动」的提示职责）
+_PENDING_TOOL_RESULT = (
+    "已登记为待确认动作（**尚未写库**，用户确认后才会执行）：{label}。"
+    "若用户本轮还提出了**其它**改动（同一任务的另一个字段、其它任务、增删任务等），"
+    "请继续调用相应工具把它们**全部**登记完，不要遗漏也不要重复登记同一条；"
+    "全部登记完成后，用一句话告诉用户本轮共待确认哪些变更。"
+)
+
+#: 识别「模型宣称自己已经完成了写操作」的措辞（用于拦截无任何写操作却谎报完成）
+_WRITE_CLAIM_RE = re.compile(
+    r"已(?:成功)?(?:修改|更改|变更|更新|调整|设置|删除|新增|添加|登记|提交|执行|改为|改好)"
+    r"|操作后(?:的)?(?:任务|计划|结果|详情|数据)"
+)
+
+#: 谎报完成时回填给模型的纠偏提示：必须真的调用写工具，而不是宣称已做
+_FALSE_COMPLETION_HINT = (
+    "你上一条回复宣称已经完成了写操作，但系统**没有收到任何写工具调用**（既没有登记待确认动作，"
+    "也没有真正执行），因此用户看到的「已完成」「操作后」结果是虚假的。"
+    "请立即**真正调用对应的写工具**（task_update / task_delete / task_add / plan_iteration 等）；"
+    "若缺少必要信息（例如不知道要操作哪个计划或哪个任务），请先调用 get_plan / list_plans 取得，"
+    "仍无法确定时再向用户说明需要补充什么信息——但**不得宣称已经完成**。"
+)
+
+#: 重试后仍谎报完成时的兜底文案（用确定性提示替换，避免用户依据虚假结论行事）
+_FALSE_COMPLETION_NOTICE = (
+    "⚠️ 本轮**没有任何变更被登记或执行**（未产生待确认动作），因此上一步提到的修改结果并不真实。\n\n"
+    "请明确告知要操作的计划与任务（例如「把计划 XXX 中『数据库设计』的工时改为 12 小时」），"
+    "或先切换到目标计划页面再发起请求。"
+)
+
+#: 「当前计划状态」类问题的特征词：这类问题的答案只能是工具实时结果，不能来自长期记忆。
+_STATE_QUESTION_RE = re.compile(
+    r"工期|工时|关键路径|燃尽|风险|人力|负荷|质量指标|任务清单|进度|延期"
+    r"|(?:这个|该|当前|这份|本)(?:计划|迭代|项目)|计划(?:里|中|内)"
+)
+
+#: 疑问句式特征。**必须与状态特征词同时命中**才算「状态提问」——否则「把…工时改为 12 小时」
+#: 这类**写指令**（含「工时」但并非提问）会被误判，导致纠偏提示把模型带偏去回答上一个问题。
+_QUESTION_SHAPE_RE = re.compile(r"[?？]|吗|呢|什么|多少|哪些|哪几|是否|有没有|几(?:天|个|条|项|人)|怎么")
+
+#: 写操作意图的特征词：用户明确要求改动时，本轮必须产出待确认写动作
+_WRITE_INTENT_RE = re.compile(r"改为|改成|修改|变更|更新|新增|添加|加到|插入|删除|移除|设置|调整|拆分|指派|分配|补一个|加一个")
+
+
+def _is_state_question(text: str) -> bool:
+    """判断用户输入是否为「当前计划状态」的提问（状态特征词 + 疑问句式同时成立）。"""
+    return _STATE_QUESTION_RE.search(text) is not None and _QUESTION_SHAPE_RE.search(text) is not None
+
+
+def _has_write_intent(text: str) -> bool:
+    """判断用户输入是否明确要求改动（写操作）。"""
+    return _WRITE_INTENT_RE.search(text) is not None
+
+#: 答复中是否出现**度量值**（数字 + 量词/单位）。不能只用裸数字判断——任务 ID 形如 ``t1``
+#: 也含数字，会把「关键路径是 t1 → t2」这类正常回答误判为「给出了当前计划的实测值」。
+_HAS_FIGURE_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:天|小时|分钟|万元|人|人次|个|项|条|次|%|h|H)")
+
+#: 无工具调用却给出状态数字时回填的纠偏提示（防止拿长期记忆/history 冒充当前实测值）
+_STATE_GROUNDING_HINT = (
+    "你刚才回答了当前计划的状态，但本轮**没有调用任何工具**。长期记忆与历史对话里的数字"
+    "可能来自其它计划或更早时间点，不能作为当前计划的实测值。请**先调用工具**"
+    "（get_plan 取任务与工期／schedule_calc 取关键路径／risk_scan 取风险等；若不知道 planId，"
+    "先 list_plans），再依据工具返回结果重新作答。本轮只是**查询状态**，不要创建新计划或做任何写操作。"
+)
+
+#: 用户明确要求改动，但本轮**没有登记到任何写动作**、也没有追问澄清时回填的纠偏提示
+#: （防止写指令被当成状态查询作答，从而被静默空转——用户的修改请求完全不会生效）。
+_WRITE_INTENT_HINT = (
+    "本轮用户明确要求**改动**计划内容，但系统**没有登记到任何待确认的写动作**"
+    "（既没有成功调用写工具，也没有向用户追问缺失信息），因此用户的修改请求当前不会生效。"
+    "请**立即调用对应的写工具**（task_update / task_delete / task_add / plan_iteration 等）"
+    "把改动登记为待确认动作；若缺少必要信息（如不知道要操作哪个计划或哪个任务），"
+    "请先调用 get_plan / list_plans 取得，仍无法确定时再明确向用户说明需要补充什么信息。"
+)
+
+
+#: 送进模型的用户消息里，真实用户输入被包在 ``<<<USER_INPUT ... USER_INPUT>>>`` 边界内，
+#: 边界之外的文字是**脚手架**（可信上下文 + list_plans 指引）。做「写意图 / 状态提问」这类
+#: 语料判据时必须只看边界内的正文——否则脚手架里的「新增 / 修改 / 删除任务」字样会把
+#: 「关键路径怎么算？」这种纯提问误判成写指令，进而触发无意义的纠偏重试。
+_UNTRUSTED_BODY_RE = re.compile(r"<<<\s*USER_INPUT\s*(.*?)\s*USER_INPUT\s*>>>", re.DOTALL)
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    """取最后一条 user 消息里的**用户原始输入**（已剥离边界脚手架）。"""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            text = _content_to_text(message.get("content"))
+            match = _UNTRUSTED_BODY_RE.search(text)
+            return match.group(1).strip() if match else text
+    return ""
+
+
 #: 依赖「知识库 / 长期记忆」服务才可用的工具 → 所需服务名（服务缺失时不出现在工具清单中，
 #: 避免模型调用一个必然失败的工具而浪费步数）
 _SERVICE_BOUND_TOOLS: dict[str, str] = {
@@ -66,6 +172,163 @@ _SERVICE_BOUND_TOOLS: dict[str, str] = {
     "kb_list_documents": "knowledge",
     "memory_search": "memory",
 }
+
+#: 以「既有任务」为目标的写类工具：登记待确认动作前必须校验 taskId 真实存在（见
+#: :meth:`AgentRunner._resolve_task_target`），避免模型臆造的 ID 进入确认卡片后才以 404 失败。
+_TASK_TARGET_WRITE_TOOLS: frozenset[str] = frozenset({"task_update", "task_delete"})
+
+#: 纠偏提示里最多回填的任务条数（防止超大计划把提示撑成另一个「计划快照」）
+_MAX_TASK_PREVIEW = 30
+
+
+def _task_preview(tasks: list[dict[str, Any]]) -> str:
+    """把计划任务压缩为「名称(ID)」清单，供模型纠正 taskId 时对照。"""
+    preview = [f"{task.get('taskName') or '(未命名)'}({task.get('taskId')})" for task in tasks[:_MAX_TASK_PREVIEW]]
+    if len(tasks) > _MAX_TASK_PREVIEW:
+        preview.append(f"…等共 {len(tasks)} 个任务")
+    return "、".join(preview) or "（该计划当前没有任务）"
+
+
+#: 模型偶发把工具调用写成正文（纯文本 JSON / ```json 代码块）而非结构化 ``tool_calls``；
+#: 这里的字段名兼容主流 Agent 框架（LangChain / Anthropic 风格）以便还原真实调用。
+_TEXT_TOOL_NAME_KEYS: tuple[str, ...] = ("name", "tool", "tool_name")
+_TEXT_TOOL_ARG_KEYS: tuple[str, ...] = ("arguments", "parameters", "input", "args")
+#: 命中这些键说明是协议信封 / 非工具对象，直接排除
+_TEXT_TOOL_DENY_KEYS: frozenset[str] = frozenset({"finish_reason", "delta", "choices"})
+
+
+def _text_tool_call(obj: Any) -> tuple[str, dict[str, Any]] | None:
+    """把一个 JSON 对象识别为工具调用；仅当工具名属于当前可用工具时才认可。"""
+    if not isinstance(obj, dict) or _TEXT_TOOL_DENY_KEYS & obj.keys():
+        return None
+    function = obj.get("function")
+    if isinstance(function, dict):
+        name, args = function.get("name"), function.get("arguments")
+    else:
+        name = next((obj[key] for key in _TEXT_TOOL_NAME_KEYS if isinstance(obj.get(key), str)), None)
+        args = next((obj[key] for key in _TEXT_TOOL_ARG_KEYS if obj.get(key) is not None), None)
+    if not isinstance(name, str) or name not in _TOOL_NAMES:
+        return None
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return None
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return None
+    return name, args
+
+
+def _close_truncated_json(raw: str) -> str | None:
+    """给被截断的 JSON 片段补上缺失的闭合符，返回可解析字符串（仍不合法时返回 ``None``）。
+
+    轻量模型把工具调用写成正文时，常在 JSON 中途停笔（如 ``{"planId": "abc`` 缺少引号与
+    两层大括号）。这里统计未闭合的结构与字符串并补齐，使这类「半截调用」也能被还原。
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if not stack:
+                return None  # 括号不配对：不是单纯截断，放弃修复
+            stack.pop()
+    if not stack and not in_string:
+        return None  # 结构已闭合，说明原本就不是合法 JSON
+    suffix = '"' if in_string else ""
+    for char in reversed(stack):
+        suffix += "}" if char == "{" else "]"
+    return raw + suffix
+
+
+def _text_tool_calls(content: str) -> list[dict[str, Any]]:
+    """从助手正文中还原「被写成文本的工具调用」（防御性兜底）。
+
+    轻量模型有时不产出结构化 ``tool_calls``，而是把调用写成正文里的 JSON（含
+    ```json 代码块），甚至在中途被截断。若按纯文本原样返回，用户的写/查请求会被静默
+    吞掉；这里把可识别的调用（含截断片段修复后）还原为标准 ``tool_calls`` 继续编排。
+    仅在工具名属于 :data:`_TOOL_NAMES` 时才认可，避免把普通说明文字误判为调用。
+    """
+    if not content or "{" not in content:
+        return []
+    decoder = json.JSONDecoder()
+    recovered: list[dict[str, Any]] = []
+    cursor = 0
+    while True:
+        start = content.find("{", cursor)
+        if start < 0:
+            break
+        cursor = start + 1
+        try:
+            obj, _ = decoder.raw_decode(content, start)
+        except ValueError:
+            # 截断片段：尝试补齐闭合符后再解析
+            closed = _close_truncated_json(content[start:])
+            if closed is None:
+                continue
+            try:
+                obj = json.loads(closed)
+            except ValueError:
+                continue
+        parsed = _text_tool_call(obj)
+        if parsed is None:
+            continue
+        name, args = parsed
+        recovered.append(
+            {
+                "id": f"call_text_{len(recovered)}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            }
+        )
+    return recovered
+
+
+def _mentions_tool(text: str, name: str) -> bool:
+    """判断文本是否「独立」提及某工具名（前后不是 ASCII 标识符字符，避免子串误命中）。
+
+    注意：不能用 ``str.isalnum()`` 判定边界——中文字符在 Python 里也算 alnum，会把
+    「使用 get_plan 工具」这类正常提及误判为子串，因此只按 ASCII 标识符字符划界。
+    """
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text) is not None
+
+
+def _unparsed_tool_attempt(content: str) -> str | None:
+    """识别「模型试图调用工具、但输出无法还原成 tool_calls」的正文，返回其目标工具名。
+
+    两种情况会命中：
+
+    1. 正文里出现 ``"name": "<已知工具>"``（参数被截断或结构不完整，无法还原）；
+    2. 正文只写了参数对象（无 ``name`` 键）且尾部 JSON 明显被截断，同时正文恰好提到唯一一个工具名。
+
+    这类答复绝不能当作最终结果直接返回（用户会看到一段「我要调用 XX」却什么都没发生），
+    而应回填纠偏提示让模型改用结构化 ``tool_calls`` 重新输出。
+    """
+    if "{" not in content:
+        return None
+    for match in _TOOL_ATTEMPT_RE.finditer(content):
+        name = match.group(1)
+        if name in _ALL_TOOL_NAMES:
+            return name
+    brace = content.rfind("{")
+    if brace < 0 or _close_truncated_json(content[brace:]) is None:
+        return None
+    mentioned = [name for name in sorted(_ALL_TOOL_NAMES) if _mentions_tool(content, name)]
+    return mentioned[0] if len(mentioned) == 1 else None
 
 
 def _content_to_text(content: Any) -> str:
@@ -411,6 +674,9 @@ class AgentRunner:
         records: list[ToolCallRecord] = []
         pending: list[PendingAction] = []
         plan_id: str | None = None
+        false_claim_fixes = 0
+        state_grounding_fixes = 0
+        write_intent_fixes = 0
 
         for step in range(1, self._max_steps + 1):
             self._enforce_budget(messages)
@@ -418,7 +684,9 @@ class AgentRunner:
             if streamer is None:
                 # 模型未实现流式能力：一次性调用，并把全文作为单帧下发（功能不变，仅少了逐字效果）
                 message = await self._llm.chat(messages, tools=self._tool_specs, temperature=self._temperature)
-                text = _content_to_text(message.get("content"))
+                text = strip_protocol_leak(_content_to_text(message.get("content")))
+                if message.get("content") is not None:
+                    message = {**message, "content": text}
                 if text:
                     yield {"event": SSE_DELTA, "data": {"text": text}}
             else:
@@ -430,19 +698,107 @@ class AgentRunner:
                 if message is None:
                     raise ApiError(422, "LLM_FORMAT_ERROR", "LLM 流式响应未返回完整消息")
 
-            messages.append(self._canonical_assistant(message))
             tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                # 兜底：模型把工具调用写成了正文（纯文本 JSON / 代码块）而非结构化 tool_calls，
+                # 若按文本原样返回，用户的请求会被静默吞掉；这里还原为真实调用继续编排。
+                recovered = _text_tool_calls(strip_protocol_leak(_content_to_text(message.get("content"))))
+                if recovered:
+                    tool_calls = recovered
+                    message = {"role": "assistant", "content": "", "tool_calls": recovered}
+                    METRICS.inc_counter("agent_text_tool_recovered_total")
+                    logger.warning(
+                        "模型将工具调用写成正文，已兜底还原 %d 个调用：%s",
+                        len(recovered),
+                        "、".join(call["function"]["name"] for call in recovered),
+                    )
+            messages.append(self._canonical_assistant(message))
 
             if not tool_calls:
+                # 无工具调用时正文即为最终答复：剥离协议字节（不依赖具体 LlmClient 实现）
+                final_text = strip_protocol_leak(_content_to_text(message.get("content"))).strip()
+                attempt = _unparsed_tool_attempt(final_text)
+                if attempt is not None and step < self._max_steps:
+                    # 正文是一次无法解析的工具调用尝试：不作为最终答复，纠偏后重试
+                    # （对齐主流 Agent 框架的「输出解析失败 → 回填格式纠偏」策略）
+                    METRICS.inc_counter("agent_text_tool_retry_total", {"tool": attempt})
+                    logger.warning(
+                        "模型把对 %s 的调用写成不可解析的正文，回填纠偏提示后重试（第 %d 步）", attempt, step
+                    )
+                    messages.append({"role": "user", "content": _TOOL_RETRY_HINT.format(tool=attempt)})
+                    continue
                 METRICS.observe("agent_steps", step, buckets=(1, 2, 3, 4, 5, 6, 8), help="Agent 收敛步数")
-                METRICS.inc_counter("agent_runs_total", {"outcome": "completed"})
+                if not pending and not any(record.ok and record.name in WRITE_TOOLS for record in records):
+                    # 一致性校验（一）：本轮没有任何写操作，模型却宣称「已修改/操作后…」——这是
+                    # **虚假完成**，用户会据此以为变更已生效。先纠偏重试，仍无效则用确定性提示覆盖。
+                    if _WRITE_CLAIM_RE.search(final_text):
+                        false_claim_fixes += 1
+                        if false_claim_fixes == 1 and step < self._max_steps:
+                            METRICS.inc_counter("agent_false_completion_total", {"action": "retry"})
+                            logger.warning("模型在无写操作的情况下宣称已完成变更，回填纠偏提示后重试（第 %d 步）", step)
+                            messages.append({"role": "user", "content": _FALSE_COMPLETION_HINT})
+                            continue
+                        METRICS.inc_counter("agent_false_completion_total", {"action": "notice"})
+                        logger.warning("模型重复谎报写入完成，已用确定性提示替换本轮结论")
+                        final_text = _FALSE_COMPLETION_NOTICE
+                if not records and not state_grounding_fixes:
+                    # 一致性校验（二）：用户问的是**当前计划状态**，模型却一次工具都没调用就给出数字
+                    # ——这些数字只能来自长期记忆或历史对话，可能属于别的计划/更早时间点。纠偏一次。
+                    if _is_state_question(_last_user_text(messages)) and _HAS_FIGURE_RE.search(final_text):
+                        state_grounding_fixes += 1
+                        if step < self._max_steps:
+                            METRICS.inc_counter("agent_ungrounded_state_answer_total", {"action": "retry"})
+                            logger.warning("模型未调用工具即回答当前计划状态，回填纠偏提示后重试（第 %d 步）", step)
+                            messages.append({"role": "user", "content": _STATE_GROUNDING_HINT})
+                            continue
+                        METRICS.inc_counter("agent_ungrounded_state_answer_total", {"action": "unresolved"})
+                        logger.warning("模型重复在无工具调用下回答状态问题，本轮结论未获得工具支撑")
+                if (
+                    not pending
+                    and not any(record.name in WRITE_TOOLS for record in records)
+                    and not write_intent_fixes
+                    and _has_write_intent(_last_user_text(messages))
+                    # 模型反问澄清（如「要改哪个计划？」）是合法收敛，不应判为空转
+                    and "？" not in final_text
+                    and "?" not in final_text
+                ):
+                    # 一致性校验（三）：用户本轮明确要求改动，模型却既没登记任何写动作、也没反问澄清，
+                    # 而是把写指令当作状态查询作答——修改请求被静默空转（用户以为已受理，实际什么都没发生）。
+                    write_intent_fixes += 1
+                    if step < self._max_steps:
+                        METRICS.inc_counter("agent_write_intent_noop_total", {"action": "retry"})
+                        logger.warning("用户要求改动但本轮无任何写动作且未澄清，回填纠偏提示后重试（第 %d 步）", step)
+                        messages.append({"role": "user", "content": _WRITE_INTENT_HINT})
+                        continue
+                    METRICS.inc_counter("agent_write_intent_noop_total", {"action": "unresolved"})
+                    logger.warning("模型重复忽略用户的写指令，本轮未登记任何待确认写动作")
+                    final_text = _FALSE_COMPLETION_NOTICE
+                if pending:
+                    # 本回合登记过写操作：以服务端确定性摘要收尾，保证展示清单与真实登记项一致。
+                    # 注意只增量下发**摘要**：模型叙述若在生成过程中已逐字下发过，这里再带上就会重复。
+                    pending = _dedupe_pending(pending)
+                    summary = _describe_pending(pending)
+                    final_text = f"{final_text}\n\n{summary}" if final_text else summary
+                    METRICS.inc_counter("agent_runs_total", {"outcome": "pending_confirmation"})
+                    yield {"event": SSE_DELTA, "data": {"text": f"\n\n{summary}"}}
+                    yield {"event": SSE_PENDING, "data": {"actions": [item.model_dump() for item in pending]}}
+                else:
+                    METRICS.inc_counter("agent_runs_total", {"outcome": "completed"})
+                    if not final_text:
+                        # 既无工具调用也无文本：明确告知而不是返回空白，避免用户以为请求被吞
+                        METRICS.inc_counter("agent_runs_total", {"outcome": "empty_reply"})
+                        logger.warning(
+                            "Agent 收敛但未产出任何文本与工具调用（model=%s）", getattr(self._llm, "name", "?")
+                        )
+                        final_text = "模型本轮未产出可展示的内容，请重试或换一种说法描述你的需求。"
                 yield {
                     "event": SSE_RESULT,
                     "data": AgentRunResult(
-                        content=_content_to_text(message.get("content")),
+                        content=final_text,
                         planId=plan_id,
                         toolCalls=records,
                         steps=step,
+                        pendingActions=pending,
                     ),
                 }
                 return
@@ -475,27 +831,27 @@ class AgentRunner:
                 }
 
             if pending:
-                # 出现写操作：本轮到此为止，交由用户确认后再落库（不继续消耗模型步数）
+                # 已登记写操作：**不结束本回合**。用户可能一次提出多处改动，必须让模型有机会
+                # 把其余改动一并登记（早期实现在此处直接 return，导致「改责任人 + 改工时」这类
+                # 复合请求只登记第一条、其余被静默丢弃）。收敛判定统一交给「模型不再请求工具」。
                 pending = _dedupe_pending(pending)
-                METRICS.observe("agent_steps", step, buckets=(1, 2, 3, 4, 5, 6, 8), help="Agent 收敛步数")
-                METRICS.inc_counter("agent_runs_total", {"outcome": "pending_confirmation"})
-                narrative = _content_to_text(message.get("content")).strip()
-                summary = _describe_pending(pending)
-                # 待确认摘要由服务端确定性生成：以增量下发，保证前端文案与最终结果一致
-                yield {"event": SSE_DELTA, "data": {"text": f"{narrative}\n\n{summary}" if narrative else summary}}
-                yield {"event": SSE_PENDING, "data": {"actions": [item.model_dump() for item in pending]}}
-                yield {
-                    "event": SSE_RESULT,
-                    "data": AgentRunResult(
-                        content=f"{narrative}\n\n{summary}" if narrative else summary,
-                        planId=plan_id,
-                        toolCalls=records,
-                        steps=step,
-                        pendingActions=pending,
-                    ),
-                }
-                return
 
+        if pending:
+            # 未收敛但已登记变更：给出确认卡片比直接报错更有用（用户至少能核对并执行已识别部分）
+            METRICS.inc_counter("agent_runs_total", {"outcome": "pending_confirmation"})
+            summary = _describe_pending(pending)
+            yield {"event": SSE_PENDING, "data": {"actions": [item.model_dump() for item in pending]}}
+            yield {
+                "event": SSE_RESULT,
+                "data": AgentRunResult(
+                    content=summary,
+                    planId=plan_id,
+                    toolCalls=records,
+                    steps=self._max_steps,
+                    pendingActions=pending,
+                ),
+            }
+            return
         METRICS.inc_counter("agent_runs_total", {"outcome": "max_steps"})
         raise ApiError(
             422,
@@ -581,20 +937,34 @@ class AgentRunner:
             record, tool_message = self._error_result(call_id, name, arguments, "VALIDATION_ERROR", message)
             return record, tool_message, None, None
         if defer_writes and name in WRITE_TOOLS:
-            return self._register_pending(name, arguments)
+            return await self._register_pending(call_id, name, arguments)
         record, tool_message, plan_id = await self._execute(call_id, name, arguments)
         return record, tool_message, plan_id, None
 
-    @staticmethod
-    def _register_pending(
-        name: str, arguments: dict[str, Any]
-    ) -> tuple[ToolCallRecord, None, None, PendingAction]:
-        """把写类工具登记为待确认动作（不触碰引擎）。"""
+    async def _register_pending(
+        self, call_id: str, name: str, arguments: dict[str, Any]
+    ) -> tuple[ToolCallRecord, dict[str, Any] | None, str | None, PendingAction | None]:
+        """把写类工具登记为待确认动作（不落库，但先校验目标任务真实存在）。
+
+        为什么登记前要先查计划：``taskId`` 由模型生成，而模型对「第一个任务」这类指代只能靠
+        猜测，极易编造出一个不存在的 ID 或误用 ``task_add`` 新建同名任务。若放任其进入确认卡片，
+        用户看到的是「修改任务 1b29d7f4… 的 责任人 → pm-01」——既无法核对改的是哪个任务，
+        确认后还会以 404 失败。因此在登记阶段就查一次计划：目标不存在则把「计划现有任务」
+        回填给模型令其自纠；目标存在则把任务名写进卡片，让确认环节真正可核对。
+        """
+        label = describe_action(name, arguments)
+        if name in _TASK_TARGET_WRITE_TOOLS:
+            task_name, error = await self._resolve_task_target(arguments)
+            if error is not None:
+                record, tool_message = self._error_result(call_id, name, arguments, "NOT_FOUND", error)
+                return record, tool_message, None, None
+            if task_name:
+                label = describe_action(name, arguments, task_name=task_name)
         plan_ref = arguments.get("planId")
         action = PendingAction(
             actionId=f"act_{uuid.uuid4().hex[:12]}",
             tool=name,
-            label=describe_action(name, arguments),
+            label=label,
             arguments=arguments,
             planId=plan_ref if isinstance(plan_ref, str) and plan_ref else None,
         )
@@ -605,7 +975,49 @@ class AgentRunner:
             ok=True,
             result={"status": "PENDING_CONFIRMATION", "actionId": action.actionId},
         )
-        return record, None, None, action
+        # 回填一条**规范的 tool 结果**：OpenAI 协议要求每个 tool_call 都有对应的 tool 消息，
+        # 缺了它下一轮请求就是非法历史（部分网关会直接报错）；同时借这条消息提醒模型
+        # 「把本轮其余改动也一并登记」，避免复合请求只登记第一条。
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": _PENDING_TOOL_RESULT.format(label=label),
+        }
+        return record, tool_message, None, action
+
+    async def _resolve_task_target(self, arguments: dict[str, Any]) -> tuple[str | None, str | None]:
+        """校验 ``taskId`` 是否属于该计划，并返回任务名。
+
+        返回 ``(任务名 | None, 错误消息 | None)``：
+        - 找到任务 → ``(名称, None)``（名称为空串时仍视为找到）；
+        - 计划不存在 / 任务不在计划中 → ``(None, 可回填给模型的纠偏提示)``；
+        - 引擎暂时不可达 → ``(None, None)``：**不阻断**用户流程，退化为无名称的登记，
+          真实错误会在确认执行时暴露（此处仅计数与告警，符合「降级不阻断主链路」约定）。
+        """
+        plan_id = arguments.get("planId")
+        task_id = arguments.get("taskId")
+        if not isinstance(plan_id, str) or not plan_id or not isinstance(task_id, str) or not task_id:
+            return None, None  # 缺参由 `_REQUIRED` 校验先行拦截，这里无需重复报错
+        try:
+            tasks = await self._dispatcher.fetch_tasks(plan_id)
+        except ApiError as exc:
+            if exc.code == "NOT_FOUND" or exc.status_code == 404:
+                return None, f"计划 {plan_id} 不存在，请先调用 list_plans 确认正确的 planId。"
+            logger.warning("登记待确认写操作前查询计划 %s 失败，降级为无校验登记：%s", plan_id, exc.message)
+            METRICS.inc_counter(
+                "agent_pending_resolve_degraded_total",
+                {"reason": "engine_error"},
+                help="待确认写操作登记前的任务校验降级次数（引擎不可达时不阻断流程）",
+            )
+            return None, None
+        for task in tasks:
+            if str(task.get("taskId")) == task_id:
+                return str(task.get("taskName") or ""), None
+        return None, (
+            f"任务 {task_id} 不在计划 {plan_id} 中，未登记该操作。"
+            f"计划现有任务（名称/ID）：{_task_preview(tasks)}。"
+            "请先调用 get_plan 取得真实 taskId 后重试；若确实需要新建任务，请改用 task_add。"
+        )
 
     @staticmethod
     def _error_result(

@@ -12,6 +12,7 @@ from app.agent.tools import ToolDispatcher
 from app.engine_client import EngineClient
 from app.errors import ApiError, bad_request, unauthorized
 from app.main import derive_engine_ws_url
+from app.resilience import RetryPolicy
 
 
 @pytest.mark.parametrize(
@@ -164,6 +165,103 @@ async def test_llm_client_stream_surfaces_upstream_error():
         assert exc.value.code == "LLM_GATEWAY_ERROR"
     finally:
         await client.aclose()
+
+
+async def test_llm_client_stream_drops_whole_leaked_protocol_envelope():
+    """上游把 SSE 协议信封整块塞进 ``delta.content``：必须丢弃，且不得进入聚合正文。"""
+    leak = '{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant","content":null}}'
+    body = (
+        _sse({"choices": [{"delta": {"content": "已完成检索。"}}]})
+        + _sse({"choices": [{"delta": {"content": leak}}]})
+        + _sse({"choices": [{"delta": {"content": "请查看结果。"}}]})
+        + "data: [DONE]\n\n"
+    ).encode("utf-8")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    client = OpenAiCompatibleClient("http://llm.test/v1", "k", "demo", transport=httpx.MockTransport(handler))
+    try:
+        texts: list[str] = []
+        message: dict | None = None
+        async for chunk in client.chat_stream([{"role": "user", "content": "hi"}]):
+            if chunk["type"] == "content":
+                texts.append(chunk["text"])
+            else:
+                message = chunk["message"]
+    finally:
+        await client.aclose()
+
+    assert texts == ["已完成检索。", "请查看结果。"]
+    assert message is not None
+    assert message["content"] == "已完成检索。请查看结果。"
+
+
+async def test_llm_client_stream_truncates_split_leaked_protocol_envelope():
+    """协议信封被切分成多个分片时，聚合阶段仍须截断剥离（信封位于正文尾部）。"""
+    body = (
+        _sse({"choices": [{"delta": {"content": "参考"}}]})
+        + _sse({"choices": [{"delta": {"content": '{"index":0,"finish_reason":'}}]})
+        + _sse({"choices": [{"delta": {"content": '"tool_calls","delta":{"role":"assistant"}}'}}]})
+        + "data: [DONE]\n\n"
+    ).encode("utf-8")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    client = OpenAiCompatibleClient("http://llm.test/v1", "k", "demo", transport=httpx.MockTransport(handler))
+    try:
+        message: dict | None = None
+        async for chunk in client.chat_stream([{"role": "user", "content": "hi"}]):
+            if chunk["type"] == "message":
+                message = chunk["message"]
+    finally:
+        await client.aclose()
+
+    assert message is not None
+    assert message["content"] == "参考"
+
+
+async def test_llm_client_retries_upstream_500():
+    """上游 500（最常见的瞬时故障）必须重试：早期实现只重试 429/502/503/504，漏掉 500
+    会导致一次上游抖动就让整轮 Agent 编排失败。"""
+    attempts: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(500, json={"error": {"message": "internal"}})
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+    client = OpenAiCompatibleClient(
+        "http://llm.test/v1", "k", "demo", transport=httpx.MockTransport(handler), retry=RetryPolicy(attempts=2, base_delay=0.0)
+    )
+    try:
+        message = await client.chat([{"role": "user", "content": "hi"}])
+    finally:
+        await client.aclose()
+    assert len(attempts) == 2
+    assert message["content"] == "ok"
+
+
+async def test_llm_client_does_not_retry_4xx():
+    """4xx（请求本身有问题，如鉴权失败 / 参数非法）不得重试，必须立即失败。"""
+    attempts: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(401, json={"error": {"message": "bad key"}})
+
+    client = OpenAiCompatibleClient(
+        "http://llm.test/v1", "k", "demo", transport=httpx.MockTransport(handler), retry=RetryPolicy(attempts=3, base_delay=0.0)
+    )
+    try:
+        with pytest.raises(ApiError) as info:
+            await client.chat([{"role": "user", "content": "hi"}])
+    finally:
+        await client.aclose()
+    assert len(attempts) == 1
+    assert info.value.status_code == 502
 
 
 # ---------------------- 配置：向量化端点与密钥的绑定关系 ----------------------

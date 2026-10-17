@@ -158,7 +158,11 @@ class MemoryService:
         if not memories:
             METRICS.inc_counter("memory_recall_total", {"outcome": "miss"})
             return None, []
-        lines = ["以下是关于当前用户 / 项目的长期记忆（仅作背景参考，可能与当前请求无关）："]
+        lines = [
+            "以下是关于当前用户 / 项目的长期记忆（仅作背景参考，可能与当前请求无关）：",
+            "⚠️ 这些条目可能来自**其它计划或更早时间点**，不得据此回答当前计划的数值型状态"
+            "（工期 / 工时 / 关键路径 / 风险 / 人员负荷 / 质量指标等）；此类问题必须调用工具实时取得。",
+        ]
         for item in memories:
             lines.append(f"- [{item['type']}] {item['text']}")
         return "\n".join(lines), memories

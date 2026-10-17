@@ -55,18 +55,32 @@ TOOL_SPECS: list[dict[str, Any]] = [
         },
         ["planId"],
     ),
-    _fn("get_plan", "读取计划完整快照。", {"planId": {"type": "string"}}, ["planId"]),
-    _fn("list_plans", "列出全部计划摘要。", {}),
+    _fn(
+        "get_plan",
+        "读取计划完整快照（含 taskList：每个任务的 taskId / taskName / estimatedHours / "
+        "predecessorTaskIds / assignee 等）。**凡是要改动既有任务的场景，都必须先调用本工具取得真实 taskId**："
+        "用户用「第一个任务 / 某名称」指代时，按 taskList 顺序（即 DAG 拓扑序）定位对应 taskId，"
+        "严禁凭位置、名称或猜测编造 taskId。",
+        {"planId": {"type": "string"}},
+        ["planId"],
+    ),
+    _fn("list_plans", "列出全部计划摘要（用于确认 planId，不返回任务明细）。", {}),
     _fn(
         "task_add",
-        "新增任务并自动全量重规划。",
+        "**新增**一个任务并自动全量重规划。仅当用户明确要求「新增 / 增加 / 补充」任务时使用；"
+        "若用户是要修改或删除**既有**任务（如「把第一个任务的工时改成 12」），必须改用 task_update / "
+        "task_delete，并先 get_plan 取得真实 taskId——不要用本工具新建一个同名任务来「代替修改」。",
         {
             "planId": {"type": "string"},
             "taskName": {"type": "string"},
             "taskDesc": {"type": "string"},
             "taskType": {"type": "string", "enum": TASK_TYPE_VALUES},
             "estimatedHours": {"type": "number", "exclusiveMinimum": 0},
-            "predecessorTaskIds": {"type": "array", "items": {"type": "string"}},
+            "predecessorTaskIds": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "前置任务 ID 列表，必须是 get_plan 返回的真实 taskId",
+            },
             "status": {"type": "string", "enum": TASK_STATUS_VALUES},
             "priority": {"type": "string", "enum": PRIORITY_VALUES},
             "assignee": {"type": "string"},
@@ -75,18 +89,20 @@ TOOL_SPECS: list[dict[str, Any]] = [
     ),
     _fn(
         "task_update",
-        "修改任务单字段并自动全量重规划。",
+        "修改**既有**任务的单个字段并自动全量重规划。taskId 必须是 get_plan 返回的真实值；"
+        "调用前若不确定 taskId，先 get_plan（用户说的「第 N 个任务」对应 taskList 中的第 N 项）。"
+        "前置依赖字段名是 predecessorTaskIds（不是 dependencies）。",
         {
             "planId": {"type": "string"},
             "taskId": {"type": "string"},
             "updateField": {"type": "string", "enum": UPDATABLE_FIELDS},
-            "newValue": {"description": "新值；类型随 updateField 而定"},
+            "newValue": {"description": "新值；类型随 updateField 而定（枚举字段见 updateField 定义）"},
         },
         ["planId", "taskId", "updateField", "newValue"],
     ),
     _fn(
         "task_delete",
-        "删除任务并清理其它任务的依赖引用（自动重规划）。",
+        "删除**既有**任务并清理其它任务的依赖引用（自动重规划）。taskId 必须是 get_plan 返回的真实值。",
         {"planId": {"type": "string"}, "taskId": {"type": "string"}},
         ["planId", "taskId"],
     ),
@@ -159,8 +175,13 @@ def _short(value: object, limit: int = 36) -> str:
     return text if len(text) <= limit else f"{text[: limit - 1]}…"
 
 
-def describe_action(name: str, args: dict[str, Any]) -> str:
-    """把待确认的写操作翻译为一句人读描述（服务端确定性生成，不依赖模型输出）。"""
+def describe_action(name: str, args: dict[str, Any], *, task_name: str | None = None) -> str:
+    """把待确认的写操作翻译为一句人读描述（服务端确定性生成，不依赖模型输出）。
+
+    ``task_name`` 为已解析出的任务名（由 :class:`AgentRunner` 在登记前查计划取得）。
+    仅有 ``taskId`` 时确认卡片只能展示一串无意义的 ID，用户无法判断改的是哪个任务；
+    因此校验通过后一律同时展示「任务名 + ID」，让确认环节真正可核对。
+    """
     action = TOOL_ACTION_LABELS.get(name, name)
     plan_ref = _short(args.get("planId"), 24) or "当前计划"
     if name == "plan_iteration":
@@ -171,11 +192,14 @@ def describe_action(name: str, args: dict[str, Any]) -> str:
         return f"{action}：{plan_ref}{suffix}"
     if name == "task_add":
         return f"{action}「{_short(args.get('taskName'), 28)}」（计划 {plan_ref}）"
+    target = _short(args.get("taskId"), 20)
+    if task_name:
+        target = f"「{_short(task_name, 28)}」({target})"
     if name == "task_update":
         field = UPDATABLE_FIELD_LABELS_MAP.get(str(args.get("updateField") or ""), str(args.get("updateField") or ""))
-        return f"{action} {_short(args.get('taskId'), 20)} 的 {field} → {_short(args.get('newValue'), 22)}"
+        return f"{action} {target} 的 {field} → {_short(args.get('newValue'), 22)}"
     if name == "task_delete":
-        return f"{action} {_short(args.get('taskId'), 20)}（计划 {plan_ref}）"
+        return f"{action} {target}（计划 {plan_ref}）"
     return action
 
 

@@ -19,6 +19,11 @@ from ..resilience import RetryPolicy, is_retryable_exception
 
 logger = logging.getLogger("iteration_planner.llm")
 
+#: 可重试的上游状态码。LLM 补全是无状态调用（重试不会产生副作用），因此与主流客户端
+#: （openai-python 等的 ``_should_retry``）一致：429 限流 + **全部 5xx**（含 500——上游
+#: 内部错误是最常见的瞬时故障，早期实现漏掉 500 会导致一次抖动就整轮失败）。
+_RETRYABLE_LLM_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+
 
 class LlmClient(Protocol):
     """LLM 客户端协议（可替换为任意实现）。
@@ -149,6 +154,11 @@ class OpenAiCompatibleClient:
                 delta = choices[0].get("delta") or {}
                 text = delta.get("content")
                 if isinstance(text, str) and text:
+                    if _is_protocol_leak(text):
+                        # 上游偶发把 SSE 协议信封塞进 delta.content：既不是模型答复，也不能回灌历史
+                        METRICS.inc_counter("llm_protocol_leak_total")
+                        logger.warning("丢弃上游泄漏的 SSE 协议信封内容分片（%d 字符）", len(text))
+                        continue
                     content_parts.append(text)
                     yield {"type": "content", "text": text}
                 for fragment in delta.get("tool_calls") or []:
@@ -160,7 +170,12 @@ class OpenAiCompatibleClient:
         finally:
             await ctx.__aexit__(None, None, None)
 
-        message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
+        raw_content = "".join(content_parts)
+        content = strip_protocol_leak(raw_content)
+        if content != raw_content:
+            METRICS.inc_counter("llm_protocol_leak_total")
+            logger.warning("剥离正文中混入的 SSE 协议信封（%d → %d 字符）", len(raw_content), len(content))
+        message: dict[str, Any] = {"role": "assistant", "content": content}
         if tool_calls:
             message["tool_calls"] = [_finalize_tool_call(index, value) for index, value in sorted(tool_calls.items())]
         yield {"type": "message", "message": message}
@@ -181,7 +196,7 @@ class OpenAiCompatibleClient:
                 METRICS.inc_counter("llm_requests_total", {"outcome": "unreachable"})
                 raise llm_gateway_error(f"LLM 网关不可达：{exc}") from exc
 
-            if response.status_code in (429, 502, 503, 504) and retry_index < self._retry.attempts:
+            if response.status_code in _RETRYABLE_LLM_STATUS and retry_index < self._retry.attempts:
                 await response.aread()
                 await ctx.__aexit__(None, None, None)
                 METRICS.inc_counter("llm_requests_total", {"outcome": "retry_status"})
@@ -215,7 +230,7 @@ class OpenAiCompatibleClient:
                 raise llm_gateway_error(f"LLM 网关不可达：{exc}") from exc
 
             # 429（限流）与 5xx 属于可恢复的上游压力，允许重试
-            if response.status_code in (429, 502, 503, 504) and retry_index < self._retry.attempts:
+            if response.status_code in _RETRYABLE_LLM_STATUS and retry_index < self._retry.attempts:
                 METRICS.inc_counter("llm_requests_total", {"outcome": "retry_status"})
                 await asyncio.sleep(self._retry.delay_for(retry_index))
                 retry_index += 1
@@ -269,4 +284,36 @@ def _finalize_tool_call(index: int, value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["LlmClient", "OpenAiCompatibleClient"]
+def _is_protocol_leak(text: str) -> bool:
+    """判断一个 content 分片是否是上游误放的 SSE 协议信封（整块形态）。"""
+    return "finish_reason" in text and '"delta"' in text
+
+
+def strip_protocol_leak(text: str) -> str:
+    """剥离上游混入 ``content`` 的 SSE 协议信封，返回纯助手文本。
+
+    归一化流式实现偶发把**协议信封**当作助手文本下发，形如
+    ``{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant",...}}``。
+    这类字节既不是模型答复、也不能回灌进会话历史，且总是出现在正文尾部，
+    因此在聚合后统一截断剥离（用 ``json.raw_decode`` 定位信封起点，避免把信封前的
+    正常陈述一并丢弃）。编排层亦复用本函数作为不依赖具体客户端实现的最后防线。
+    """
+    if "finish_reason" not in text:
+        return text
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while True:
+        start = text.find('{"', cursor)
+        if start < 0:
+            return text
+        try:
+            obj, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            cursor = start + 2
+            continue
+        if isinstance(obj, dict) and "finish_reason" in obj and "delta" in obj:
+            return text[:start].rstrip()
+        cursor = start + 2
+
+
+__all__ = ["LlmClient", "OpenAiCompatibleClient", "strip_protocol_leak"]

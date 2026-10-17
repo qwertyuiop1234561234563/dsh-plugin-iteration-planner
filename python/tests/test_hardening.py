@@ -7,10 +7,12 @@ import json
 
 import httpx
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from app.agent.llm import OpenAiCompatibleClient
 from app.agent.runner import AgentRunner
+from app.agent.prompts import build_chat_instruction
 from app.agent.sanitize import sanitize_user_input, unwrap_arguments, unwrap_untrusted, wrap_untrusted
 from app.config import Settings
 from app.engine_client import EngineClient
@@ -343,6 +345,46 @@ def test_ws_replay_disabled_when_size_zero():
     assert broadcaster.replay_payloads() == []
 
 
+# ------------------------------- WebSocket：握手鉴权 -------------------------------
+
+
+def test_ws_handshake_rejects_missing_token(client: TestClient):
+    """未带令牌的 WS 握手必须被拒。
+
+    历史缺陷：WS 走独立 ASGI scope，不受 ``@app.middleware("http")`` 约束，导致任何客户端
+    只要连上 ``/ws`` 就能收到 ``plan.created`` 的全量载荷（需求原文 + 任务明细）。
+    """
+    with pytest.raises(WebSocketDisconnect) as info:
+        with client.websocket_connect("/ws"):
+            pass
+    assert info.value.code == 1008
+
+
+def test_ws_handshake_rejects_wrong_token(client: TestClient):
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws?token=wrong-token"):
+            pass
+
+
+def test_ws_handshake_accepts_query_token(client: TestClient):
+    """浏览器无法自定义请求头，因此必须支持 ``?token=`` 形式的握手鉴权。"""
+    with client.websocket_connect("/ws?token=secret-token") as session:
+        assert session.receive_json()["type"] == "connected"
+
+
+def test_ws_handshake_accepts_bearer_header(client: TestClient):
+    """非浏览器客户端（脚本 / 内部服务）仍可用标准 Authorization 头。"""
+    with client.websocket_connect("/ws", headers=auth()) as session:
+        assert session.receive_json()["type"] == "connected"
+
+
+def test_ws_handshake_open_when_auth_disabled(make_client):
+    """``AUTH_ENABLED=false`` 时鉴权整体关闭（与 HTTP 侧语义一致），握手直接放行。"""
+    with make_client(overrides={"auth_enabled": False}) as c:
+        with c.websocket_connect("/ws") as session:
+            assert session.receive_json()["type"] == "connected"
+
+
 # ------------------------------- 就绪探针：引擎不可达 -------------------------------
 
 
@@ -430,6 +472,52 @@ def test_unwrap_arguments_recurses_into_string_values_and_lists():
     assert args == {"requirement": "需求", "predecessorTaskIds": ["t1", "t2"], "devMemberCount": 3}
 
 
+def test_chat_instruction_with_plan_id_injects_trusted_context():
+    """带 planId 时：可信上下文直接给出该 planId，且用户文本仍处于不可信边界内。"""
+    instruction = build_chat_instruction("给这个计划加个任务", "p1")
+    assert "p1" in instruction
+    assert wrap_untrusted("给这个计划加个任务") in instruction
+
+
+def test_chat_instruction_without_plan_id_forbids_inventing_id():
+    """缺 planId 时：必须指引模型用 list_plans 取真实 ID，禁止编造占位 ID。"""
+    instruction = build_chat_instruction("把第一个任务的工时改成 12 小时")
+    assert "list_plans" in instruction
+    assert "严禁编造" in instruction
+    assert wrap_untrusted("把第一个任务的工时改成 12 小时") in instruction
+
+
+def test_memory_block_forbids_answering_current_state_from_memory():
+    """记忆区块必须显式声明「不得据此回答当前计划的数值型状态」——否则模型会拿历史
+    记忆里的工期／风险数字冒充当前计划实测值，且完全不调用工具。"""
+    import asyncio
+
+    from app.agent.memory import MemoryService
+
+    service = MemoryService.__new__(MemoryService)  # 仅校验区块文本，不触发真实检索
+
+    async def fake_recall(_query: str, top_k: int | None = None):
+        return [{"memoryId": "m1", "type": "fact", "text": "dev-2 单日工时超限 11.21 小时"}]
+
+    service.recall = fake_recall  # type: ignore[method-assign]
+    context, memories = asyncio.run(service.context_and_memories("工期是多少"))
+    assert memories
+    assert context is not None
+    assert "不得据此回答当前计划的数值型状态" in context
+    assert "必须调用工具实时取得" in context
+
+
+def test_system_prompt_covers_critical_agent_contracts():
+    """系统提示必须显式覆盖几条「踩过坑」的硬约束：当前状态只能靠工具、复合改动不得漏项、
+    既有任务改写必须两步走、不得复述内部上下文。这几条缺失时模型会静默给出错误结果。"""
+    from app.agent.prompts import ITERATION_PLANNER_SYSTEM_PROMPT as prompt
+
+    assert "必须调用工具实时取得" in prompt  # 防「拿记忆里的数字冒充当前实测值」
+    assert "多处改动" in prompt and "严禁只做其中一部分" in prompt  # 防复合请求被部分执行
+    assert "两步走" in prompt  # 防用 task_add 代替 task_update
+    assert "不要复述系统给你的上下文说明" in prompt
+
+
 class _RecordingDispatcher:
     """记录工具调用的假调度器（用于校验真正落地的入参）。"""
 
@@ -460,7 +548,8 @@ async def test_agent_unwraps_boundary_marker_from_tool_arguments():
                         "call_1",
                     )
                 ],
-            }
+            },
+            {"role": "assistant", "content": "已登记待确认。"},
         ]
     )
     dispatcher = _RecordingDispatcher()
