@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from ..errors import ApiError
+
+logger = logging.getLogger("iteration_planner.gateway")
 
 #: 逐跳首部：不应由代理层转发（content-length / content-encoding 由响应体重新计算，
 #: content-type 通过 media_type 单独设置以防重复）
@@ -79,10 +82,14 @@ async def _forward(ctx, request: Request, path: str) -> Response:
         )
     except ApiError as exc:  # 引擎不可达 / 熔断：返回标准错误信封（保持错误码语义）
         return JSONResponse(status_code=exc.status_code, content=exc.to_body())
-    except Exception as exc:  # noqa: BLE001 - 兜底，绝不抛出未捕获异常
+    except Exception:  # noqa: BLE001 - 兜底，绝不抛出未捕获异常
+        # 只回通用文案：``{exc}`` 可能带出引擎地址、连接串等内部细节，而这里是 catch-all
+        # 路由，任何未转换的异常都会走到这——最不该成为信息泄漏面。细节留在服务端日志，
+        # 调用方用响应头 ``X-Request-Id`` 关联排查。
+        logger.exception("转发引擎请求失败：%s %s", request.method, path)
         return JSONResponse(
             status_code=502,
-            content={"code": "ENGINE_UNAVAILABLE", "message": f"算法引擎不可达：{exc}"},
+            content={"code": "ENGINE_UNAVAILABLE", "message": "算法引擎暂不可达，请稍后重试"},
         )
 
     if upstream.status_code == 204 or not upstream.content:

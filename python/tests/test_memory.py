@@ -185,6 +185,35 @@ async def test_extract_disabled_without_llm(kb_store, stub_embedder):
     assert await service.extract("s1", "我们约定灰度发布", "收到") == []
 
 
+async def test_schedule_extract_consumes_unexpected_failure(kb_store, stub_embedder, monkeypatch):
+    """后台提取任务出现非 ``ApiError`` 异常时必须被回调**取走**并计入指标。
+
+    ``_propose`` 只把 ``ApiError`` 转成告警，其余异常会逃逸出任务；若回调只做
+    ``discard``（不读 ``task.exception()``），记忆写入会静默失败并让 asyncio 打印
+    ``Task exception was never retrieved``，既无指标也无法告警。
+    """
+    from app.agent import memory as memory_module
+    from app.metrics import Metrics
+
+    fresh = Metrics()
+    monkeypatch.setattr(memory_module, "METRICS", fresh)
+
+    service = memory_service(kb_store, stub_embedder, ScriptedLlm([]), extract_enabled=True)
+    service.schedule_extract("s1", "用户偏好先出协议再开发", "好的，已记录")
+    task = next(iter(service._tasks))
+    with pytest.raises(AssertionError):  # 脚本化 LLM 无响应可用 → 异常逃逸出 extract
+        await task
+
+    assert task not in service._tasks  # 回调已把任务移出集合并取走异常
+    assert 'iteration_planner_memory_extract_failed_total{reason="unexpected"}' in fresh.render()
+
+
+async def test_schedule_extract_is_skipped_when_disabled(kb_store, stub_embedder):
+    service = memory_service(kb_store, stub_embedder, None, extract_enabled=True)
+    service.schedule_extract("s1", "用户偏好先出协议", "好的")
+    assert service._tasks == set()
+
+
 # ============================ REST 契约 ============================
 
 

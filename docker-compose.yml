@@ -86,8 +86,13 @@ services:
       RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-auto}
       # 可信反代地址清单（逗号分隔 IP/CIDR）；仅在直连对端命中时才采信 X-Forwarded-For
       API_TRUSTED_PROXIES: ${API_TRUSTED_PROXIES:-}
+      # 请求体大小上限（字节，0 关闭）；超限即 413，须 ≥ KB_MAX_DOCUMENT_BYTES + multipart 开销
+      API_MAX_BODY_BYTES: ${API_MAX_BODY_BYTES:-33554432}
       API_WORKERS: ${API_WORKERS:-1}
       WS_REPLAY_SIZE: ${WS_REPLAY_SIZE:-20}
+      # 单客户端事件下发超时（秒，防慢客户端拖住扇出）与在线客户端上限（0 不限）
+      WS_SEND_TIMEOUT_SECONDS: ${WS_SEND_TIMEOUT_SECONDS:-5.0}
+      WS_MAX_CLIENTS: ${WS_MAX_CLIENTS:-512}
       # Agent 编排（LLM 三项齐全才启用 /api/agent/*）
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
@@ -103,10 +108,10 @@ services:
       CACHE_BACKEND: ${CACHE_BACKEND:-auto}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}
       CACHE_MAX_ENTRIES: ${CACHE_MAX_ENTRIES:-2048}
-      # 知识库（RAG）与长期记忆：留空 EMBEDDING_* 则回落 LLM_*（百炼同一端点兼做 embeddings）
+      # 知识库（RAG）与长期记忆：留空 EMBEDDING_* 则回落 LLM_*（智谱同一端点兼做 embeddings）
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v4}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-embedding-3}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
       VECTOR_STORE: ${VECTOR_STORE:-chroma}
       CHROMA_DIR: /app/.data/chroma
@@ -116,6 +121,8 @@ services:
       KB_HYBRID: ${KB_HYBRID:-true}
       KB_AUTO_INJECT: ${KB_AUTO_INJECT:-true}
       KB_INJECT_TOP_K: ${KB_INJECT_TOP_K:-3}
+      # 文档详情分块预览上限（chunkCount 仍为真实总数）
+      KB_DETAIL_PREVIEW_CHUNKS: ${KB_DETAIL_PREVIEW_CHUNKS:-50}
       MEMORY_ENABLED: ${MEMORY_ENABLED:-true}
       MEMORY_EXTRACT: ${MEMORY_EXTRACT:-true}
       MEMORY_TOP_K: ${MEMORY_TOP_K:-4}

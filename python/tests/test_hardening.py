@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -392,3 +393,222 @@ def test_wrap_untrusted_marks_boundary():
     wrapped = wrap_untrusted("原始需求")
     assert wrapped.startswith("以下为用户提供的原始需求文本")
     assert "<<<USER_INPUT\n原始需求\nUSER_INPUT>>>" in wrapped
+
+
+# ------------------------------- 安全：请求体大小上限 -------------------------------
+
+
+async def test_body_size_limit_rejects_declared_oversize_without_reading_body():
+    """已声明超限 ``content-length`` 时应直接回 413，**不读取**请求体。"""
+    from app.security import BodySizeLimitMiddleware
+
+    sent: list[dict] = []
+
+    async def app(_scope, _receive, send):  # pragma: no cover - 不应被调用
+        raise AssertionError("超限请求不应进入下游应用")
+
+    async def receive():  # pragma: no cover - 不应被调用
+        raise AssertionError("已声明超限长度时不应读取请求体")
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = BodySizeLimitMiddleware(app, max_bytes=1024)
+    scope = {"type": "http", "path": "/api/kb/documents", "headers": [(b"content-length", b"99999")]}
+    await middleware(scope, receive, send)
+
+    assert sent[0]["status"] == 413
+    body = json.loads(sent[1]["body"].decode())
+    assert body["code"] == "PAYLOAD_TOO_LARGE"
+    assert body["details"]["maxBodyBytes"] == 1024
+
+
+async def test_body_size_limit_aborts_oversized_chunked_read():
+    """未声明长度（chunked）时须在**读取过程中**中断，而不是读完再判断。
+
+    越界由中间件自有的哨兵异常触发并**就地**转成 413：请求体读取发生在 FastAPI 异常处理层
+    之外，若依赖 ``ApiError`` 处理器渲染就会冒泡成未捕获异常（实测如此）。
+    """
+    from app.security import BodySizeLimitMiddleware
+
+    reads = {"count": 0}
+    pending = [{"type": "http.request", "body": b"a" * 80, "more_body": True} for _ in range(3)]
+    sent: list[dict] = []
+
+    async def app(_scope, receive, _send):
+        while True:
+            message = await receive()
+            if not message.get("more_body"):
+                break
+
+    async def receive():
+        reads["count"] += 1
+        return pending.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = BodySizeLimitMiddleware(app, max_bytes=100)
+    await middleware({"type": "http", "path": "/api/plans", "headers": []}, receive, send)
+
+    assert reads["count"] == 2  # 仅读到越界的那一块：剩余分块未再读取，未读进内存
+    assert sent[0]["status"] == 413
+    body = json.loads(sent[1]["body"].decode())
+    assert body["code"] == "PAYLOAD_TOO_LARGE"
+    assert body["details"]["maxBodyBytes"] == 100
+
+
+def test_body_limit_allows_request_within_limit(make_client):
+    with make_client(overrides={"api_max_body_bytes": 4096}) as c:
+        response = c.post("/api/plans", json={"requirement": "订单中心 v2.1"}, headers=auth())
+        assert response.status_code == 201
+        assert response.json()["data"]["planId"] == "p1"
+
+
+def test_body_limit_rejects_oversized_request(make_client):
+    with make_client(overrides={"api_max_body_bytes": 1024}) as c:
+        response = c.post(
+            "/api/plans",
+            content=b"x" * 4096,
+            headers={**auth(), "content-type": "application/json"},
+        )
+        assert response.status_code == 413
+        assert response.json()["code"] == "PAYLOAD_TOO_LARGE"
+        # 413 同样带安全首部：证明安全首部中间件在请求体限制之外
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert 'iteration_planner_http_body_rejected_total{source="content_length"}' in c.get("/metrics").text
+
+
+def test_body_limit_rejects_oversized_chunked_request(make_client):
+    """未声明长度的请求体越界时，须由全局异常处理器转成标准 413 信封（而非裸 500）。
+
+    合成 ASGI 用例只验证了中间件本身；此处验证越界异常穿过真实中间件栈后，
+    仍会被 ``ApiError`` 处理器渲染成标准信封，且响应带安全首部与关联 ID。
+    """
+
+    def chunks():
+        for _ in range(4):
+            yield b"x" * 512  # 合计 2048 字节 > 1024 上限
+
+    with make_client(overrides={"api_max_body_bytes": 1024}) as c:
+        response = c.post(
+            "/api/plans",
+            content=chunks(),
+            headers={**auth(), "content-type": "application/json"},
+        )
+        assert response.status_code == 413
+        assert response.json()["code"] == "PAYLOAD_TOO_LARGE"
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["X-Request-Id"]
+        # 标记为 chunked 来源，证明走的是「读取中中断」分支而非 content-length 分支
+        assert 'iteration_planner_http_body_rejected_total{source="chunked"}' in c.get("/metrics").text
+
+
+def test_body_limit_disabled_allows_oversized_request(make_client):
+    with make_client(overrides={"api_max_body_bytes": 0}) as c:
+        response = c.post(
+            "/api/plans",
+            content=b"x" * 100_000,
+            headers={**auth(), "content-type": "application/json"},
+        )
+        assert response.status_code == 201
+
+
+# ------------------------------- 可观测：错误响应不回显内部异常 -------------------------------
+
+
+def test_unhandled_exception_masks_internal_details(settings: Settings):
+    """未处理异常只回稳定错误码 + 通用文案，避免把内部细节反射给调用方。"""
+    from fastapi.routing import APIRoute
+
+    app = create_app(settings, engine=None, llm=None, start_bridge=False)  # type: ignore[arg-type]
+
+    async def boom() -> dict:  # pragma: no cover - 仅用于触发 500
+        raise RuntimeError("__BOOM__ postgres://user:pass@db.internal:5432")
+
+    # 插到最前：catch-all 兜底路由会先匹配 ``/boom``，否则请求根本进不了该端点
+    app.router.routes.insert(0, APIRoute("/boom", boom, methods=["GET"]))
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        response = c.get("/boom", headers=auth())
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["code"] == "INTERNAL_ERROR"
+    # 异常文本可能带出上游响应 / 连接串等内部细节，绝不能回显给调用方
+    assert "__BOOM__" not in body["message"]
+    assert "postgres://" not in body["message"]
+    assert response.headers["X-Request-Id"]  # 调用方凭该 ID 与服务端日志关联排查
+
+
+def test_gateway_does_not_leak_internal_details_on_unexpected_error(settings: Settings):
+    """catch-all 转发路由的兜底分支同样不得回显异常文本（它是最易成为泄漏面的位置）。"""
+
+    def boom(_request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("__BOOM__ http://engine.internal:8080/internal")
+
+    engine = EngineClient(
+        "http://engine.test",
+        "/api",
+        5.0,
+        transport=httpx.MockTransport(boom),
+        retry=RetryPolicy(attempts=0),
+    )
+    app = create_app(settings, engine=engine, llm=None, start_bridge=False)
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        response = c.get("/api/plans", headers=auth())
+
+    assert response.status_code == 502
+    body = response.json()
+    assert body["code"] == "ENGINE_UNAVAILABLE"
+    assert "__BOOM__" not in body["message"]
+    assert "engine.internal" not in body["message"]
+
+
+def test_sse_error_event_masks_internal_details(make_client):
+    llm = ScriptedLlm([{"role": "assistant", "content": "ok"}])
+    with make_client(llm=llm) as c:
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("__BOOM__ 内部细节")
+            yield  # pragma: no cover - 使该函数成为异步生成器
+
+        c.app.state.ctx.runner.run_chat_stream = boom
+        response = c.post("/api/agent/chat/stream", json={"message": "你好"}, headers=auth())
+
+        assert response.status_code == 200  # 流已建立，错误只能以事件送达
+        assert "event: error" in response.text
+        assert "INTERNAL_ERROR" in response.text
+        assert "__BOOM__" not in response.text
+
+
+# ------------------------------- 安全：会话 ID 白名单 -------------------------------
+
+
+def test_illegal_session_id_rejected_by_validation(make_client):
+    llm = ScriptedLlm([{"role": "assistant", "content": "ok"}])
+    with make_client(llm=llm) as c:
+        chat = c.post("/api/agent/chat", json={"message": "你好", "sessionId": "bad id!"}, headers=auth())
+        assert chat.status_code == 400
+        assert chat.json()["code"] == "VALIDATION_ERROR"
+        confirm = c.post(
+            "/api/agent/confirm",
+            json={"sessionId": "bad$id", "actionIds": ["a1"]},
+            headers=auth(),
+        )
+        assert confirm.status_code == 400
+
+
+def test_reset_session_masks_illegal_and_unknown_ids(make_client):
+    """非法 ID 与不存在的 ID 同构回报 404，避免把「格式探测」与「是否存在」区分开。"""
+    llm = ScriptedLlm([{"role": "assistant", "content": "ok"}])
+    with make_client(llm=llm) as c:
+        assert c.delete("/api/agent/sessions/bad$id", headers=auth()).status_code == 404
+        assert c.delete("/api/agent/sessions/deadbeef", headers=auth()).status_code == 404
+
+        created = c.post("/api/agent/chat", json={"message": "你好"}, headers=auth()).json()["data"]["sessionId"]
+        cleared = c.delete(f"/api/agent/sessions/{created}", headers=auth())
+        assert cleared.status_code == 200
+        assert cleared.json()["data"]["cleared"] is True
+        assert c.delete(f"/api/agent/sessions/{created}", headers=auth()).status_code == 404

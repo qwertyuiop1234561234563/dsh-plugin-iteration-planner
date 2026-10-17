@@ -2,11 +2,11 @@
 
 设计要点（对齐项目既有 LLM 网关的工程口径）：
 
-- **协议化**：``Embedder`` 为 ``Protocol``，生产用 :class:`BailianEmbedder`，
+- **协议化**：``Embedder`` 为 ``Protocol``，生产用 :class:`OpenAiEmbedder`，
   测试可注入桩实现（不触网、可复现）；
 - **OpenAI 兼容**：调用 ``POST {base}/embeddings``，请求体 ``{model, input, dimensions}``，
-  与阿里云百炼「兼容模式」一致（``text-embedding-v4``）；
-- **分批**：百炼单次请求文本条数较少，按 ``batch_size``（默认 10）分批，避免 400；
+  与智谱 GLM「OpenAI 兼容」端点一致（``embedding-3``，维度 256–2048 可自定义）；
+- **分批**：embedding-3 单次请求最多 64 条文本，按 ``batch_size``（默认 10）分批，避免 400；
 - **韧性**：连接失败 / 429 / 5xx 指数退避重试，其余 4xx 立即失败（不放大错误）；
 - **可观测**：按结果埋点 ``embedding_requests_total``，并统计耗时直方图。
 """
@@ -44,8 +44,8 @@ class Embedder(Protocol):
         ...
 
 
-class BailianEmbedder:
-    """阿里云百炼（OpenAI 兼容）向量化客户端。"""
+class OpenAiEmbedder:
+    """OpenAI 兼容向量化客户端（默认对接智谱 ``embedding-3``）。"""
 
     def __init__(
         self,
@@ -62,10 +62,10 @@ class BailianEmbedder:
         max_keepalive_connections: int = 10,
         retry: RetryPolicy | None = None,
     ) -> None:
-        self.name = f"bailian-embedding:{model}"
+        self.name = f"openai-embedding:{model}"
         self.dimensions = max(1, dimensions)
         self._model = model
-        self._batch_size = max(1, min(batch_size, 25))
+        self._batch_size = max(1, min(batch_size, 64))
         self._retry = retry or RetryPolicy()
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
@@ -95,9 +95,8 @@ class BailianEmbedder:
         payload: dict[str, Any] = {
             "model": self._model,
             "input": batch,
-            "encoding_format": "float",
         }
-        # 部分模型（如 text-embedding-v3/v4）支持显式指定输出维度
+        # embedding-3 支持显式指定输出维度（256–2048），按配置下发；不指定则用模型默认维度
         if self.dimensions:
             payload["dimensions"] = self.dimensions
 
@@ -264,4 +263,4 @@ class CachedEmbedder:
             task.exception()
 
 
-__all__ = ["Embedder", "BailianEmbedder", "CachedEmbedder"]
+__all__ = ["Embedder", "OpenAiEmbedder", "CachedEmbedder"]

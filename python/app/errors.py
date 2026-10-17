@@ -11,7 +11,8 @@
 Python 对外服务扩展错误码：``ENGINE_UNAVAILABLE``(502) / ``ENGINE_CIRCUIT_OPEN``(503) /
 ``LLM_UNAVAILABLE``(503) / ``LLM_GATEWAY_ERROR``(502) / ``EMBEDDING_UNAVAILABLE``(503) /
 ``VECTOR_STORE_UNAVAILABLE``(503) / ``SESSION_STORE_UNAVAILABLE``(503) / ``SESSION_BUSY``(409) /
-``RATE_LIMITED``(429) / ``SERVICE_UNAVAILABLE``(503) / ``AGENT_MAX_STEPS``(422) / ``INTERNAL_ERROR``(500)。
+``RATE_LIMITED``(429) / ``PAYLOAD_TOO_LARGE``(413) / ``SERVICE_UNAVAILABLE``(503) /
+``AGENT_MAX_STEPS``(422) / ``INTERNAL_ERROR``(500)。
 """
 
 from __future__ import annotations
@@ -109,6 +110,16 @@ def rate_limited(message: str = "请求过于频繁，请稍后重试", retry_af
 def service_unavailable(message: str = "服务尚未就绪") -> ApiError:
     """就绪探针未通过 / 正在优雅关机。"""
     return ApiError(503, "SERVICE_UNAVAILABLE", message)
+
+
+def payload_too_large(message: str, details: Any | None = None) -> ApiError:
+    """请求体超过服务端上限。
+
+    由 :class:`app.security.BodySizeLimitMiddleware` 在**读取请求体之前/期间**抛出：
+    未做限制时，一个超大 body（尤其是文件上传）会被整体读进内存，足以打爆进程，
+    而限流按「请求数/分钟」计量，防不住这一维度。
+    """
+    return ApiError(413, "PAYLOAD_TOO_LARGE", message, details)
 
 
 def session_store_unavailable(message: str, details: Any | None = None) -> ApiError:

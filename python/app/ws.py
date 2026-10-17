@@ -17,49 +17,112 @@ from typing import Any
 
 import websockets
 
+from .metrics import METRICS
+
 logger = logging.getLogger("iteration_planner.ws")
 
 
 class WsBroadcaster:
-    """前端 WebSocket 连接管理与广播（含断线重连事件重放缓冲）。"""
+    """前端 WebSocket 连接管理与广播（含断线重连事件重放缓冲）。
 
-    def __init__(self, replay_size: int = 0) -> None:
-        self._clients: set[Any] = set()
+    并发要点（压测下暴露的真实问题）：
+
+    - **扇出必须并发**：早期实现是「逐个 ``await send``」，一个不读数据的客户端（TCP 接收
+      窗口写满）会把整个循环卡住——其余客户端全部延迟，且引擎事件桥的 ``async for`` 也停在
+      ``_relay`` 上，进而对引擎连接形成反压（读不动引擎 socket）。现在改为 ``asyncio.gather``
+      并发下发，单个慢连接只影响它自己；
+    - **同一连接串行发送**：每客户端一把 :class:`asyncio.Lock`。心跳重放（端点内 ``send``）
+      与广播可能并发触碰同一 socket，而 Starlette 的 ``send_text`` 对并发调用无保护，
+      帧可能交错损坏；
+    - **慢客户端兜底**：单条事件下发超过 ``send_timeout`` 即判定该连接不可用并断开，
+      避免其长期占用扇出槽位；
+    - **连接数上限**：超过 ``max_clients`` 的新连接以 ``1013``（服务端暂不可用）拒绝，
+      防止连接数无界增长。
+    """
+
+    def __init__(
+        self,
+        replay_size: int = 0,
+        *,
+        send_timeout: float = 5.0,
+        max_clients: int = 0,
+    ) -> None:
+        #: 客户端 → 发送锁（保证同一连接上的帧串行下发，不交错）
+        self._clients: dict[Any, asyncio.Lock] = {}
         #: 最近 N 条已广播事件，供新连接补齐断线期间遗漏的变更
         self._replay: deque[dict[str, Any]] = deque(maxlen=max(0, replay_size))
+        self._send_timeout = max(0.0, send_timeout)
+        self._max_clients = max(0, max_clients)
 
     @property
     def size(self) -> int:
         return len(self._clients)
 
-    async def connect(self, websocket: Any) -> None:
+    @property
+    def max_clients(self) -> int:
+        return self._max_clients
+
+    async def connect(self, websocket: Any) -> bool:
+        """接入客户端；超过上限时拒绝并返回 ``False``（调用方应直接结束处理）。"""
         await websocket.accept()
-        self._clients.add(websocket)
+        if self._max_clients and len(self._clients) >= self._max_clients:
+            METRICS.inc_counter("ws_connections_total", {"outcome": "rejected"})
+            logger.warning("WebSocket 连接数已达上限 %d，拒绝新连接", self._max_clients)
+            with contextlib.suppress(Exception):
+                await websocket.close(code=1013, reason="连接数已达上限，请稍后重试")
+            return False
+        self._clients[websocket] = asyncio.Lock()
+        METRICS.inc_counter("ws_connections_total", {"outcome": "accepted"})
+        return True
 
     def disconnect(self, websocket: Any) -> None:
-        self._clients.discard(websocket)
+        self._clients.pop(websocket, None)
 
     def replay_payloads(self) -> list[dict[str, Any]]:
         """返回重放缓冲中的事件快照（断线重连时下发）。"""
         return list(self._replay)
 
     async def send(self, websocket: Any, payload: dict[str, Any]) -> None:
-        await websocket.send_text(json.dumps(payload, ensure_ascii=False, default=str))
+        """向单个客户端下发（经该连接的发送锁串行化，避免与广播并发写同一 socket）。"""
+        lock = self._clients.get(websocket)
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+        if lock is None:  # 未登记的连接（如拒绝后的收尾下发）：直接发，不做加锁
+            await websocket.send_text(text)
+            return
+        async with lock:
+            await websocket.send_text(text)
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
-        """向全部客户端推送；单个客户端异常不影响其它客户端。"""
+        """向全部客户端**并发**推送；单个客户端异常 / 超时不影响其它客户端。"""
         self._replay.append(payload)
-        if not self._clients:
+        clients = list(self._clients.items())
+        if not clients:
             return
         text = json.dumps(payload, ensure_ascii=False, default=str)
-        dead: list[Any] = []
-        for websocket in list(self._clients):
-            try:
-                await websocket.send_text(text)
-            except Exception:  # noqa: BLE001 - 连接已断开等，清理即可
-                dead.append(websocket)
-        for websocket in dead:
-            self.disconnect(websocket)
+        results = await asyncio.gather(
+            *(self._deliver(websocket, lock, text) for websocket, lock in clients)
+        )
+        for websocket, ok in zip((item[0] for item in clients), results):
+            if not ok:
+                self.disconnect(websocket)
+
+    async def _deliver(self, websocket: Any, lock: asyncio.Lock, text: str) -> bool:
+        """下发一条事件；返回 ``False`` 表示该连接应被清理（已断开或超时）。"""
+        try:
+            async with lock:
+                if self._send_timeout:
+                    await asyncio.wait_for(websocket.send_text(text), timeout=self._send_timeout)
+                else:
+                    await websocket.send_text(text)
+        except asyncio.TimeoutError:
+            METRICS.inc_counter("ws_broadcast_total", {"outcome": "timeout"})
+            logger.warning("客户端下发超时（%.1fs），断开该慢连接", self._send_timeout)
+            return False
+        except Exception:  # noqa: BLE001 - 连接已断开等，清理即可
+            METRICS.inc_counter("ws_broadcast_total", {"outcome": "failed"})
+            return False
+        METRICS.inc_counter("ws_broadcast_total", {"outcome": "delivered"})
+        return True
 
 
 class EngineEventBridge:

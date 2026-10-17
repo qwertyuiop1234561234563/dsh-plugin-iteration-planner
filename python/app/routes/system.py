@@ -109,7 +109,9 @@ def register_system_routes(app: FastAPI) -> None:
     async def ws_endpoint(websocket: WebSocket) -> None:
         ctx: AppContext = websocket.app.state.ctx
         broadcaster = ctx.broadcaster
-        await broadcaster.connect(websocket)
+        # 连接数达上限时 connect() 已按 1013 关闭连接，此处不得再下发任何消息
+        if not await broadcaster.connect(websocket):
+            return
         try:
             await broadcaster.send(websocket, {"type": "connected", "at": datetime.now(timezone.utc).isoformat()})
             # 断线重连补偿：补发缓冲中的最近事件，避免客户端漏掉断线期间的变更

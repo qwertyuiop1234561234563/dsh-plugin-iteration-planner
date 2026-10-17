@@ -37,7 +37,7 @@ from .config import Settings, get_settings
 from .constants import KB_COLLECTION, MEMORY_COLLECTION, default_chroma_dir, default_store_path
 from .engine_client import EngineClient
 from .errors import ApiError, bad_request, internal, rate_limited, unauthorized
-from .kb import BailianEmbedder, CachedEmbedder, ChromaVectorStore, Embedder, build_knowledge_base
+from .kb import CachedEmbedder, ChromaVectorStore, Embedder, OpenAiEmbedder, build_knowledge_base
 from .logging_config import configure_logging, request_id_var
 from .metrics import METRICS
 from .resilience import CircuitBreaker, RetryPolicy
@@ -50,6 +50,7 @@ from .routes.system import register_system_routes
 from .routes.workspace import build_workspace_router
 from .security import (
     SECURITY_HEADERS,
+    BodySizeLimitMiddleware,
     RateLimitBackend,
     build_rate_limiter,
     client_ip,
@@ -127,7 +128,7 @@ def create_app(
     #: 只释放自己创建的向量化客户端：注入的实现（测试桩）由调用方负责关闭
     owns_embedder = embedder is None
     if resolved_embedder is None and settings.embedding_enabled:
-        resolved_embedder = BailianEmbedder(
+        resolved_embedder = OpenAiEmbedder(
             settings.resolved_embedding_base_url,
             settings.resolved_embedding_api_key,
             settings.embedding_model,
@@ -172,6 +173,7 @@ def create_app(
                 rrf_k=settings.kb_rrf_k,
                 max_document_bytes=settings.kb_max_document_bytes,
                 max_documents=settings.kb_max_documents,
+                detail_preview_chunks=settings.kb_detail_preview_chunks,
             )
             if settings.memory_enabled:
                 memory = MemoryService(
@@ -210,7 +212,11 @@ def create_app(
         kb_inject_top_k=settings.kb_inject_top_k,
         memory_top_k=settings.memory_top_k,
     )
-    broadcaster = WsBroadcaster(replay_size=settings.ws_replay_size)
+    broadcaster = WsBroadcaster(
+        replay_size=settings.ws_replay_size,
+        send_timeout=settings.ws_send_timeout_seconds,
+        max_clients=settings.ws_max_clients,
+    )
     bridge = EngineEventBridge(derive_engine_ws_url(settings.engine_base_url, settings.api_ws_path), broadcaster)
     limiter = build_rate_limiter(
         per_minute=settings.api_rate_limit_per_minute,
@@ -271,7 +277,11 @@ def create_app(
     )
 
     # 注册顺序：先注册的在内层，后注册的在外层（Starlette 语义），CORS 需最外层。
+    # 最终栈（外→内）：cors → observability → security_headers → rate_limit → body_limit → auth，
+    # 因此 413（超限请求体）同样带安全首部、被访问日志与 http_requests_total 覆盖，
+    # 且超限请求先计入限流配额，再被请求体检查拦下。
     _register_auth(app, settings)
+    _register_body_limit(app, settings)
     _register_rate_limit(app, settings, limiter)
     _register_security_headers(app, settings)
     _register_observability(app)
@@ -376,6 +386,20 @@ def _register_rate_limit(app: FastAPI, settings: Settings, limiter: RateLimitBac
         return await call_next(request)
 
 
+def _register_body_limit(app: FastAPI, settings: Settings) -> None:
+    """请求体大小上限（``API_MAX_BODY_BYTES``；``<= 0`` 关闭）。
+
+    使用**纯 ASGI** 中间件而非 ``@app.middleware("http")``：只有直接包装 ``receive``
+    才能在读取过程中中断超大请求体，避免把整个 body 读进内存（详见
+    :class:`app.security.BodySizeLimitMiddleware`）。
+    """
+    limit = settings.api_max_body_bytes
+    if limit <= 0:
+        logger.warning("请求体大小限制已关闭（API_MAX_BODY_BYTES=%s），超大 body 将不再被拦截", limit)
+        return
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=limit)
+
+
 def _register_security_headers(app: FastAPI, settings: Settings) -> None:
     """为所有响应注入安全首部（含错误与限流响应）。"""
 
@@ -394,6 +418,10 @@ def _register_observability(app: FastAPI) -> None:
     @app.middleware("http")
     async def observability_middleware(request: Request, call_next):
         request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+        #: 落进 scope（而非仅 contextvar）：未处理异常由最外层的 ServerErrorMiddleware
+        #: 兜底，其处理器拿到的是同一个 scope 上的新 Request 对象，只有 scope 里的值还在，
+        #: 500 响应才能带上 ``X-Request-Id`` 供调用方关联服务端日志。
+        request.state.request_id = request_id
         token = request_id_var.set(request_id)
         started = time.perf_counter()
         try:
@@ -456,8 +484,14 @@ def _register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(status_code=400, content=bad_request("请求入参校验失败", issues).to_body())
 
     @app.exception_handler(Exception)
-    async def handle_unexpected(_request: Request, exc: Exception) -> JSONResponse:
-        return JSONResponse(status_code=500, content=internal(f"服务内部错误：{exc}").to_body())
+    async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
+        # 只回稳定错误码与通用文案：异常文本可能带出上游响应、文件路径、驱动细节，
+        # 回显给调用方等同信息泄漏。traceback 由 observability 中间件记录；本处理器运行在
+        # 最外层 ServerErrorMiddleware 中（它已越过各中间件），因此需自行补上关联 ID 首部。
+        logger.debug("未处理异常以通用文案返回（%s）：%s", type(exc).__name__, exc)
+        request_id = getattr(request.state, "request_id", "")
+        headers = {"X-Request-Id": request_id} if request_id else None
+        return JSONResponse(status_code=500, content=internal().to_body(), headers=headers)
 
 
 # 模块导入时安装 JSON 日志（若宿主已配置日志处理器则保持不动）

@@ -11,7 +11,8 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 _ISO_DATE = r"^\d{4}-\d{2}-\d{2}$"
-#: 计划 ID 字符集（引擎生成 UUID）；限制字符集可避免 ID 被拼进上游 URL 时产生路径穿越
+#: 标识符字符集（计划 ID / 会话 ID：引擎与服务端均生成 UUID，仅接受字母数字与 ``-`` / ``_``）。
+#: 限制字符集可避免 ID 被拼进上游 URL 时产生路径穿越，也避免任意形态的键污染会话存储。
 _ID = r"^[A-Za-z0-9_-]{1,128}$"
 
 
@@ -28,7 +29,11 @@ class AgentChatRequest(BaseModel):
     """会话式对话（携带上下文，可多轮修改计划）。"""
 
     message: str = Field(min_length=1, max_length=20_000, description="用户消息")
-    sessionId: str | None = Field(default=None, max_length=128, description="会话 ID；缺省则新建会话")
+    sessionId: str | None = Field(
+        default=None,
+        pattern=_ID,
+        description="会话 ID；缺省则新建会话（服务端下发 uuid4().hex，原样回传）",
+    )
     planId: str | None = Field(
         default=None,
         max_length=64,
@@ -87,7 +92,7 @@ class AgentChatResponse(AgentRunResult):
 class AgentConfirmRequest(BaseModel):
     """确认（或驳回）待确认的写操作。"""
 
-    sessionId: str = Field(min_length=1, max_length=128, description="会话 ID")
+    sessionId: str = Field(min_length=1, max_length=128, pattern=_ID, description="会话 ID")
     actionIds: list[str] | None = Field(
         default=None,
         max_length=50,

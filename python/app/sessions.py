@@ -85,9 +85,16 @@ class SessionStore(Protocol):
 class InMemorySessionStore:
     """进程内存会话存储（LRU + TTL + 会话级锁）。"""
 
-    def __init__(self, *, max_sessions: int = 200, ttl_seconds: int = 3600) -> None:
+    def __init__(
+        self,
+        *,
+        max_sessions: int = 200,
+        ttl_seconds: int = 3600,
+        max_locks: int = 1024,
+    ) -> None:
         self._max_sessions = max(1, max_sessions)
         self._ttl = ttl_seconds
+        self._max_locks = max(16, max_locks)
         self._sessions: OrderedDict[str, tuple[list[dict[str, Any]], float]] = OrderedDict()
         #: 待确认写操作（与历史分开存放：它不是消息，不能污染送入模型的上下文）
         self._pending: OrderedDict[str, tuple[list[dict[str, Any]], float]] = OrderedDict()
@@ -135,13 +142,31 @@ class InMemorySessionStore:
             self._pending.popitem(last=False)
 
     async def pop(self, session_id: str) -> bool:
-        self._locks.pop(session_id, None)
+        self._drop_lock(session_id)
         self._pending.pop(session_id, None)
         return self._sessions.pop(session_id, None) is not None
+
+    def _drop_lock(self, session_id: str) -> None:
+        """回收会话锁登记项——**仅在无人持有/等待时**。
+
+        早期实现无条件 ``self._locks.pop(session_id)``：若此时该锁正被另一请求持有（或有人
+        在等），下一次 :meth:`lock` 会为同一 session 新建**另一把**锁，两个请求随即同时进入
+        临界区——互斥被静默打破，历史被并发覆盖（``DELETE /agent/sessions/{id}`` 与
+        ``POST /agent/chat`` 并发时即可触发）。这里改为「锁空闲才回收」，空闲意味着既无持有者
+        也无等待者（有等待者时 ``locked()`` 必为真）。
+        """
+        lock = self._locks.get(session_id)
+        if lock is not None and not lock.locked():
+            self._locks.pop(session_id, None)
 
     def lock(self, session_id: str) -> asyncio.Lock:
         lock = self._locks.get(session_id)
         if lock is None:
+            if len(self._locks) >= self._max_locks:
+                # 有界回收：仅清理「未被持有」的条目，避免长跑进程 / 大量不同会话时
+                # 锁登记表无界增长（Redis 实现已有同样的上限，此处对齐）
+                for key in [sid for sid, item in self._locks.items() if not item.locked()]:
+                    self._locks.pop(key, None)
             lock = asyncio.Lock()
             self._locks[session_id] = lock
         return lock

@@ -209,7 +209,28 @@ class MemoryService:
             return
         task = loop.create_task(self.extract(session_id, user_message, assistant_message))
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._on_extract_done)
+
+    def _on_extract_done(self, task: asyncio.Task[Any]) -> None:
+        """消费后台任务的结果。
+
+        后台任务**必须**在这里把异常取走：``extract`` 只把 ``ApiError`` 转成告警，向量库
+        / IO 层的意外异常会逃逸出任务；若回调只做 ``discard``（不读 ``exception()``），
+        记忆写入会静默失败并让 asyncio 打印 ``Task exception was never retrieved``，
+        既不产出指标也无法告警。
+        """
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        METRICS.inc_counter(
+            "memory_extract_failed_total",
+            {"reason": "unexpected"},
+            help="后台记忆提取出现未预期异常的次数（>0 说明该轮记忆未落库）",
+        )
+        logger.warning("后台记忆提取出现未预期异常，该轮记忆未写入：%s", error)
 
     async def _propose(self, user_message: str, assistant_message: str) -> list[dict[str, Any]]:
         """调用 LLM 抽取候选记忆，失败返回空列表（不影响主链路）。"""

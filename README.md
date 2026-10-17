@@ -457,15 +457,18 @@ docker compose up -d --build
 | `DATABASE_URL` | — | PostgreSQL 连接串（优先于离散 `PG*` 参数） |
 | `WEB_STATIC_DIR` | 空 | 前端产物目录；存在则同域托管 SPA |
 | `PLANNER_FALLBACK_TO_RULE` | `true` | LLM 输出异常时是否降级规则实现 |
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 空 | OpenAI 兼容网关；三项齐全才启用 LLM 主路径。阿里云百炼示例：`https://dashscope.aliyuncs.com/compatible-mode/v1` + `qwen-plus` |
-| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | 空 / 空 / `text-embedding-v4` | 向量化网关；端点与密钥留空则回落 `LLM_BASE_URL` / `LLM_API_KEY`（百炼同一端点兼做 embeddings） |
-| `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE` | `1024` / `10` | 向量维度（v4 支持 2048…64）/ 单次请求条数 |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 空 | OpenAI 兼容网关；三项齐全才启用 LLM 主路径。智谱 GLM 示例：`https://open.bigmodel.cn/api/paas/v4` + `glm-4.7-flash`（**长期免费**，支持流式输出与 Function Calling） |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` | 空 / 空 / `embedding-3` | 向量化网关；端点与密钥留空则回落 `LLM_BASE_URL` / `LLM_API_KEY`（智谱同一端点兼做 embeddings） |
+| `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE` | `1024` / `10` | 向量维度（embedding-3 支持 256–2048）/ 单次请求条数（上限 64） |
 | `VECTOR_STORE` / `CHROMA_DIR` | `chroma` / 空 | 向量库驱动 / 持久化目录（留空用 `python/.data/chroma`，已 gitignore） |
 | `KB_CHUNK_SIZE` / `KB_CHUNK_OVERLAP` / `KB_TOP_K` | `800` / `120` / `4` | 分块字符数 / 重叠字符数 / 默认召回条数 |
 | `KB_HYBRID` / `KB_RRF_K` / `KB_AUTO_INJECT` / `KB_INJECT_TOP_K` | `true` / `60` / `true` / `3` | 混合检索开关 / RRF 平滑常数 / 对话自动注入开关 / 注入条数 |
 | `KB_MAX_DOCUMENT_BYTES` / `KB_MAX_DOCUMENTS` | `20971520` / `500` | 单文档体积上限 / 文档总数上限 |
 | `MEMORY_ENABLED` / `MEMORY_EXTRACT` / `MEMORY_TOP_K` | `true` / `true` / `4` | 记忆总开关 / 自动提取开关 / 每轮注入条数 |
 | `MEMORY_DEDUP_THRESHOLD` / `MEMORY_MAX_ITEMS` | `0.92` / `2000` | 去重相似度阈值 / 记忆总量上限 |
+| `API_MAX_BODY_BYTES` | `33554432` | 请求体大小上限（字节，`0` 关闭）；超限即 413 `PAYLOAD_TOO_LARGE`，须 ≥ `KB_MAX_DOCUMENT_BYTES` + multipart 开销 |
+| `KB_DETAIL_PREVIEW_CHUNKS` | `50` | 文档详情返回的分块**预览**条数上限（`chunkCount` 始终为真实总数）；超大文档分块上万，全量返回会让单次响应达数十 MB |
+| `WS_SEND_TIMEOUT_SECONDS` / `WS_MAX_CLIENTS` | `5.0` / `512` | 单客户端单条事件下发超时（秒，超时即断开该连接）/ 在线客户端上限（`0` 不限，超出以 close code `1013` 拒绝）；扇出为并发下发，慢客户端不会拖住其余客户端 |
 
 ### 10.6 开放 API 一览
 
@@ -517,7 +520,7 @@ docker compose up -d --build
 |---|---|---|
 | 对外网关（Python） | [`python/app/routes/proxy.py`](./python/app/routes/proxy.py) | `/api/**` 原样透传（信封 / 状态码 / 导出文件），统一 Bearer 鉴权、CORS、SPA 托管 |
 | Agent 编排（Python） | [`python/app/agent/`](./python/app/agent) | 系统提示词 + function calling 循环；每个工具通过 HTTP 调用 TS 引擎 |
-| 知识库 RAG（Python） | [`python/app/kb/`](./python/app/kb) | 文档解析 → 递归分块 → 批量向量化（百炼 `text-embedding-v4`）→ Chroma 持久化；检索走稠密向量 + BM25 → RRF 融合 |
+| 知识库 RAG（Python） | [`python/app/kb/`](./python/app/kb) | 文档解析 → 递归分块 → 批量向量化（智谱 `embedding-3`）→ Chroma 持久化；检索走稠密向量 + BM25 → RRF 融合 |
 | 长期记忆（Python） | [`python/app/agent/memory.py`](./python/app/agent/memory.py) | 每轮对话后自动提取（Mem0 风格）→ 向量去重 → 语义召回 top-k 注入上下文 |
 | 内部算法引擎（TS） | [`src/api/`](./src/api)、[`src/service/`](./src/service)、[`src/algorithm/`](./src/algorithm) | Kahn 拓扑 / AOE 关键路径 / 缓冲 / 风险 / 燃尽 / 报表，**算法零改动** |
 | 控制台（Vue3） | [`web/`](./web) | 仅把 base URL 指向 Python 服务，**页面代码零改动** |
@@ -548,15 +551,21 @@ ENGINE_BASE_URL=http://127.0.0.1:8080 API_PORT=8000 python python/run.py
 
 需配置 `LLM_BASE_URL / LLM_API_KEY / LLM_MODEL`（OpenAI 兼容网关）后启用；未配置时明确返回 `503 LLM_UNAVAILABLE`。
 
-以阿里云百炼（Model Studio）为例：把密钥写入仓库根目录 `.env`（已被 `.gitignore` 忽略，不会入库），重启服务即生效。
+以智谱 GLM（BigModel 开放平台，有免费额度）为例：把密钥写入仓库根目录 `.env`（已被 `.gitignore` 忽略，不会入库），重启服务即生效。
 
 ```ini
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_API_KEY=sk-xxxxxxxxxxxxxxxx
-LLM_MODEL=qwen-plus
+# 对话与 Agent 编排：glm-4.7-flash 为长期免费文本模型（支持流式输出 + Function Calling）
+LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+LLM_API_KEY=xxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxx
+LLM_MODEL=glm-4.7-flash
+
+# 知识库向量化：同一端点兼做 embeddings；留空则自动回落上面两项
+EMBEDDING_MODEL=embedding-3
+EMBEDDING_DIMENSIONS=1024
 ```
 
-新人免费额度按模型发放、仅「华北2（北京）」地域享有（开通后 90 天内有效），额度用尽后已实名账号会自动转为按量计费。
+`glm-4.7-flash` / `glm-4.5-flash` / `glm-4-flash` 为智谱**长期免费**文本模型（不消耗额度，支持流式输出与 Function Calling）；
+`embedding-3` 按量计费（0.5 元/百万 Tokens，新注册账号赠送免费 Token 额度），单次最多 64 条、单条 3072 Tokens。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -614,9 +623,10 @@ Agent 的工具**不实现算法**，仅把 function call 翻译为引擎 REST �
 `CYCLE_DEPENDENCY`(409)、`VALIDATION_ERROR`(400)、`LLM_FORMAT_ERROR`(422)、`STORAGE_UNAVAILABLE`(503)、`UNAUTHORIZED`(401)；
 Python 新增：`ENGINE_UNAVAILABLE`(502，引擎不可达)、`ENGINE_CIRCUIT_OPEN`(503，引擎断路器开路)、
 `LLM_UNAVAILABLE`(503，未配置网关)、`AGENT_MAX_STEPS`(422，编排未收敛)、
-`RATE_LIMITED`(429，触发限流)、`SERVICE_UNAVAILABLE`(503，未就绪/关机)、
+`RATE_LIMITED`(429，触发限流)、`PAYLOAD_TOO_LARGE`(413，请求体超过 `API_MAX_BODY_BYTES`)、
+`SERVICE_UNAVAILABLE`(503，未就绪/关机)、
 `EMBEDDING_UNAVAILABLE`(503，未配置向量化模型)、`EMBEDDING_GATEWAY_ERROR`(502，向量化网关异常)、
-`VECTOR_STORE_UNAVAILABLE`(503，Chroma 不可用/集合未知)。
+`VECTOR_STORE_UNAVAILABLE`(503，Chroma 不可用/集合未知)、`SESSION_STORE_UNAVAILABLE`(503，会话存储后端异常)。
 
 ### 10.6 测试
 
@@ -624,11 +634,12 @@ Python 新增：`ENGINE_UNAVAILABLE`(502，引擎不可达)、`ENGINE_CIRCUIT_OP
 npm run py:test          # 等价于 python -m pytest -c python/pyproject.toml
 ```
 
-149 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
-Agent 工具调度、工具失败容忍、会话上下文、步数上限，企业级加固能力（限流 / 安全头 / 关联 ID /
+206 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
+Agent 工具调度、工具失败容忍、会话上下文、步数上限，企业级加固能力（限流 / 请求体上限 / 安全头 / 关联 ID /
 指标 / 就绪探针 / 断路器 / 重试 / 并行工具调用 / 上下文裁剪 / 会话存储 / LLM 调用重试 / WS 断线重放 /
-工具异常兜底 / 输入边界包裹），以及**知识库全链路**（分块 / 文档解析 / BM25 / RRF / 向量库增删查 /
-入库-检索-删除 REST）与**长期记忆**（候选解析 / 去重 / 语义召回 / 停用治理 / 自动提取 / agentic RAG 工具）。
+工具异常兜底 / 错误响应脱敏 / 输入边界包裹 / 会话 ID 白名单），以及**知识库全链路**（分块 / 文档解析 /
+BM25 / RRF / 向量库增删查 / 入库-检索-删除 REST）与**长期记忆**（候选解析 / 去重 / 语义召回 / 停用治理 /
+自动提取 / 后台提取失败消费 / agentic RAG 工具）。
 
 ### 10.7 Docker Compose（Python 对外，引擎内网）
 
@@ -653,6 +664,8 @@ Agent 工具调度、工具失败容忍、会话上下文、步数上限，企�
 | 鉴权 | [`security.py`](./python/app/security.py) | Bearer 令牌**常量时间比较**（防时序侧信道） |
 | 限流 | [`security.py`](./python/app/security.py) | 按客户端 IP 令牌桶，超限 `429 RATE_LIMITED` + `Retry-After`（`API_RATE_LIMIT_PER_MINUTE`，默认关闭）。分桶键**只认 TCP 对端地址**：`X-Forwarded-For` 仅在直连对端命中 `API_TRUSTED_PROXIES` 清单时才采信（否则伪造该头即可换桶绕过限流）。注意 `run.py` 已显式关闭 uvicorn 的 `--proxy-headers`（其默认把 `127.0.0.1` 当可信代理并用 XFF 改写 `request.client`，会绕过上述判断）；用 uvicorn CLI 启动时请加 `--no-proxy-headers`。后端可插拔：配置 `REDIS_URL` 时自动切换为 **Redis 共享令牌桶**（判定与扣减在同一段 Lua 内原子完成，桶键带 TTL），`API_WORKERS>1` / 多副本下得到**真正的全局配额**；未配置则为单进程内存实现（全局配额 ≈ 配置值 × worker 数），可用 `RATE_LIMIT_BACKEND=memory/redis` 显式指定 |
 | 安全响应头 | [`security.py`](./python/app/security.py) | `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` 等，含错误与限流响应 |
+| 请求体上限 | [`security.py`](./python/app/security.py) | **纯 ASGI** 中间件 `BodySizeLimitMiddleware`（`API_MAX_BODY_BYTES`，默认 32 MiB）：已声明超限 `Content-Length` 时**不读 body** 直接 `413 PAYLOAD_TOO_LARGE`；未声明长度（chunked）时**读到越界块即中断**，绝不把整个 body 读进内存。限流按「请求数/分钟」计量，防不住单请求体积，二者互补 |
+| 错误响应脱敏 | [`main.py`](./python/app/main.py)、[`routes/proxy.py`](./python/app/routes/proxy.py) | 500 / 502 只回**稳定错误码 + 通用文案**：异常文本可能带出上游响应、连接串、文件路径，回显等于信息泄漏。traceback 只进服务端结构化日志，调用方凭 `X-Request-Id` 关联排查（该首部在 500 响应上也会补发） |
 | 注入消毒 | [`agent/sanitize.py`](./python/app/agent/sanitize.py) | 剥离用户输入中的伪角色前缀与 ChatML 特殊 token；送入模型前用 `<<<USER_INPUT ... USER_INPUT>>>` 显式边界包裹，让模型区分「指令」与「数据」 |
 | 结构化日志 | [`logging_config.py`](./python/app/logging_config.py) | 单行 JSON 日志，自动携带 `requestId` |
 | 全链路关联 | [`main.py`](./python/app/main.py) | 生成/透传 `X-Request-Id`，同步下发给引擎与前端 |
@@ -673,7 +686,7 @@ Agent 工具调度、工具失败容忍、会话上下文、步数上限，企�
 返回 `false`，控制台对应页面展示配置引导，主对话链路不受影响。
 
 **技术选型（当前主流方案）**：向量库 [Chroma](https://www.trychroma.com/)（本地持久化，生产可换远端客户端）；
-向量化用阿里云百炼 `text-embedding-v4`（OpenAI 兼容 `/embeddings`，支持 2048/1536/1024/768/512/256/128/64 维，默认 1024）；
+向量化用智谱 `embedding-3`（OpenAI 兼容 `/embeddings`，维度 256–2048 可自定义，默认 1024）；
 检索用**混合检索**——稠密向量召回 + `BM25`（中文按 unigram + bigram 切分，零分词依赖）→ **RRF 融合**（`k=60`）。
 
 **入库流水线**（`python/app/kb/`）：

@@ -17,10 +17,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from ..agent.advisor import generate_advice
-from ..agent.sanitize import sanitize_plan_id, sanitize_user_input
+from ..agent.sanitize import sanitize_plan_id, sanitize_session_id, sanitize_user_input
 from ..agent.schemas import WRITE_TOOL_NAMES
 from ..constants import SSE_ERROR, SSE_HEARTBEAT_SECONDS
-from ..errors import ApiError, internal, llm_unavailable, not_found
+from ..errors import ApiError, bad_request, internal, llm_unavailable, not_found
 from ..models import (
     AdviceRequest,
     AgentChatRequest,
@@ -48,6 +48,19 @@ def _require_agent(ctx: AppContext):
     if not ctx.runner.available:
         raise llm_unavailable()
     return ctx.runner
+
+
+def _sanitized_input(raw: str, *, field: str) -> str:
+    """消毒用户输入；只含空白 / 不可见字符时**明确拒绝**。
+
+    Pydantic 的 ``min_length=1`` 只约束原始字符串，``"   "`` 或纯控制字符都能通过校验，
+    但消毒后为空：若照原样送进编排，会在会话历史中留下空 ``content`` 的用户消息，
+    多数 OpenAI 兼容服务端会直接拒绝后续请求（该会话从此不可用）。因此这里统一拦截。
+    """
+    cleaned = sanitize_user_input(raw)
+    if not cleaned:
+        raise bad_request(f"{field}为空或仅包含空白 / 不可见字符，请重新输入")
+    return cleaned
 
 
 def _new_session_id() -> str:
@@ -92,7 +105,7 @@ def build_agent_router(base: str) -> APIRouter:
         ctx: AppContext = request.app.state.ctx
         runner = _require_agent(ctx)
         result = await runner.run_plan(
-            sanitize_user_input(payload.requirement),
+            _sanitized_input(payload.requirement, field="需求原文"),
             iteration_deadline=payload.iterationDeadline,
             iteration_start_date=payload.iterationStartDate,
             dev_member_count=payload.devMemberCount,
@@ -106,7 +119,7 @@ def build_agent_router(base: str) -> APIRouter:
         session_id = payload.sessionId or _new_session_id()
         result: AgentRunResult = await runner.run_chat(
             session_id,
-            sanitize_user_input(payload.message),
+            _sanitized_input(payload.message, field="消息内容"),
             defer_writes=payload.deferWrites,
             plan_id=sanitize_plan_id(payload.planId),
         )
@@ -125,7 +138,7 @@ def build_agent_router(base: str) -> APIRouter:
         ctx: AppContext = request.app.state.ctx
         runner = _require_agent(ctx)
         session_id = payload.sessionId or _new_session_id()
-        message = sanitize_user_input(payload.message)
+        message = _sanitized_input(payload.message, field="消息内容")
         plan_id = sanitize_plan_id(payload.planId)
 
         async def event_source() -> AsyncIterator[str]:
@@ -151,9 +164,10 @@ def build_agent_router(base: str) -> APIRouter:
                     except ApiError as exc:
                         yield _sse_event(SSE_ERROR, exc.to_body())
                         return
-                    except Exception as exc:  # noqa: BLE001 - 流已建立，异常必须以事件送达
+                    except Exception:  # noqa: BLE001 - 流已建立，异常必须以事件送达
+                        # 同上：只下发稳定错误码 + 通用文案，异常细节仅留在服务端日志
                         logger.exception("Agent 流式编排异常：会话 %s", session_id)
-                        yield _sse_event(SSE_ERROR, internal(f"Agent 编排异常：{exc}").to_body())
+                        yield _sse_event(SSE_ERROR, internal().to_body())
                         return
                     yield _sse_event(event["event"], event["data"])
             finally:
@@ -207,9 +221,14 @@ def build_agent_router(base: str) -> APIRouter:
     @router.delete("/sessions/{session_id}", summary="清空指定会话上下文")
     async def reset_session(session_id: str, request: Request) -> dict:
         ctx: AppContext = request.app.state.ctx
-        if not await ctx.runner.reset_session(session_id):
-            raise not_found(f"会话不存在：{session_id}")
-        return {"data": {"sessionId": session_id, "cleared": True}}
+        # 会话 ID 是「持有即代表身份」的凭据，且会作为会话存储键使用：路径参数不受
+        # pydantic 约束，此处按同一字符集白名单校验；非法与不存在同样回报 NOT_FOUND，
+        # 避免把「格式探测」与「是否存在」区分开来。
+        resolved = sanitize_session_id(session_id)
+        if resolved is None or not await ctx.runner.reset_session(resolved):
+            # 不回显原始路径参数：非法 ID 会走到这里，原样拼回消息等于反射用户输入
+            raise not_found("会话不存在或已被清空")
+        return {"data": {"sessionId": resolved, "cleared": True}}
 
     return router
 

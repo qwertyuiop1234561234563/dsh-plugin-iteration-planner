@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     #: 可信反向代理地址清单（逗号分隔的 IP / CIDR）；仅当直连对端命中清单时才采信
     #: ``X-Forwarded-For``。留空表示不信任任何转发头（防客户端伪造 IP 绕过限流）。
     api_trusted_proxies: str = ""
+    #: 请求体大小上限（字节）；``0`` 表示关闭。
+    #: 须 ≥ ``KB_MAX_DOCUMENT_BYTES`` + multipart 编码开销，否则正常上传会被误判为超限。
+    api_max_body_bytes: int = 32 * 1024 * 1024
     #: uvicorn 进程数；>1 时需共享会话存储（Redis）与网关层粘性（详见 README）
     api_workers: int = 1
 
@@ -104,6 +107,12 @@ class Settings(BaseSettings):
     # ------------------------------ WS 推送 ------------------------------
     #: 断线重连时向前端重放最近 N 条事件（0 表示关闭）
     ws_replay_size: int = 20
+    #: 单客户端单条事件的下发超时（秒）；``0`` 表示不限。超时即断开该慢客户端，
+    #: 避免一个不读数据的客户端拖住整个扇出（扇出是并发的，但超时仍需兜底）。
+    ws_send_timeout_seconds: float = 5.0
+    #: 同时在线客户端上限（``0`` 表示不限）。达上限后新连接以 1013 拒绝，
+    #: 防止连接数无界增长耗尽内存。
+    ws_max_clients: int = 512
 
     # --------------------------- LLM 网关（OpenAI 兼容） ---------------------------
     llm_base_url: str = ""
@@ -115,15 +124,15 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 0.5
 
     # ------------------------ 向量化模型（Embedding） ------------------------
-    #: 兼容端点基地址；留空则回落 ``LLM_BASE_URL``（百炼同一端点既做 chat 也做 embeddings）
+    #: 兼容端点基地址；留空则回落 ``LLM_BASE_URL``（智谱同一端点既做 chat 也做 embeddings）
     embedding_base_url: str = ""
     #: 密钥；留空则回落 ``LLM_API_KEY``
     embedding_api_key: str = ""
-    #: 向量化模型名（百炼 text-embedding-v4 支持 2048/1536/1024/768/512/256/128/64 维）
-    embedding_model: str = "text-embedding-v4"
+    #: 向量化模型名（智谱 embedding-3 支持 256–2048 维，默认 1024）
+    embedding_model: str = "embedding-3"
     #: 输出维度（需与模型支持的档位一致；默认 1024 兼顾效果与体积）
     embedding_dimensions: int = 1024
-    #: 单次请求的文本条数（百炼 text-embedding-v4 单次上限较小，保守按 10 条分批）
+    #: 单次请求的文本条数（embedding-3 单次上限 64 条，保守按 10 条分批）
     embedding_batch_size: int = 10
     embedding_timeout_seconds: float = 60.0
     #: 向量化调用额外重试次数（连接失败 / 429 / 5xx 生效）
@@ -147,6 +156,9 @@ class Settings(BaseSettings):
     #: 单文档体积上限（字节）与知识库文档总数上限
     kb_max_document_bytes: int = 20 * 1024 * 1024
     kb_max_documents: int = 500
+    #: 文档详情返回的分块预览条数上限（``chunkCount`` 仍为真实总数）。
+    #: 单文档可达 ``kb_max_document_bytes``，默认分块参数下可分块上万，全量返回会撑爆单次响应。
+    kb_detail_preview_chunks: int = 50
     #: 对话时是否自动把命中的知识库片段注入上下文（agentic 检索工具同时可用）
     kb_auto_inject: bool = True
     #: 自动注入时使用的召回条数（通常小于人工检索）
@@ -171,7 +183,7 @@ class Settings(BaseSettings):
 
     @property
     def resolved_embedding_base_url(self) -> str:
-        """向量化端点：优先独立配置，否则回落 LLM 网关（百炼同一端点）。"""
+        """向量化端点：优先独立配置，否则回落 LLM 网关（智谱同一端点）。"""
         return self.embedding_base_url or self.llm_base_url
 
     @property

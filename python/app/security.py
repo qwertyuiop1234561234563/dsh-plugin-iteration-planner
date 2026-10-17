@@ -17,6 +17,7 @@ import contextlib
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
 import time
 from collections.abc import Iterable
@@ -25,6 +26,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from fastapi import Request
 
+from .errors import payload_too_large
 from .metrics import METRICS
 
 logger = logging.getLogger("iteration_planner.security")
@@ -96,6 +98,121 @@ def client_ip(request: Request, *, trusted_proxies: tuple[ipaddress.IPv4Network 
             if first:
                 return first
     return peer or "unknown"
+
+
+def _declared_length(scope: Any) -> int | None:
+    """读取请求已声明的 ``content-length``（缺失 / 非法 / 负数 → ``None``）。"""
+    for key, value in scope.get("headers") or ():
+        if key.lower() == b"content-length":
+            try:
+                length = int(value)
+            except (TypeError, ValueError):
+                return None
+            return length if length >= 0 else None
+    return None
+
+
+def _payload_too_large_body(max_bytes: int) -> bytes:
+    return json.dumps(
+        payload_too_large(f"请求体超过上限 {max_bytes} 字节", {"maxBodyBytes": max_bytes}).to_body(),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+class _BodyTooLarge(Exception):
+    """内部哨兵：请求体越界时由 ``limited_receive`` 抛出，仅供本中间件自己捕获。
+
+    不能直接抛 :class:`app.errors.ApiError`：请求体的读取发生在 **FastAPI 异常处理层之外**
+    （``BaseHTTPMiddleware`` 会在后台任务里监听客户端断连，顺带消费请求体；上游异常则直接
+    穿过基类中间件的 ``collapse_excgroups``），因此既不会被 ``ExceptionMiddleware`` 的
+    ``ApiError`` 处理器接住，也没法依赖它渲染 413 —— 实测会一路冒泡成未捕获异常。
+    用独立的哨兵类型并在本中间件内捕获，语义最清晰、也不与业务 ``ApiError`` 混淆。
+    """
+
+
+class BodySizeLimitMiddleware:
+    """请求体大小上限（纯 ASGI 实现）。
+
+    动机：Starlette / FastAPI **默认不限制请求体大小**。上传与 JSON 端点都会把 body 整体
+    读进内存，一个超大请求即可显著抬高内存并挤占其余请求——而限流按「请求数/分钟」计量，
+    完全防不住这一维度。
+
+    为什么不用 ``BaseHTTPMiddleware``：``call_next`` 会把请求体读完再交给下游，中间件
+    本身没有机会在「读到一半」时中断；只有直接包装 ``receive``，才能同时拦住两种写法：
+
+    - **已声明** ``content-length`` 且超限：不读 body，``O(1)`` 直接回 413；
+    - **未声明长度**（``Transfer-Encoding: chunked``，或声明值小于实际）：逐块累计，
+      一旦越界立即抛 :class:`_BodyTooLarge` **中断请求体读取**，并由本中间件就地回 413；
+      超出的部分**不会**被读进内存。
+
+    413 响应仍经原 ``send`` 下发，因此外层中间件（安全首部 / 访问日志 / 请求指标）照常生效。
+    ``http.response.start`` 若已下发则无法补发 413，此时只记录并向上抛出（连接会被关闭）。
+
+    :param max_bytes: 上限（字节）；``<= 0`` 表示关闭该限制。
+    :param exempt_prefixes: 豁免的路径前缀（如内部健康探测端点）。
+    """
+
+    def __init__(self, app: Any, *, max_bytes: int, exempt_prefixes: Iterable[str] = ()) -> None:
+        self._app = app
+        self._max_bytes = int(max_bytes)
+        self._exempt_prefixes = tuple(exempt_prefixes)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or self._max_bytes <= 0 or self._is_exempt(scope):
+            await self._app(scope, receive, send)
+            return
+
+        declared = _declared_length(scope)
+        if declared is not None and declared > self._max_bytes:
+            METRICS.inc_counter("http_body_rejected_total", {"source": "content_length"})
+            await self._send_rejection(send)
+            return
+
+        received = 0
+        started = False
+
+        async def limited_receive() -> Any:
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body") or b"")
+                if received > self._max_bytes:
+                    METRICS.inc_counter("http_body_rejected_total", {"source": "chunked"})
+                    raise _BodyTooLarge
+            return message
+
+        async def guarded_send(message: Any) -> None:
+            nonlocal started
+            if message.get("type") == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self._app(scope, limited_receive, guarded_send)
+        except _BodyTooLarge:
+            if started:  # 已开始响应，无法再补发 413；交由上层关闭连接
+                logger.warning("请求体越界但响应已开始，无法回 413（path=%s）", scope.get("path"))
+                raise
+            await self._send_rejection(send)
+
+    async def _send_rejection(self, send: Any) -> None:
+        body = _payload_too_large_body(self._max_bytes)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json; charset=utf-8"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    def _is_exempt(self, scope: Any) -> bool:
+        if not self._exempt_prefixes:
+            return False
+        return str(scope.get("path") or "").startswith(self._exempt_prefixes)
 
 
 @dataclass
@@ -375,6 +492,7 @@ def build_rate_limiter(
 
 __all__ = [
     "SECURITY_HEADERS",
+    "BodySizeLimitMiddleware",
     "RateLimiter",
     "MemoryRateLimitBackend",
     "RedisRateLimiter",

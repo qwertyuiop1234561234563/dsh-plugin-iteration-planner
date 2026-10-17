@@ -55,6 +55,7 @@ class KnowledgeBaseService:
         rrf_k: int = 60,
         max_document_bytes: int = 20 * 1024 * 1024,
         max_documents: int = 500,
+        detail_preview_chunks: int = 50,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -65,6 +66,7 @@ class KnowledgeBaseService:
         self._rrf_k = rrf_k
         self._max_document_bytes = max_document_bytes
         self._max_documents = max_documents
+        self._detail_preview_chunks = max(1, detail_preview_chunks)
         #: BM25 需要的分块快照（懒加载 + 写入后失效，避免每轮检索全量拉取向量库）
         self._rows: list[dict[str, Any]] | None = None
         self._lock = asyncio.Lock()
@@ -278,8 +280,19 @@ class KnowledgeBaseService:
         return documents
 
     async def get_document(self, doc_id: str) -> dict[str, Any]:
-        """文档详情（含分块预览）。"""
-        rows = await asyncio.to_thread(self._store.get, KB_COLLECTION, where={"docId": doc_id})
+        """文档详情（含分块预览）。
+
+        分块按 ``chunkIndex < detail_preview_chunks`` 在**向量库侧**过滤，而不是全量取回再切片：
+        单文档上限（``max_document_bytes``，默认 20 MiB）在 ``chunk_size`` 默认值下可分块上万，
+        全量取回会把整份正文读进内存、并序列化成数十 MB 的单次响应。真实分块总数仍由分块
+        元数据里的 ``chunkCount`` 给出（不因预览截断而失真）。
+        """
+        rows = await asyncio.to_thread(
+            self._store.get,
+            KB_COLLECTION,
+            # Chroma 的 ``get`` 要求 ``where`` 中**恰好一个**操作符：多条件必须显式 ``$and``
+            where={"$and": [{"docId": doc_id}, {"chunkIndex": {"$lt": self._detail_preview_chunks}}]},
+        )
         if not rows:
             raise not_found(f"知识库文档不存在：{doc_id}")
         rows.sort(key=lambda row: int((row.get("metadata") or {}).get("chunkIndex") or 0))
@@ -370,6 +383,7 @@ def build_knowledge_base(
     rrf_k: int = 60,
     max_document_bytes: int = 20 * 1024 * 1024,
     max_documents: int = 500,
+    detail_preview_chunks: int = 50,
 ) -> KnowledgeBaseService:
     """按配置构建知识库服务（向量库实例由调用方复用，与长期记忆共享同一客户端）。"""
     return KnowledgeBaseService(
@@ -382,6 +396,7 @@ def build_knowledge_base(
         rrf_k=rrf_k,
         max_document_bytes=max_document_bytes,
         max_documents=max_documents,
+        detail_preview_chunks=detail_preview_chunks,
     )
 
 
