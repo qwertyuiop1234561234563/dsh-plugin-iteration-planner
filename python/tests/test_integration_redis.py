@@ -14,7 +14,8 @@
 - **E7** Redis 不可达时缓存与限流**一律 fail-open**，不影响问答可用性，且故障被计数。
 
 无可用 Redis 时相关用例自动跳过（``TEST_REDIS_URL`` 可覆盖默认地址）；
-E7 不需要真实 Redis（指向一个不可达端口即可）。
+E7 不需要真实 Redis **服务**（指向一个不可达端口即可），但仍需安装可选依赖 ``redis`` 包，
+未安装时同样跳过 —— 只装 requirements-dev.txt 的开发机不应因此报错。
 """
 
 from __future__ import annotations
@@ -280,6 +281,7 @@ async def test_redis_quota_is_global_while_memory_is_per_replica(tmp_path):
 
 async def test_fail_open_when_redis_unreachable(tmp_path):
     """Redis 不可达：缓存降级为未命中、限流降级为放行，问答链路不受影响且故障被计数。"""
+    pytest.importorskip("redis")
     embedder = StubEmbedder()
     with _replica(
         tmp_path,

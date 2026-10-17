@@ -44,6 +44,7 @@ from ..sessions import InMemorySessionStore, SessionStore
 from .llm import LlmClient
 from .memory import MemoryService
 from .prompts import ITERATION_PLANNER_SYSTEM_PROMPT, build_chat_instruction, build_plan_instruction
+from .sanitize import unwrap_arguments
 from .schemas import TOOL_SPECS, WRITE_TOOLS, describe_action
 from .tools import ToolDispatcher
 
@@ -571,6 +572,9 @@ class AgentRunner:
             )
             return record, tool_message, None, None
         arguments = _parse_arguments(raw_arguments)
+        # 入参是模型生成的自由文本：可能把「送入模型时加的不可信边界」整段回填进来，
+        # 在落库 / 展示 / 审计之前统一还原，避免脚手架文本变成业务数据。
+        arguments = unwrap_arguments(arguments)
         missing = [key for key in _REQUIRED[name] if arguments.get(key) in (None, "")]
         if missing:
             message = f"工具 {name} 缺少必填参数：{', '.join(missing)}"

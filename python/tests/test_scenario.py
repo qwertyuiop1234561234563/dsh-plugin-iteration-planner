@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from tests.conftest import DELETED_PLAN_IDS, auth
+import json
+
+import httpx
+from fastapi.testclient import TestClient
+
+from app.agent.sanitize import wrap_untrusted
+from app.engine_client import EngineClient
+from app.main import create_app
+from tests.conftest import SCENARIO_BASELINE, SCENARIO_TEMP, DELETED_PLAN_IDS, auth
 
 
 def _compare(client, **overrides):
@@ -63,3 +71,31 @@ def test_scenario_compare_unknown_plan(make_client):
         response = _compare(c, planId="ghost")
         assert response.status_code == 404
         assert response.json()["code"] == "NOT_FOUND"
+
+
+def test_scenario_compare_unwraps_boundary_from_baseline_requirement(settings):
+    """基线 ``rawRequirement`` 若含「不可信边界」脚手架，复算时必须还原成需求原文。
+
+    否则脚手架会被写进新建的情景计划，并随再次对比层层扩散。
+    """
+    posted: dict = {}
+    baseline = {**SCENARIO_BASELINE, "rawRequirement": wrap_untrusted("情景基线需求")}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/plans/base-plan" and request.method == "GET":
+            return httpx.Response(200, json={"data": baseline})
+        if path == "/api/plans" and request.method == "POST":
+            posted.update(json.loads(request.content.decode() or "{}"))
+            return httpx.Response(201, json={"data": SCENARIO_TEMP})
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(404, json={"code": "NOT_FOUND", "message": f"未模拟的路径：{request.method} {path}"})
+
+    engine = EngineClient("http://engine.test", "/api", 5.0, transport=httpx.MockTransport(handler))
+    app = create_app(settings, engine=engine, start_bridge=False)
+    with TestClient(app) as c:
+        response = _compare(c)
+
+    assert response.status_code == 200
+    assert posted["requirement"] == "情景基线需求"

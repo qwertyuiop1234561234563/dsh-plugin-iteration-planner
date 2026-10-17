@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from importlib.util import find_spec
 
 import pytest
 
@@ -199,14 +200,17 @@ async def test_cached_embedder_fail_open_cache_but_surfaces_upstream_error():
     cache = InMemoryCache()
     embedder = CachedEmbedder(inner, cache, ttl_seconds=30)
 
-    # 缓存后端不可用时仍应正常返回（fail-open），不吞掉上游自身的故障
-    broken = RedisCache("redis://127.0.0.1:6399/0", socket_timeout=0.2, connect_timeout=0.2)
-    try:
-        tolerant = CachedEmbedder(inner, broken, ttl_seconds=30)
-        vectors = await tolerant.embed(["hello"])
-        assert len(vectors) == 1 and len(vectors[0]) == 4, "缓存不可用不应影响向量化结果"
-    finally:
-        await broken.close()
+    # 缓存后端不可用时仍应正常返回（fail-open），不吞掉上游自身的故障。
+    # ``redis`` 是可选依赖（见 requirements-redis.txt）：本机未安装时只跳过这一段，
+    # 下面「上游故障必须原样暴露」的断言语义与缓存实现无关，照常执行。
+    if find_spec("redis") is not None:
+        broken = RedisCache("redis://127.0.0.1:6399/0", socket_timeout=0.2, connect_timeout=0.2)
+        try:
+            tolerant = CachedEmbedder(inner, broken, ttl_seconds=30)
+            vectors = await tolerant.embed(["hello"])
+            assert len(vectors) == 1 and len(vectors[0]) == 4, "缓存不可用不应影响向量化结果"
+        finally:
+            await broken.close()
 
     failing = CachedEmbedder(CountingEmbedder(fail=True), cache, ttl_seconds=30)
     with pytest.raises(RuntimeError):

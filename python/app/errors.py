@@ -65,7 +65,13 @@ def bad_gateway(message: str, details: Any | None = None) -> ApiError:
 
 
 def llm_unavailable(
-    message: str = "未配置 LLM 网关，Agent 功能不可用；请设置 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL",
+    message: str = (
+        "未配置 LLM 网关，Agent 功能不可用。"
+        "免费方案：智谱 GLM-4-Flash（文本模型长期免费、支持流式输出与 Function Calling）——"
+        "前往 https://open.bigmodel.cn 免费注册后创建 API Key，然后设置 "
+        "LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4、LLM_MODEL=glm-4-flash、LLM_API_KEY=<你的密钥>；"
+        "自建无鉴权网关（vLLM / Ollama）只需设置 LLM_BASE_URL 与 LLM_MODEL"
+    ),
 ) -> ApiError:
     return ApiError(503, "LLM_UNAVAILABLE", message)
 

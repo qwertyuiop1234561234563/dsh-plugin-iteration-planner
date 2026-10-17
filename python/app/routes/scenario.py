@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from ..agent.sanitize import unwrap_untrusted
 from ..engine_client import EngineClient
 from ..errors import ApiError, bad_request
 from ..models import (
@@ -98,7 +99,9 @@ def build_scenario_router(base: str) -> APIRouter:
         ctx: AppContext = request.app.state.ctx
         baseline = await ctx.engine.request("GET", f"/plans/{payload.planId}")
 
-        requirement = str(baseline.get("rawRequirement") or "").strip()
+        # 基线需求可能被模型回填过「不可信边界」脚手架（历史计划尤其如此）：对比要复用的
+        # 是**需求原文**本身，这里先还原，避免把脚手架再次写进新建的情景计划。
+        requirement = unwrap_untrusted(str(baseline.get("rawRequirement") or "")).strip()
         if not requirement:
             raise bad_request("基线计划缺少原始需求文本，无法进行情景对比")
 
