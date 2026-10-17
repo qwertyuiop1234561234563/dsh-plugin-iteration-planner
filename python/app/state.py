@@ -11,11 +11,13 @@ from dataclasses import dataclass
 
 from .agent import AgentRunner
 from .agent.memory import MemoryService
+from .cache import CacheBackend
 from .config import Settings
 from .engine_client import EngineClient
 from .kb.embedder import Embedder
 from .kb.pipeline import KnowledgeBaseService
 from .metrics import Metrics
+from .security import RateLimitBackend
 from .sessions import SessionStore
 from .workstore import WorkspaceStore
 from .ws import EngineEventBridge, WsBroadcaster
@@ -41,6 +43,10 @@ class AppContext:
     memory: MemoryService | None = None
     #: 向量化客户端（与知识库 / 记忆共用；关停时统一释放连接）
     embedder: Embedder | None = None
+    #: 可插拔缓存后端（Redis / 进程内存）：缓存确定性计算结果，加速重复问答
+    cache: CacheBackend | None = None
+    #: 限流后端（Redis / 进程内存）：多副本经 Redis 共享全局配额
+    rate_limit: RateLimitBackend | None = None
     #: 优雅关机标志：置位后 /readyz 返回未就绪，拒绝新请求（在途请求自然排空）
     shutting_down: bool = False
 

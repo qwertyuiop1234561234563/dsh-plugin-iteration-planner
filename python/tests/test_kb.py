@@ -154,6 +154,32 @@ def test_store_rejects_unknown_collection(kb_store):
         kb_store.count("unknown")
 
 
+def test_store_reset_by_full_name_keeps_handle_usable(kb_store):
+    """回归：以**集合全名**清空后，缓存句柄必须换成新集合，否则后续读写会报「集合不存在」。
+
+    自愈逻辑重建集合时传入的是 ``KB_COLLECTION``（全名）而非别名，此处即守护该路径。
+    """
+    kb_store.upsert(
+        "chunks",
+        ids=["d:0000"],
+        documents=["关键路径计算"],
+        embeddings=[[1.0, 0.0]],
+        metadatas=[{"docId": "d", "chunkIndex": 0}],
+    )
+    kb_store.reset(KB_COLLECTION)
+    assert kb_store.count(KB_COLLECTION) == 0
+
+    kb_store.upsert(
+        KB_COLLECTION,
+        ids=["d:0000"],
+        documents=["关键路径计算"],
+        embeddings=[[1.0, 0.0]],
+        metadatas=[{"docId": "d", "chunkIndex": 0}],
+    )
+    assert kb_store.count("chunks") == 1
+    assert kb_store.query("chunks", embedding=[1.0, 0.1], top_k=1)[0]["id"] == "d:0000"
+
+
 # ============================ 服务层 ============================
 
 

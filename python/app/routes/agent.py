@@ -50,6 +50,16 @@ def _require_agent(ctx: AppContext):
     return ctx.runner
 
 
+def _new_session_id() -> str:
+    """新建会话 ID。
+
+    会话 ID 是**持有即代表身份**的凭据（凭它可读回对话历史、确认该会话登记中的写操作），
+    因此取 ``uuid4``（CPython 用 ``os.urandom`` 生成，密码学随机）的**完整 128 bit**，
+    不做长度截断——截断只会削弱凭据强度，换不来任何收益。
+    """
+    return uuid.uuid4().hex
+
+
 def build_agent_router(base: str) -> APIRouter:
     router = APIRouter(prefix=f"{base}/agent", tags=["agent"])
 
@@ -93,7 +103,7 @@ def build_agent_router(base: str) -> APIRouter:
     async def agent_chat(payload: AgentChatRequest, request: Request) -> dict:
         ctx: AppContext = request.app.state.ctx
         runner = _require_agent(ctx)
-        session_id = payload.sessionId or uuid.uuid4().hex[:16]
+        session_id = payload.sessionId or _new_session_id()
         result: AgentRunResult = await runner.run_chat(
             session_id,
             sanitize_user_input(payload.message),
@@ -114,7 +124,7 @@ def build_agent_router(base: str) -> APIRouter:
         """
         ctx: AppContext = request.app.state.ctx
         runner = _require_agent(ctx)
-        session_id = payload.sessionId or uuid.uuid4().hex[:16]
+        session_id = payload.sessionId or _new_session_id()
         message = sanitize_user_input(payload.message)
         plan_id = sanitize_plan_id(payload.planId)
 

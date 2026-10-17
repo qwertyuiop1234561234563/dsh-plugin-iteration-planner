@@ -46,6 +46,9 @@ npx tsx demo/demo.ts 1> examples/sample-output.md 2> demo-stderr.txt
 
 ```
 dsh-plugin-iteration-planner/
+├── .github/
+│   └── workflows/
+│       └── ci.yml               # 【CI 门禁】引擎单测 / Python 单测（含真实 Redis 服务）/ 控制台类型检查
 ├── src/
 │   ├── index.ts                 # 【插件入口】Cordis 插件：name / inject / apply
 │   ├── constants/
@@ -117,6 +120,7 @@ dsh-plugin-iteration-planner/
 │   ├── tests/                   # pytest（Mock 引擎 + 脚本化 LLM + 桩向量化，覆盖转发/错误/鉴权/Agent/知识库/记忆）
 │   ├── requirements.txt         # 运行时依赖
 │   ├── requirements-dev.txt     # 开发测试依赖
+│   ├── requirements-redis.txt   # 可选依赖：Redis 共享后端（会话 / 限流 / 缓存）
 │   ├── pyproject.toml           # pytest 配置
 │   └── run.py                   # 启动入口（uvicorn，读取 .env）
 ├── test/
@@ -585,6 +589,10 @@ LLM_MODEL=qwen-plus
 服务端每 15s 发送一行注释心跳（`: ping`）防止中间代理空闲断连；
 调用方主动断开（如前端「停止生成」）时后端会取消进行中的编排并释放连接。
 
+> **反代部署注意**：SSE 会被 Nginx / Ingress 的默认响应缓冲吃掉（表现为「一次性吐出全部内容」）。
+> 应用已回 `X-Accel-Buffering: no` 与 `Cache-Control: no-cache, no-transform`，若仍被缓冲，请在该路径上显式关闭：
+> `location /api/agent/chat/stream { proxy_buffering off; proxy_cache off; proxy_read_timeout 3600s; }`。
+
 ### 10.4 Agent 工具 → 内部引擎 REST 映射
 
 Agent 的工具**不实现算法**，仅把 function call 翻译为引擎 REST 调用：
@@ -628,23 +636,34 @@ Agent 工具调度、工具失败容忍、会话上下文、步数上限，企�
 浏览器与外部系统只访问 Python 服务；Python 通过 `ENGINE_BASE_URL=http://engine:8080` 调用引擎。
 镜像构建见 [`Dockerfile.python`](./Dockerfile.python)（多阶段：前端构建 → Python 运行时）。
 
+> **需要 Redis 时不要只配 `REDIS_URL` 而不起实例**：compose 中的 `redis` 服务挂在 `redis` profile 下
+> （默认不启动，避免单副本部署多跑一个容器）。多副本 / 多 worker 共享会话时请一并拉起并成对配置：
+>
+> ```bash
+> docker compose --profile redis up -d --build
+> # 环境变量：SESSION_STORE=redis  REDIS_URL=redis://redis:6379/0
+> ```
+>
+> 只配 `SESSION_STORE=redis` 而没有实例时服务会**启动即失败**（刻意的，避免「以为共享了会话其实各存各的」）。
+
 ### 10.8 企业级能力（生产加固）
 
 | 能力 | 实现 | 说明 |
 |---|---|---|
 | 鉴权 | [`security.py`](./python/app/security.py) | Bearer 令牌**常量时间比较**（防时序侧信道） |
-| 限流 | [`security.py`](./python/app/security.py) | 按客户端 IP 令牌桶，超限 `429 RATE_LIMITED` + `Retry-After`（`API_RATE_LIMIT_PER_MINUTE`，默认关闭）。**单进程内存实现**：`API_WORKERS>1` 时每个 worker 独立计数，实际全局配额 ≈ 配置值 × worker 数；多副本生产环境建议在网关（Nginx/Ingress）做统一限流，或改用 Redis 全局限流 |
+| 限流 | [`security.py`](./python/app/security.py) | 按客户端 IP 令牌桶，超限 `429 RATE_LIMITED` + `Retry-After`（`API_RATE_LIMIT_PER_MINUTE`，默认关闭）。分桶键**只认 TCP 对端地址**：`X-Forwarded-For` 仅在直连对端命中 `API_TRUSTED_PROXIES` 清单时才采信（否则伪造该头即可换桶绕过限流）。注意 `run.py` 已显式关闭 uvicorn 的 `--proxy-headers`（其默认把 `127.0.0.1` 当可信代理并用 XFF 改写 `request.client`，会绕过上述判断）；用 uvicorn CLI 启动时请加 `--no-proxy-headers`。后端可插拔：配置 `REDIS_URL` 时自动切换为 **Redis 共享令牌桶**（判定与扣减在同一段 Lua 内原子完成，桶键带 TTL），`API_WORKERS>1` / 多副本下得到**真正的全局配额**；未配置则为单进程内存实现（全局配额 ≈ 配置值 × worker 数），可用 `RATE_LIMIT_BACKEND=memory/redis` 显式指定 |
 | 安全响应头 | [`security.py`](./python/app/security.py) | `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy` 等，含错误与限流响应 |
 | 注入消毒 | [`agent/sanitize.py`](./python/app/agent/sanitize.py) | 剥离用户输入中的伪角色前缀与 ChatML 特殊 token；送入模型前用 `<<<USER_INPUT ... USER_INPUT>>>` 显式边界包裹，让模型区分「指令」与「数据」 |
 | 结构化日志 | [`logging_config.py`](./python/app/logging_config.py) | 单行 JSON 日志，自动携带 `requestId` |
 | 全链路关联 | [`main.py`](./python/app/main.py) | 生成/透传 `X-Request-Id`，同步下发给引擎与前端 |
-| 指标 | [`metrics.py`](./python/app/metrics.py)、`GET /metrics` | Prometheus 文本（请求数/耗时直方图/引擎/Agent/WS），纯标准库零依赖；路径标签按路由模板降基数 |
+| 指标 | [`metrics.py`](./python/app/metrics.py)、`GET /metrics` | Prometheus 文本（请求数/耗时直方图/引擎/Agent/WS/缓存命中），纯标准库零依赖；路径标签按路由模板降基数 |
 | 探针 | `GET /healthz`（存活）/ `GET /readyz`（就绪） | 就绪=引擎可达且未在关机；LLM 为可选能力不作门槛 |
 | 引擎韧性 | [`resilience.py`](./python/app/resilience.py)、[`engine_client.py`](./python/app/engine_client.py) | 连接/读取分离超时、连接池上限、指数退避重试（仅连接失败与幂等方法的 5xx）、三态断路器 |
 | 优雅关机 | [`main.py`](./python/app/main.py) | 关机时置 `shutting_down` → `/readyz` 返回 503，随后停止桥接并关闭连接池 |
 | Agent 增强 | [`agent/runner.py`](./python/app/agent/runner.py)、[`agent/llm.py`](./python/app/agent/llm.py) | 同一消息内**并行**执行工具调用（保序回填）、上下文预算超限自动裁剪最旧历史、工具入参结构校验、LLM 调用重试 |
-| 会话存储 | [`sessions.py`](./python/app/sessions.py) | 可插拔：内存（LRU + TTL + 后台清理）或 Redis（多副本共享）；同会话串行化（会话级锁） |
-| 多进程 | `run.py`、`API_WORKERS` | 多 worker 需 `SESSION_STORE=redis` + 网关层 WS 粘性会话；限流与断路器均为**进程内**状态，多 worker/多副本下应上移到网关或改用 Redis 全局实现 |
+| 会话存储 | [`sessions.py`](./python/app/sessions.py) | 可插拔：内存（LRU + TTL + 后台清理）或 Redis（多副本共享）；同会话串行化（**Redis 租约锁**：`SET NX PX` + Lua token 校验 + 续租，跨副本互斥，超时 `SESSION_BUSY`） |
+| 缓存加速 | [`cache.py`](./python/app/cache.py) | 可插拔（Redis / 进程内存 LRU）：缓存**确定性**的向量化结果（`CachedEmbedder`，含同批去重与在途合并），重复提问直接省掉上游往返；缓存是纯优化，**故障一律 fail-open**，不影响可用性。`/api/health` 的 `python.cache` 透出后端与命中率 |
+| 多进程 | `run.py`、`API_WORKERS` | 多 worker 需 `SESSION_STORE=redis` + 网关层 WS 粘性会话；配置 `REDIS_URL` 后限流与缓存亦自动切换为共享实现（断路器仍为进程内状态，必要时可上移到网关） |
 
 运维端点：`http://<host>/healthz`、`/readyz`、`/metrics`（均免鉴权，便于 k8s 探针与 Prometheus 抓取）。
 
@@ -692,6 +711,37 @@ Agent 侧新增三个**只读**检索工具（写类工具仍走两阶段确认�
 > 运行期数据默认落在 `python/.data/chroma`（已 gitignore）；容器部署请挂载卷以免重建镜像丢库。
 > Chroma 为**单进程本地库**：多 worker / 多副本时需改用 Chroma Server 或远端向量库（如 Milvus / pgvector）。
 
+### 10.10 缓存加速（可选，Redis / 进程内存）
+
+配置 `REDIS_URL`（或 `CACHE_BACKEND=redis`）后，服务会把**确定性的昂贵计算结果**放进缓存，
+用来压缩单轮问答的上游往返。当前接入点是**向量化结果**（[`cache.py`](./python/app/cache.py) +
+`CachedEmbedder`）：
+
+- **为什么能缓存**：同一向量化模型 + 维度 + 文本，必然得到同一向量（缓存键已含模型与维度，
+  换模型不会命中旧向量），因此不需要版本化失效，只用 TTL 控制占用；
+- **省掉的是什么**：一轮对话中「长期记忆召回」与「知识库检索」会对**同一段用户输入**各向量化
+  一次，第二次直接命中缓存；重复提问 / 高并发相同提问则完全省掉上游往返（首字更快）；
+- **同批去重 + 在途合并**：同一条消息内重复文本只上行一次；相同批次的并发请求共享同一个
+  上游调用，避免缓存击穿时的重复风暴。
+
+设计取舍（与**会话存储**刻意不同，务必区分）：
+
+| 维度 | 会话存储（`sessions.py`） | 缓存（`cache.py`） |
+|---|---|---|
+| 数据性质 | **业务数据**：丢了就是丢上下文 | **纯优化**：丢了只是重算一次 |
+| 后端故障 | 明确失败 `SESSION_STORE_UNAVAILABLE(503)`，绝不静默降级 | **fail-open**：按未命中处理、计数告警，绝不影响可用性 |
+| 超时 | 按业务时长设置 | 刻意设短（1s），故障时快速失败 |
+
+配置项：`CACHE_BACKEND`（`auto`/`memory`/`redis`）、`CACHE_TTL_SECONDS`（默认 3600，设 0 关闭缓存）、
+`CACHE_MAX_ENTRIES`（内存后端 LRU 上限）、`RATE_LIMIT_BACKEND`（`auto`/`memory`/`redis`）。
+可观测：`/api/health` 的 `python.cache` 返回后端、命中率与淘汰次数，`/metrics` 暴露
+`cache_operations_total{backend,outcome}`；限流后端故障计数为 `rate_limit_backend_errors_total`。
+
+> 未配置 `REDIS_URL` 时自动退化为进程内 LRU 缓存：单进程部署同样有效，只是命中率不跨副本共享。
+> `CACHE_BACKEND=redis` / `RATE_LIMIT_BACKEND=redis` 为**显式选择**，此时缺 `REDIS_URL` 或未安装
+> `redis` 依赖会直接报错启动失败，不做静默降级（避免「以为共享了其实各存各的」）。
+> 可选 Redis 依赖已单独声明：`python -m pip install -r python/requirements-redis.txt`。
+
 ---
 
 ## 十一、已知边界
@@ -704,3 +754,11 @@ Agent 侧新增三个**只读**检索工具（写类工具仍走两阶段确认�
   Chroma Server 或远端向量库（Milvus / pgvector），并在容器中挂载持久卷（默认 `python/.data/chroma`）。
 - **检索策略**为「混合检索（向量 + BM25 → RRF）+ agentic 检索工具」，**未引入 rerank 精排模型**；
   若需更高精度可接入 `gte-rerank` 等重排服务作为后续扩展点。
+- **向量索引自愈**：Chroma 本地持久化索引存在**偶发**的段不可读缺陷（新建集合时约 1% 命中，
+  报 `Error creating hnsw segment reader: Nothing found on disk`，且**重试与重开客户端均无效**）。
+  [`heal.py`](./python/app/kb/heal.py) 会在此类错误上原地重建集合（读回正文 → 重新向量化 →
+  重建 → 写回；存储损坏时 SQLite 中的正文仍可读回，**数据不丢**），并暴露指标
+  `vector_store_self_heal_total{collection,outcome}` 与 `{outcome="failed",reason}`，
+  便于直接对「RAG 静默降级」告警。
+  触发条件严格限定于该错误特征，其它向量库错误一律原样上抛；重建前先完成向量化，
+  中途失败不会删除原集合。

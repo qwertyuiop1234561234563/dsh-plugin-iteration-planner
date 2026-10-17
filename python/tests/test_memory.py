@@ -263,12 +263,16 @@ def test_chat_injects_memory_and_knowledge(kb_client):
     # 关闭自动提取，避免后台任务与本用例的脚本化 LLM 响应争用
     with kb_client(llm=llm, overrides={"memory_extract": False}) as c:
         headers = auth()
-        c.post(
+        seeded_doc = c.post(
             "/api/kb/documents",
             json={"title": "排期规范", "content": "关键路径必须由 AOE 算法计算，不允许手工排期。"},
             headers=headers,
         )
-        c.post("/api/memories", json={"text": "关键路径怎么算都按 AOE 结果"}, headers=headers)
+        assert seeded_doc.is_success, f"知识库播种失败：{seeded_doc.status_code} {seeded_doc.text}"
+        seeded_memory = c.post(
+            "/api/memories", json={"text": "关键路径怎么算都按 AOE 结果"}, headers=headers
+        )
+        assert seeded_memory.is_success, f"记忆播种失败：{seeded_memory.status_code} {seeded_memory.text}"
 
         data = c.post("/api/agent/chat", json={"message": "关键路径怎么算？"}, headers=headers).json()["data"]
         assert data["references"], "应返回知识库引用片段"
@@ -291,7 +295,12 @@ def test_chat_uses_kb_search_tool(kb_client):
     )
     with kb_client(llm=llm, overrides={"memory_extract": False}) as c:
         headers = auth()
-        c.post("/api/kb/documents", json={"title": "排期规范", "content": "关键路径必须由 AOE 算法计算。"}, headers=headers)
+        seeded = c.post(
+            "/api/kb/documents",
+            json={"title": "排期规范", "content": "关键路径必须由 AOE 算法计算。"},
+            headers=headers,
+        )
+        assert seeded.is_success, f"知识库播种失败：{seeded.status_code} {seeded.text}"
         data = c.post("/api/agent/chat", json={"message": "查一下规范"}, headers=headers).json()["data"]
         assert data["toolCalls"][0]["name"] == "kb_search"
         assert data["toolCalls"][0]["ok"] is True

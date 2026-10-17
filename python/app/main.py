@@ -10,7 +10,8 @@
 - 鉴权：Bearer ``API_TOKEN``（常量时间比较）+ 按客户端 IP 令牌桶限流 / 安全响应头；
 - 可观测：JSON 结构化日志 + ``X-Request-Id`` 全链路关联 + ``/metrics``（Prometheus 文本）；
 - 韧性：引擎客户端内置重试与断路器；``/healthz``（存活）/``/readyz``（就绪）分离；
-- 会话：可插拔存储（内存 TTL / Redis）+ 会话级锁 + 过期清理。
+- 会话：可插拔存储（内存 TTL / Redis）+ 会话级锁 + 过期清理；
+- 加速：可插拔缓存（Redis / 进程内存）缓存向量化结果，降低重复问答的上游往返与首字延迟。
 
 鉴权豁免：``/healthz``、``/readyz``、``/metrics``、``/api/health``、``/docs``、静态资源。
 """
@@ -31,11 +32,12 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .agent import AgentRunner, MemoryService, OpenAiCompatibleClient, ToolDispatcher
+from .cache import build_cache
 from .config import Settings, get_settings
 from .constants import KB_COLLECTION, MEMORY_COLLECTION, default_chroma_dir, default_store_path
 from .engine_client import EngineClient
 from .errors import ApiError, bad_request, internal, rate_limited, unauthorized
-from .kb import BailianEmbedder, ChromaVectorStore, Embedder, build_knowledge_base
+from .kb import BailianEmbedder, CachedEmbedder, ChromaVectorStore, Embedder, build_knowledge_base
 from .logging_config import configure_logging, request_id_var
 from .metrics import METRICS
 from .resilience import CircuitBreaker, RetryPolicy
@@ -46,7 +48,14 @@ from .routes.proxy import register_proxy_and_static
 from .routes.scenario import build_scenario_router
 from .routes.system import register_system_routes
 from .routes.workspace import build_workspace_router
-from .security import SECURITY_HEADERS, RateLimiter, client_ip, constant_time_equals
+from .security import (
+    SECURITY_HEADERS,
+    RateLimitBackend,
+    build_rate_limiter,
+    client_ip,
+    constant_time_equals,
+    parse_trusted_proxies,
+)
 from .sessions import build_session_store
 from .state import AppContext
 from .workstore import WorkspaceStore
@@ -115,6 +124,8 @@ def create_app(
         )
 
     resolved_embedder = embedder
+    #: 只释放自己创建的向量化客户端：注入的实现（测试桩）由调用方负责关闭
+    owns_embedder = embedder is None
     if resolved_embedder is None and settings.embedding_enabled:
         resolved_embedder = BailianEmbedder(
             settings.resolved_embedding_base_url,
@@ -129,6 +140,16 @@ def create_app(
                 max_delay=max(settings.embedding_retry_base_delay * 4, 2.0),
             ),
         )
+
+    cache = build_cache(
+        driver=settings.cache_backend,
+        redis_url=settings.redis_url,
+        max_entries=settings.cache_max_entries,
+    )
+    # 向量化结果是确定性计算，包一层缓存：一轮对话中「记忆召回」与「知识库检索」对同一段
+    # 用户输入只向量化一次；重复提问 / 多副本共享命中后直接省掉上游往返（首字更快）。
+    if resolved_embedder is not None and settings.cache_ttl_seconds > 0:
+        resolved_embedder = CachedEmbedder(resolved_embedder, cache, ttl_seconds=settings.cache_ttl_seconds)
 
     knowledge = None
     memory = None
@@ -172,6 +193,8 @@ def create_app(
         max_sessions=settings.agent_max_sessions,
         ttl_seconds=settings.agent_session_ttl_seconds,
         redis_url=settings.redis_url,
+        lock_ttl_seconds=settings.agent_session_lock_ttl_seconds,
+        lock_wait_seconds=settings.agent_session_lock_wait_seconds,
     )
     dispatcher = ToolDispatcher(resolved_engine, knowledge=knowledge, memory=memory)
     runner = AgentRunner(
@@ -189,7 +212,12 @@ def create_app(
     )
     broadcaster = WsBroadcaster(replay_size=settings.ws_replay_size)
     bridge = EngineEventBridge(derive_engine_ws_url(settings.engine_base_url, settings.api_ws_path), broadcaster)
-    limiter = RateLimiter(settings.api_rate_limit_per_minute, settings.api_rate_limit_burst or None)
+    limiter = build_rate_limiter(
+        per_minute=settings.api_rate_limit_per_minute,
+        burst=settings.api_rate_limit_burst or None,
+        redis_url=settings.redis_url,
+        driver=settings.rate_limit_backend,
+    )
     workspace = WorkspaceStore(settings.workspace_store_path or default_store_path())
 
     @asynccontextmanager
@@ -207,11 +235,13 @@ def create_app(
                 await bridge.stop()
             await store.close()
             await workspace.close()
+            await cache.close()
             await resolved_engine.aclose()
             if isinstance(resolved_llm, OpenAiCompatibleClient):
                 await resolved_llm.aclose()
-            if resolved_embedder is not None and resolved_embedder is not embedder:
+            if resolved_embedder is not None and owns_embedder:
                 await resolved_embedder.aclose()
+            await limiter.close()
 
     app = FastAPI(
         title="企业级研发迭代规划智能 Agent · Python 开放 API",
@@ -236,6 +266,8 @@ def create_app(
         knowledge=knowledge,
         memory=memory,
         embedder=resolved_embedder,
+        cache=cache,
+        rate_limit=limiter,
     )
 
     # 注册顺序：先注册的在内层，后注册的在外层（Starlette 语义），CORS 需最外层。
@@ -306,10 +338,18 @@ def _register_auth(app: FastAPI, settings: Settings) -> None:
         return await call_next(request)
 
 
-def _register_rate_limit(app: FastAPI, settings: Settings, limiter: RateLimiter) -> None:
-    """按客户端 IP 的令牌桶限流（仅作用于对外 API，豁免探测端点与预检）。"""
+def _register_rate_limit(app: FastAPI, settings: Settings, limiter: RateLimitBackend) -> None:
+    """按客户端 IP 的令牌桶限流（仅作用于对外 API，豁免探测端点与预检）。
+
+    后端为内存或 Redis（``REDIS_URL`` 时）：Redis 后端让多 worker / 多副本共享**全局**配额，
+    避免进程内限流被副本数稀释（详见 :func:`app.security.build_rate_limiter`）。
+    """
     base = settings.api_base_path
     counter = {"n": 0}
+    #: 仅当直连对端命中该清单时才采信 X-Forwarded-For（防止伪造 IP 绕过限流）
+    trusted_proxies = parse_trusted_proxies(settings.api_trusted_proxies)
+    #: 仅内存后端需要周期性清理空闲桶；Redis 后端靠键 TTL 自动过期
+    prune = getattr(limiter, "prune", None)
 
     def _should_limit(request: Request) -> bool:
         if request.method == "OPTIONS":
@@ -322,16 +362,17 @@ def _register_rate_limit(app: FastAPI, settings: Settings, limiter: RateLimiter)
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
         if limiter.enabled and _should_limit(request):
-            allowed, retry_after = limiter.allow(client_ip(request))
+            allowed, retry_after = await limiter.allow(client_ip(request, trusted_proxies=trusted_proxies))
             if not allowed:
                 METRICS.inc_counter("http_rate_limited_total", {"path": _metric_path(request)})
                 response = JSONResponse(status_code=429, content=rate_limited(retry_after=retry_after).to_body())
                 response.headers["Retry-After"] = str(retry_after)
                 return response
             # 周期性清理空闲桶，避免内存随客户端数量无界增长
-            counter["n"] += 1
-            if counter["n"] % 1000 == 0:
-                limiter.prune()
+            if prune is not None:
+                counter["n"] += 1
+                if counter["n"] % 1000 == 0:
+                    prune()
         return await call_next(request)
 
 

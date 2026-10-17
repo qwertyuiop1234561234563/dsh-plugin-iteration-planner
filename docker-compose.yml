@@ -82,6 +82,10 @@ services:
       API_SECURITY_HEADERS: ${API_SECURITY_HEADERS:-true}
       API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-0}
       API_RATE_LIMIT_BURST: ${API_RATE_LIMIT_BURST:-0}
+      # 限流后端：auto（有 REDIS_URL 则用 Redis 共享令牌桶）| memory | redis
+      RATE_LIMIT_BACKEND: ${RATE_LIMIT_BACKEND:-auto}
+      # 可信反代地址清单（逗号分隔 IP/CIDR）；仅在直连对端命中时才采信 X-Forwarded-For
+      API_TRUSTED_PROXIES: ${API_TRUSTED_PROXIES:-}
       API_WORKERS: ${API_WORKERS:-1}
       WS_REPLAY_SIZE: ${WS_REPLAY_SIZE:-20}
       # Agent 编排（LLM 三项齐全才启用 /api/agent/*）
@@ -95,6 +99,10 @@ services:
       # 会话存储：单副本用 memory；多副本/多 worker 改为 redis 并设置 REDIS_URL
       SESSION_STORE: ${SESSION_STORE:-memory}
       REDIS_URL: ${REDIS_URL:-}
+      # 缓存加速（可选）：保存确定性的向量化结果，重复问答省掉上游往返；故障 fail-open
+      CACHE_BACKEND: ${CACHE_BACKEND:-auto}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}
+      CACHE_MAX_ENTRIES: ${CACHE_MAX_ENTRIES:-2048}
       # 知识库（RAG）与长期记忆：留空 EMBEDDING_* 则回落 LLM_*（百炼同一端点兼做 embeddings）
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}

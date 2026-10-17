@@ -28,6 +28,7 @@ from ..errors import ApiError, bad_request, not_found
 from ..metrics import METRICS
 from .chunking import chunk_text
 from .embedder import Embedder
+from .heal import query_resilient
 from .loader import LoadedDocument, load_document
 from .retrieval import bm25_search, rrf_fuse
 from .store import ChromaVectorStore
@@ -181,18 +182,25 @@ class KnowledgeBaseService:
         use_hybrid = self._hybrid if hybrid is None else bool(hybrid)
 
         if await asyncio.to_thread(self._store.count, KB_COLLECTION) == 0:
+            METRICS.inc_counter("kb_search_total", {"outcome": "empty", "reason": "no_documents"})
             return []
 
         vector = (await self._embedder.embed([cleaned]))[0]
-        dense = await asyncio.to_thread(
-            self._store.query,
+        dense = await query_resilient(
+            self._store,
+            self._embedder,
             KB_COLLECTION,
             embedding=vector,
             top_k=max(limit * 4, limit),
         )
 
         if not use_hybrid:
-            return [self._to_hit(row) for row in dense[:limit]]
+            hits = [self._to_hit(row) for row in dense[:limit]]
+            METRICS.inc_counter(
+                "kb_search_total",
+                {"outcome": "success" if hits else "empty", "mode": "vector"},
+            )
+            return hits
 
         rows = await self._snapshot()
         sparse = await asyncio.to_thread(bm25_search, rows, cleaned, top_k=max(limit * 4, limit))
@@ -211,7 +219,10 @@ class KnowledgeBaseService:
             hit = self._to_hit(row)
             hit["score"] = round(score, 6)
             hits.append(hit)
-        METRICS.inc_counter("kb_search_total", {"outcome": "success", "mode": "hybrid"})
+        METRICS.inc_counter(
+            "kb_search_total",
+            {"outcome": "success" if hits else "empty", "mode": "hybrid"},
+        )
         return hits
 
     async def context_and_hits(self, query: str, *, top_k: int | None = None) -> tuple[str | None, list[dict[str, Any]]]:
@@ -223,9 +234,11 @@ class KnowledgeBaseService:
         try:
             hits = await self.search(query, top_k=top_k)
         except ApiError as exc:
+            METRICS.inc_counter("kb_inject_degraded_total", {"reason": "api_error", "code": exc.code})
             logger.warning("知识库自动注入降级（%s）：%s", exc.code, exc.message)
             return None, []
         except Exception as exc:  # noqa: BLE001 - 兜底：增强能力绝不阻断主链路
+            METRICS.inc_counter("kb_inject_degraded_total", {"reason": "unexpected"})
             logger.warning("知识库自动注入出现未预期异常，已跳过：%s", exc)
             return None, []
         if not hits:

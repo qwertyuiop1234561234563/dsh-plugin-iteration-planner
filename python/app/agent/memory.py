@@ -34,6 +34,7 @@ from ..constants import (
 )
 from ..errors import ApiError, bad_request, not_found
 from ..kb.embedder import Embedder
+from ..kb.heal import query_resilient
 from ..kb.store import ChromaVectorStore
 from ..metrics import METRICS
 from .llm import LlmClient
@@ -112,8 +113,9 @@ class MemoryService:
             return []
         limit = max(1, int(top_k or self._top_k))
         vector = (await self._embedder.embed([cleaned]))[0]
-        rows = await asyncio.to_thread(
-            self._store.query,
+        rows = await query_resilient(
+            self._store,
+            self._embedder,
             MEMORY_COLLECTION,
             embedding=vector,
             top_k=max(limit * 3, limit),
@@ -146,12 +148,15 @@ class MemoryService:
         try:
             memories = await self.recall(query, top_k=top_k)
         except ApiError as exc:
+            METRICS.inc_counter("memory_recall_degraded_total", {"reason": "api_error", "code": exc.code})
             logger.warning("长期记忆召回降级（%s）：%s", exc.code, exc.message)
             return None, []
         except Exception as exc:  # noqa: BLE001 - 兜底：增强能力绝不阻断主链路
+            METRICS.inc_counter("memory_recall_degraded_total", {"reason": "unexpected"})
             logger.warning("长期记忆召回出现未预期异常，已跳过：%s", exc)
             return None, []
         if not memories:
+            METRICS.inc_counter("memory_recall_total", {"outcome": "miss"})
             return None, []
         lines = ["以下是关于当前用户 / 项目的长期记忆（仅作背景参考，可能与当前请求无关）："]
         for item in memories:

@@ -14,11 +14,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import logging
 from typing import Any, Protocol, Sequence
 
 import httpx
 
+from ..cache import CacheBackend
 from ..errors import embedding_gateway_error, embedding_unavailable
 from ..metrics import METRICS
 from ..resilience import RetryPolicy
@@ -160,4 +163,105 @@ class BailianEmbedder:
             return response
 
 
-__all__ = ["Embedder", "BailianEmbedder"]
+class CachedEmbedder:
+    """向量化结果的缓存包装（Redis / 进程内存），含同批去重与在途合并。
+
+    **为什么可以缓存**：向量化是确定性函数——同一模型 + 同一维度 + 同一文本必然得到
+    同一向量，缓存不会引入陈旧数据（缓存键已含模型名与维度，切换模型不会命中旧向量）。
+
+    **为什么值得缓存**：一轮对话中「长期记忆召回」与「知识库检索」会对**同一段用户输入**
+    各向量化一次，第二次直接命中，省掉一次上游往返；多副本部署时经 Redis 共享，
+    同一问题被不同副本 / 不同用户重复提问时命中率不随副本数稀释。
+
+    **在途合并**：相同一批文本的并发请求共用同一个 ``asyncio.Task``（``shield`` 保护，
+    单个调用方取消不影响其它调用方），避免上游被重复风暴击穿。
+    """
+
+    def __init__(self, inner: Embedder, cache: CacheBackend, *, ttl_seconds: float = 3600.0) -> None:
+        self._inner = inner
+        self._cache = cache
+        self._ttl = ttl_seconds
+        self._inflight: dict[tuple[str, ...], asyncio.Task[list[list[float]]]] = {}
+
+    @property
+    def name(self) -> str:
+        return f"{self._inner.name}+cache"
+
+    @property
+    def dimensions(self) -> int:
+        return self._inner.dimensions
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """与底层实现**同序等长**返回；命中缓存的条目不再请求上游。"""
+        items = [text if text and text.strip() else " " for text in texts]
+        if not items:
+            return []
+
+        keys = [self._digest(text) for text in items]
+        resolved: list[list[float] | None] = [None] * len(items)
+
+        # 1) 批量查缓存（重复键重复查询无妨，命中即复用）
+        cached_values = await self._cache.get_many(keys)
+        missing_text: dict[str, str] = {}
+        for index, key in enumerate(keys):
+            value = cached_values[index] if index < len(cached_values) else None
+            if self._is_valid_vector(value):
+                resolved[index] = value  # type: ignore[assignment]
+                continue
+            missing_text.setdefault(key, items[index])
+
+        # 2) 未命中的按「去重后的顺序」批量取回，并回填缓存
+        if missing_text:
+            ordered_keys = tuple(missing_text)
+            vectors = await self._fetch_coalesced(ordered_keys, [missing_text[key] for key in ordered_keys])
+            for index, key in enumerate(keys):
+                vector = vectors.get(key)
+                if vector is None:
+                    continue
+                if resolved[index] is None:
+                    resolved[index] = vector
+                await self._cache.set(key, vector, self._ttl)
+
+        # 3) 契约校验：与底层实现一致，条数不足必须显式失败（不静默返回残缺结果）
+        if any(vector is None for vector in resolved):
+            raise embedding_gateway_error("向量化结果条数与输入不一致（缓存包装层校验）")
+        return [vector for vector in resolved if vector is not None]
+
+    # ------------------------------- 内部实现 -------------------------------
+
+    def _digest(self, text: str) -> str:
+        """缓存键：模型 + 维度 + 文本（三者任一变化即不命中，天然避免陈旧向量）。"""
+        raw = f"{self._inner.name}|{self._inner.dimensions}|{text}".encode()
+        return f"embedding:{hashlib.sha256(raw).hexdigest()}"
+
+    def _is_valid_vector(self, value: Any) -> bool:
+        """缓存值须为与配置维度一致的浮点数组，否则按未命中处理。"""
+        if not isinstance(value, list) or not value:
+            return False
+        if len(value) != self._inner.dimensions:
+            return False
+        return all(isinstance(item, (int, float)) for item in value)
+
+    async def _fetch_coalesced(self, batch_key: tuple[str, ...], texts: list[str]) -> dict[str, list[float]]:
+        """取回一批未命中文本的向量；相同批次并发调用共享同一底层请求。"""
+        task = self._inflight.get(batch_key)
+        if task is None:
+            task = asyncio.create_task(self._inner.embed(texts), name="embedding-fetch")
+            self._inflight[batch_key] = task
+            task.add_done_callback(lambda done: self._finish(batch_key, done))
+        vectors = await asyncio.shield(task)
+        return dict(zip(batch_key, vectors))
+
+    def _finish(self, batch_key: tuple[str, ...], task: asyncio.Task[list[list[float]]]) -> None:
+        """清理在途登记，并消费异常避免「Future exception was never retrieved」告警。"""
+        if self._inflight.get(batch_key) is not task:
+            return
+        self._inflight.pop(batch_key, None)
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.exception()
+
+
+__all__ = ["Embedder", "BailianEmbedder", "CachedEmbedder"]

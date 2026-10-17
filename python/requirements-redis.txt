@@ -1,0 +1,11 @@
+# 可选依赖：Redis 共享后端（多副本 / 多 worker 部署时启用）
+#
+#   共享会话存储：SESSION_STORE=redis
+#   共享配额限流：RATE_LIMIT_BACKEND=redis（全局配额，而非「配置值 × 副本数」）
+#   共享向量化缓存：CACHE_BACKEND=redis
+#
+# 安装：python -m pip install -r python/requirements-redis.txt
+# 单副本部署无需安装：auto 模式下未安装该依赖会自动退化为进程内实现并记录告警；
+# 但显式配置 *_BACKEND=redis 时若缺依赖或 REDIS_URL，服务会启动失败（不做静默降级）。
+-r requirements.txt
+redis>=5.0,<7.0

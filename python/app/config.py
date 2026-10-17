@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     api_rate_limit_per_minute: int = 0
     #: 限流突发容量（缺省与每分钟上限相同）
     api_rate_limit_burst: int = 0
+    #: 可信反向代理地址清单（逗号分隔的 IP / CIDR）；仅当直连对端命中清单时才采信
+    #: ``X-Forwarded-For``。留空表示不信任任何转发头（防客户端伪造 IP 绕过限流）。
+    api_trusted_proxies: str = ""
     #: uvicorn 进程数；>1 时需共享会话存储（Redis）与网关层粘性（详见 README）
     api_workers: int = 1
 
@@ -83,6 +86,20 @@ class Settings(BaseSettings):
     session_store: str = "memory"
     #: Redis 连接串（session_store=redis 时必填）
     redis_url: str = ""
+    #: 会话分布式锁租约 TTL（秒）；持有期间自动续租，需覆盖单次编排最长耗时
+    agent_session_lock_ttl_seconds: float = 300.0
+    #: 会话分布式锁获取等待上限（秒）；超时以 SESSION_BUSY(409) 明确失败，避免并发覆盖上下文
+    agent_session_lock_wait_seconds: float = 20.0
+
+    # ------------------------------ 缓存（可选加速） ------------------------------
+    #: 缓存后端：auto（配置了 REDIS_URL 且依赖可用则用 Redis，否则进程内存）| memory | redis
+    cache_backend: str = "auto"
+    #: 进程内存缓存的 LRU 上限（条）
+    cache_max_entries: int = 2048
+    #: 向量化结果缓存有效期（秒）；0 表示关闭该缓存
+    cache_ttl_seconds: float = 3600.0
+    #: 限流后端：auto | memory | redis；多副本 / API_WORKERS>1 时用 redis 才能得到全局配额
+    rate_limit_backend: str = "auto"
 
     # ------------------------------ WS 推送 ------------------------------
     #: 断线重连时向前端重放最近 N 条事件（0 表示关闭）

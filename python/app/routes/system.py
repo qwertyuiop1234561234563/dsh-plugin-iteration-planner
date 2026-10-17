@@ -48,6 +48,9 @@ async def _collect_health(ctx: AppContext) -> dict:
             "agentTools": len(ctx.runner.tool_names),
             "knowledgeEnabled": ctx.knowledge is not None,
             "memoryEnabled": ctx.memory is not None,
+            # 缓存是纯优化项：透出后端与命中率，便于判断「加速是否真的生效」
+            "cache": ctx.cache.describe() if ctx.cache is not None else None,
+            "rateLimitBackend": ctx.rate_limit.name if ctx.rate_limit is not None else None,
         },
     }
 

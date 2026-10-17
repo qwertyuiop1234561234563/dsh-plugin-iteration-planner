@@ -9,8 +9,9 @@
 ``LLM_FORMAT_ERROR``(422) / ``STORAGE_UNAVAILABLE``(503) / ``UNAUTHORIZED``(401)。
 
 Python 对外服务扩展错误码：``ENGINE_UNAVAILABLE``(502) / ``ENGINE_CIRCUIT_OPEN``(503) /
-``LLM_UNAVAILABLE``(503) / ``LLM_GATEWAY_ERROR``(502) / ``RATE_LIMITED``(429) /
-``SERVICE_UNAVAILABLE``(503) / ``AGENT_MAX_STEPS``(422) / ``INTERNAL_ERROR``(500)。
+``LLM_UNAVAILABLE``(503) / ``LLM_GATEWAY_ERROR``(502) / ``EMBEDDING_UNAVAILABLE``(503) /
+``VECTOR_STORE_UNAVAILABLE``(503) / ``SESSION_STORE_UNAVAILABLE``(503) / ``SESSION_BUSY``(409) /
+``RATE_LIMITED``(429) / ``SERVICE_UNAVAILABLE``(503) / ``AGENT_MAX_STEPS``(422) / ``INTERNAL_ERROR``(500)。
 """
 
 from __future__ import annotations
@@ -108,6 +109,20 @@ def rate_limited(message: str = "请求过于频繁，请稍后重试", retry_af
 def service_unavailable(message: str = "服务尚未就绪") -> ApiError:
     """就绪探针未通过 / 正在优雅关机。"""
     return ApiError(503, "SERVICE_UNAVAILABLE", message)
+
+
+def session_store_unavailable(message: str, details: Any | None = None) -> ApiError:
+    """会话存储（Redis）不可用：明确失败，避免「以为存上了其实没存」的隐蔽故障。"""
+    return ApiError(503, "SESSION_STORE_UNAVAILABLE", message, details)
+
+
+def session_busy(message: str = "同一会话仍有请求在处理中，请稍后重试") -> ApiError:
+    """同一会话的并发请求超过等待上限（跨副本分布式锁未获取到）。
+
+    这里选择「明确失败」而非「放弃互斥继续执行」：后者会让两个请求并发改写同一份
+    会话上下文，造成历史丢失（last-write-wins），比一次可重试的错误更难排查。
+    """
+    return ApiError(409, "SESSION_BUSY", message)
 
 
 def internal(message: str = "服务内部错误") -> ApiError:

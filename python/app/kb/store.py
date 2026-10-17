@@ -54,6 +54,11 @@ class ChromaVectorStore:
 
     # ------------------------------- 集合访问 -------------------------------
 
+    @property
+    def path(self) -> str:
+        """持久化目录（自愈逻辑据此把「尝试配额」限定在单个存储实例上）。"""
+        return self._path
+
     def _collection(self, name: str) -> Any:
         try:
             return self._client.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
@@ -186,7 +191,9 @@ class ChromaVectorStore:
         except Exception as exc:  # noqa: BLE001
             raise vector_store_unavailable(f"向量库清空失败：{exc}") from exc
         fresh = self._collection(name)
-        if collection == "chunks":
+        # 注意：传入的可能是别名（chunks / memories）也可能是集合全名，两者都要能正确换新句柄，
+        # 否则重建后仍持有已被删除的旧句柄，后续读写会报「Collection does not exist」。
+        if name == self._chunk_name:
             self._chunks = fresh
         else:
             self._memories = fresh
