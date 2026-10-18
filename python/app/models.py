@@ -558,3 +558,169 @@ class MemoryStats(BaseModel):
 # 需在模块加载完成后显式重建，否则首次校验时才会解析，易在子类继承场景下遗漏。
 AgentRunResult.model_rebuild()
 AgentChatResponse.model_rebuild()
+
+
+# ========================= What-if 沙盘（自然语言仿真，/api/agent/whatif） =========================
+
+
+class WhatIfRequest(BaseModel):
+    """自然语言情景仿真：一句话描述假设改动，服务端调引擎重算并给出增量对比。"""
+
+    planId: str = Field(min_length=1, max_length=128, description="基线计划 ID")
+    instruction: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="情景区改动描述，例如「后端延期 3 天」「再加 2 个人」「把接口开发的工时提到 12 小时」",
+    )
+
+
+class WhatIfTaskEdit(BaseModel):
+    """单条任务级扰动的落地结果（before/after 均为引擎返回值）。"""
+
+    task: str = Field(description="用户描述中的任务引用（服务端解析后回填为真实任务名）")
+    taskId: str | None = None
+    field: str
+    value: Any = None
+    before: Any = None
+    after: Any = None
+    applied: bool = False
+    error: str | None = None
+    reason: str | None = None
+
+
+class WhatIfResponse(BaseModel):
+    """情景仿真结果：基线 vs 情景的完整增量对比。
+
+    ``ephemeral`` 恒为 true —— 情景计划是临时计划，仿真结束后立即回收，不污染持久化存储。
+    """
+
+    planId: str
+    mode: str = Field(description="llm | rule（解析路径；rule 表示未用模型，附带 degradedReason）")
+    model: str | None = None
+    degradedReason: str | None = None
+    intent: str = Field(description="服务端理解到的情景意图（回显给用户核对）")
+    constraints: ScenarioConstraints
+    baselineConstraints: ScenarioConstraints
+    baseline: ScenarioMetrics
+    scenario: ScenarioMetrics
+    delta: ScenarioDelta
+    deadlineShiftDays: int | None = Field(default=None, description="预计完成日期偏移（正值为推迟）")
+    criticalPathAdded: list[str] = Field(default_factory=list)
+    criticalPathRemoved: list[str] = Field(default_factory=list)
+    newRisks: list[str] = Field(default_factory=list)
+    resolvedRisks: list[str] = Field(default_factory=list)
+    edits: list[WhatIfTaskEdit] = Field(default_factory=list)
+    unparsed: bool = Field(default=False, description="描述无法映射为任何可执行改动")
+    summary: str = ""
+    notes: list[str] = Field(default_factory=list)
+    ephemeral: bool = True
+
+
+# ============================ 主动巡检（/api/agent/patrol/**） ============================
+
+
+class PatrolFinding(BaseModel):
+    """一条巡检发现（信号 + 严重度 + 可读描述，全部源于引擎事实）。"""
+
+    findingId: str
+    planId: str
+    planRequirement: str = ""
+    signal: str
+    signalLabel: str
+    severity: str = Field(description="info | warning | critical")
+    title: str
+    detail: str = ""
+    status: str = Field(description="new | ongoing | resolved")
+    escalated: bool = False
+    at: float = 0.0
+
+
+class PatrolFindingsResponse(BaseModel):
+    """巡检发现列表与巡检运行状态。"""
+
+    items: list[PatrolFinding] = Field(default_factory=list)
+    total: int = 0
+    running: bool = False
+    enabled: bool = True
+    intervalSeconds: float = 0.0
+    lastRunAt: float | None = None
+    lastSummary: dict[str, Any] = Field(default_factory=dict)
+    signals: list[str] = Field(default_factory=list)
+
+
+class PatrolRunResponse(BaseModel):
+    """手动触发一轮巡检的结果摘要。"""
+
+    plans: int = 0
+    signals: int = 0
+    alerts: int = 0
+    resolved: int = 0
+    errors: list[str] = Field(default_factory=list)
+    durationMs: int = 0
+    at: float | None = None
+
+
+# ===================== 多角色协作编排（/api/agent/collab/stream） =====================
+
+
+class AgentCollabRequest(BaseModel):
+    """一句话需求 → 多角色协作（需求分析 / 引擎排期 / 估算审阅 / 风险缓解 / 质量校验）。"""
+
+    requirement: str = Field(min_length=1, max_length=20_000, description="业务需求原文")
+    iterationDeadline: str | None = Field(default=None, pattern=_ISO_DATE, description="迭代截止日期")
+    iterationStartDate: str | None = Field(default=None, pattern=_ISO_DATE, description="迭代起始日期")
+    devMemberCount: int | None = Field(default=None, gt=0, le=1000, description="可用开发人数")
+
+
+class AgentCollabStep(BaseModel):
+    """一个角色步骤（前端时间线展示；``status`` 为 pending | running | done | failed）。"""
+
+    role: str
+    title: str
+    status: str
+    detail: str = ""
+    at: float = 0.0
+
+
+# ===================== 迭代复盘 + 学习（/api/agent/retro） =====================
+
+
+class RetroRequest(BaseModel):
+    """对一个迭代计划做复盘（可选提供实际工时等外部事实）。"""
+
+    planId: str = Field(min_length=1, max_length=128, description="复盘的计划 ID")
+    actualHours: dict[str, float] = Field(
+        default_factory=dict,
+        description="实际工时映射（键为 taskId 或任务名）；不提供则跳过工时偏差与估算校准",
+    )
+    materializedRiskIds: list[str] = Field(
+        default_factory=list,
+        max_length=200,
+        description="人工判定「确实发生了」的风险 ID 列表；用于计算风险兑现率",
+    )
+    scopeChanges: list[str] = Field(
+        default_factory=list,
+        max_length=200,
+        description="相对基线的范围变更说明（新增 / 砍掉的需求点）",
+    )
+    writeMemory: bool = Field(
+        default=True,
+        description="是否把复盘结论写回长期记忆（闭环「学习」，反哺后续规划）",
+    )
+
+
+class RetroResponse(BaseModel):
+    """复盘结果：确定性统计 + 模型结论（模型不可用时降级为规则结论）。"""
+
+    planId: str
+    metrics: dict[str, Any] = Field(default_factory=dict, description="确定性统计（可复算）")
+    mode: str = Field(description="llm | rule")
+    model: str | None = None
+    degradedReason: str | None = None
+    summary: str = ""
+    highlights: list[str] = Field(default_factory=list)
+    problems: list[str] = Field(default_factory=list)
+    actions: list[str] = Field(default_factory=list)
+    memories: list[str] = Field(default_factory=list)
+    memoryWritten: int = Field(default=0, description="实际写回长期记忆的条数（去重后可能少于 memories）")
+    memoryEnabled: bool = False

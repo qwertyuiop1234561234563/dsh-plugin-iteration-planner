@@ -61,7 +61,8 @@ services:
       - postgres
     environment:
       API_HOST: 0.0.0.0
-      API_PORT: 8080
+      # 本网关监听端口（独立于引擎的 API_PORT，避免本地联调抢同一个端口）
+      GATEWAY_PORT: 8080
       API_BASE_PATH: /api
       API_WS_PATH: /ws
       # 同域部署时 CORS 可收紧；此处默认放开，便于前后端分离联调
@@ -115,10 +116,25 @@ services:
       AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-8}
       AGENT_TEMPERATURE: ${AGENT_TEMPERATURE:-0.2}
       AGENT_MAX_CONTEXT_CHARS: ${AGENT_MAX_CONTEXT_CHARS:-96000}
+      # 多角色协作（planner/estimator/risk/critic）单次最多产出的角色步骤数
+      AGENT_COLLAB_MAX_STEPS: ${AGENT_COLLAB_MAX_STEPS:-6}
       AGENT_SESSION_TTL_SECONDS: ${AGENT_SESSION_TTL_SECONDS:-3600}
       # 会话存储：单副本用 memory；多副本/多 worker 改为 redis 并设置 REDIS_URL
       SESSION_STORE: ${SESSION_STORE:-memory}
       REDIS_URL: ${REDIS_URL:-}
+      # 主动巡检（后台巡检 Agent）：只聚合引擎事实 + 增量比对，经 WS 推送增量预警
+      PATROL_ENABLED: ${PATROL_ENABLED:-true}
+      PATROL_INTERVAL_SECONDS: ${PATROL_INTERVAL_SECONDS:-300}
+      PATROL_MAX_PLANS: ${PATROL_MAX_PLANS:-20}
+      PATROL_ALERT_COOLDOWN_SECONDS: ${PATROL_ALERT_COOLDOWN_SECONDS:-1800}
+      PATROL_FINDING_TTL_SECONDS: ${PATROL_FINDING_TTL_SECONDS:-86400}
+      PATROL_MAX_FINDINGS: ${PATROL_MAX_FINDINGS:-200}
+      PATROL_ESCALATE_SEVERITY: ${PATROL_ESCALATE_SEVERITY:-critical}
+      # 迭代复盘 + 学习：确定性统计 + 结论，可选写回长期记忆（闭环反哺后续规划）
+      RETRO_WRITE_MEMORY: ${RETRO_WRITE_MEMORY:-true}
+      RETRO_MAX_MEMORIES: ${RETRO_MAX_MEMORIES:-4}
+      # What-if 沙盘：自然语言情景 → 临时计划 → 引擎重算 → 增量对比（临时计划即时回收）
+      WHATIF_MAX_TASK_EDITS: ${WHATIF_MAX_TASK_EDITS:-10}
       # 缓存加速（可选）：保存确定性的向量化结果，重复问答省掉上游往返；故障 fail-open
       CACHE_BACKEND: ${CACHE_BACKEND:-auto}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}

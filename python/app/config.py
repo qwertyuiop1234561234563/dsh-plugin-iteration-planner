@@ -39,7 +39,12 @@ class Settings(BaseSettings):
 
     # ------------------------------ HTTP 服务 ------------------------------
     api_host: str = "0.0.0.0"
-    api_port: int = 8080
+    #: 本网关（Python 对外服务）的监听端口，环境变量为 ``GATEWAY_PORT``。
+    #:
+    #: 刻意**不复用** ``API_PORT``：TS 算法引擎同样读 ``API_PORT``，而两者共用仓库根
+    #: 的同一份 ``.env``（单一事实来源）。同名会导致本地联调时引擎与网关都去绑定 8080，
+    #: 后者启动失败或抢占端口。docker compose 中各容器分别显式赋值，故不受影响。
+    gateway_port: int = 8080
     api_base_path: str = "/api"
     api_ws_path: str = "/ws"
     #: CORS 允许来源；``*`` 表示全部放开，多个来源用英文逗号分隔
@@ -133,6 +138,35 @@ class Settings(BaseSettings):
     agent_session_lock_ttl_seconds: float = 300.0
     #: 会话分布式锁获取等待上限（秒）；超时以 SESSION_BUSY(409) 明确失败，避免并发覆盖上下文
     agent_session_lock_wait_seconds: float = 20.0
+    #: 多角色协作编排（planner/estimator/scheduler/risk/critic）单次最多产出的角色步骤数
+    agent_collab_max_steps: int = 6
+
+    # ------------------------ 主动巡检（后台巡检 Agent） ------------------------
+    #: 是否启用后台定时巡检：对可见计划做异常信号聚合 + 与上次快照增量比对，经 WS 推送预警。
+    #: 首轮巡检**延迟一个周期**执行（不在启动瞬间集中打引擎），因此不影响启动耗时。
+    patrol_enabled: bool = True
+    #: 巡检周期（秒）。每个被巡检计划需要一次 ``GET /plans/{id}``，故默认 5 分钟；
+    #: 调得过短会让后台持续占用引擎连接，影响交互式请求。
+    patrol_interval_seconds: float = 300.0
+    #: 单轮巡检最多检查的计划数（计划很多时截断，防止把引擎打满）
+    patrol_max_plans: int = 20
+    #: 同一信号的告警冷却时间（秒）：冷却期内该信号不重复推送（置 0 表示不去重）
+    patrol_alert_cooldown_seconds: float = 1800.0
+    #: 巡检发现保留时长（秒）与条数上限（供前端「主动预警」列表展示）
+    patrol_finding_ttl_seconds: float = 86400.0
+    patrol_max_findings: int = 200
+    #: 达到该严重度即视为「需立即处理」（前端高亮 / 可据此接告警通道）
+    patrol_escalate_severity: str = "critical"
+
+    # ------------------------ 迭代复盘 + 学习 ------------------------
+    #: 是否把复盘结论写回长期记忆（闭环「学习」，用于反哺后续规划的估算与风险口径）
+    retro_write_memory: bool = True
+    #: 一次复盘最多写回的记忆条数
+    retro_max_memories: int = 4
+
+    # ------------------------ What-if 沙盘（自然语言仿真） ------------------------
+    #: 单次仿真最多接受的「任务级扰动」条数（防止把临时计划改得面目全非而失去可比性）
+    whatif_max_task_edits: int = 10
 
     # ------------------------------ 缓存（可选加速） ------------------------------
     #: 缓存后端：auto（配置了 REDIS_URL 且依赖可用则用 Redis，否则进程内存）| memory | redis
@@ -318,6 +352,14 @@ class Settings(BaseSettings):
     def ws_url_suffix(self) -> str:
         """引擎 WebSocket 路径（与 TS 侧保持一致）。"""
         return self.api_ws_path
+
+    @property
+    def resolved_patrol_escalate_severity(self) -> str:
+        """巡检「需立即处理」阈值（归一化并校验，非法值静默回落 ``critical``）。"""
+        from .constants import PATROL_SEVERITIES
+
+        value = (self.patrol_escalate_severity or "").strip().lower()
+        return value if value in PATROL_SEVERITIES else "critical"
 
 
 @lru_cache(maxsize=1)

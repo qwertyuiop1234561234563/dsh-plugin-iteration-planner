@@ -13,6 +13,8 @@ import type {
   AdviceResult,
   AgentChatRequest,
   AgentChatResult,
+  AgentCollabRequest,
+  AgentCollabStep,
   AgentConfirmResult,
   AgentHealth,
   AgentPendingAction,
@@ -61,6 +63,9 @@ import type {
   MemorySearchResult,
   MemoryStats,
   PlanSummary,
+  PatrolFindingsResult,
+  PatrolRunResult,
+  PatrolSignalsResult,
   PreferenceBlob,
   ProjectPlan,
   QualityResult,
@@ -69,6 +74,8 @@ import type {
   RegisterPayload,
   ReplanPayload,
   ReportResult,
+  RetroRequest,
+  RetroResult,
   RiskItem,
   ScenarioCompareRequest,
   ScenarioCompareResult,
@@ -76,6 +83,8 @@ import type {
   TaskHistoryResult,
   TaskMutationResult,
   TaskUpdatePayload,
+  WhatIfRequest,
+  WhatIfResult,
   WorkloadResult,
 } from './types'
 
@@ -303,6 +312,40 @@ export const api = {
   /** 清空 Agent 会话上下文（含未确认的写操作） */
   agentResetSession: (sessionId: string) =>
     http.delete(`/agent/sessions/${encodeURIComponent(sessionId)}`).then(() => undefined),
+
+  /* --------------------- Agent 高级能力：协作 / 沙盘 / 复盘 / 巡检 --------------------- */
+
+  /** 多角色协作的角色与步骤说明（时间线图例） */
+  agentCollabSteps: () => unwrap<AgentCollabStep[]>(http.get('/agent/collab/steps')),
+
+  /**
+   * 多角色协作（SSE：`step` 角色时间线 → `tool_start`/`tool_result` 引擎排期 → `pending`
+   * 估算修正待确认 → `final` 结论）。`AbortSignal` 支持「中断协作」。
+   */
+  agentCollabStream: (payload: AgentCollabRequest, handlers: AgentCollabHandlers, signal?: AbortSignal) =>
+    agentCollabStream(payload, handlers, signal),
+
+  /**
+   * What-if 沙盘：自然语言情景 → 引擎重算 → 增量对比。
+   *
+   * 后端会临时生成情景计划并**即时回收**，不污染基线；耗时为引擎侧全量算法计算，故放宽超时。
+   */
+  agentWhatIf: (payload: WhatIfRequest, signal?: AbortSignal) =>
+    unwrap<WhatIfResult>(http.post('/agent/whatif', payload, { timeout: 180_000, signal })),
+
+  /** 迭代复盘 + 学习：确定性统计 + 结论（可选写回长期记忆） */
+  agentRetro: (payload: RetroRequest, signal?: AbortSignal) =>
+    unwrap<RetroResult>(http.post('/agent/retro', payload, { timeout: 180_000, signal })),
+
+  /** 巡检发现列表（可按计划过滤；含巡检运行状态与信号图例） */
+  patrolFindings: (params: { planId?: string; limit?: number } = {}) =>
+    unwrap<PatrolFindingsResult>(http.get('/agent/patrol/findings', { params })),
+
+  /** 立即执行一轮巡检（只读 + 推送增量预警，不改数据） */
+  patrolRun: () => unwrap<PatrolRunResult>(http.post('/agent/patrol/run', {}, { timeout: 120_000 })),
+
+  /** 巡检信号与严重度说明（前端图例） */
+  patrolSignals: () => unwrap<PatrolSignalsResult>(http.get('/agent/patrol/signals')),
 
   /** What-if 情景对比：以同需求 + 情景约束临时生成计划并与基线对比（后端会即时回收临时计划） */
   scenarioCompare: (payload: ScenarioCompareRequest) =>
@@ -627,6 +670,70 @@ export async function agentChatStream(
     `${API_BASE}/agent/chat/stream`,
     { method: 'POST', body: JSON.stringify(payload), contentType: 'application/json', signal },
     (frame, status) => dispatchSseFrame(frame, handlers, status),
+  )
+}
+
+/* ----------------------- 多角色协作（SSE · /agent/collab/stream） ----------------------- */
+
+/** 多角色协作流事件回调（`step` 驱动角色时间线，其余与对话流同构） */
+export interface AgentCollabHandlers {
+  /** 角色步骤状态变更（running / done / failed / skipped） */
+  onStep?: (step: AgentCollabStep) => void
+  /** 开始调用引擎工具（排期角色） */
+  onToolStart?: (name: string) => void
+  /** 引擎工具调用结果 */
+  onToolResult?: (record: AgentStreamToolResult) => void
+  /** 估算审阅给出的待确认写操作（确认前不落库） */
+  onPending?: (actions: AgentPendingAction[]) => void
+  /** 终态：结论与计划 */
+  onFinal?: (result: AgentChatResult) => void
+}
+
+/** 解析协作流帧：在对话流事件之上增加 `step`（角色时间线）。 */
+function dispatchCollabFrame(frame: string, handlers: AgentCollabHandlers, status: number): void {
+  const parsed = parseSseFrame(frame)
+  if (!parsed) return
+  const { name, data } = parsed
+  switch (name) {
+    case 'step':
+      handlers.onStep?.(data as AgentCollabStep)
+      break
+    case 'tool_start':
+      handlers.onToolStart?.((data as { name?: string }).name ?? '')
+      break
+    case 'tool_result':
+      handlers.onToolResult?.(data as AgentStreamToolResult)
+      break
+    case 'pending':
+      handlers.onPending?.((data as { actions?: AgentPendingAction[] }).actions ?? [])
+      break
+    case 'final':
+      handlers.onFinal?.(data as AgentChatResult)
+      break
+    case 'error': {
+      const body = data as ApiErrorBody
+      throw new ApiClientError(
+        body?.message ?? '协作流响应出错',
+        body?.code ?? 'STREAM_ERROR',
+        status,
+        body?.details,
+      )
+    }
+    default:
+      break
+  }
+}
+
+/** 多角色协作流式编排（SSE）。`AbortSignal` 支持「中断协作」，已产出的步骤与内容保留。 */
+export async function agentCollabStream(
+  payload: AgentCollabRequest,
+  handlers: AgentCollabHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  await streamSse(
+    `${API_BASE}/agent/collab/stream`,
+    { method: 'POST', body: JSON.stringify(payload), contentType: 'application/json', signal },
+    (frame, status) => dispatchCollabFrame(frame, handlers, status),
   )
 }
 

@@ -148,44 +148,59 @@ class EngineClient:
 
         merged_headers = self._merge_headers(headers)
         retry_index = 0
-        while True:
-            try:
-                response = await self._client.request(
-                    method,
-                    url,
-                    json=json,
-                    params=params,
-                    content=content,
-                    headers=merged_headers,
-                    timeout=request_timeout,
-                )
-            except httpx.HTTPError as exc:  # 连接失败 / 超时
-                if retry_index < self._retry.attempts and is_retryable_exception(exc, method):
-                    METRICS.inc_counter("engine_request_retries_total", {"method": method, "reason": "transport"})
+        # 每一次「放行」都必须配套结算：成功 / 失败 / 归还半开名额三者之一。
+        # 半开态只放行有限次探测，若调用因**取消**（客户端断连、服务端关机）而未结算，
+        # 探测名额不会被归还，断路器会永远停在 half_open 却持续阻断全部引擎调用。
+        try:
+            while True:
+                try:
+                    response = await self._client.request(
+                        method,
+                        url,
+                        json=json,
+                        params=params,
+                        content=content,
+                        headers=merged_headers,
+                        timeout=request_timeout,
+                    )
+                except httpx.HTTPError as exc:  # 连接失败 / 超时
+                    if retry_index < self._retry.attempts and is_retryable_exception(exc, method):
+                        METRICS.inc_counter("engine_request_retries_total", {"method": method, "reason": "transport"})
+                        await asyncio.sleep(self._retry.delay_for(retry_index))
+                        retry_index += 1
+                        continue
+                    self._breaker.record_failure()
+                    # 严格区分「可达但慢」与「连不上」（RFC 9110）：
+                    #   504 —— 连接已建立、引擎在处理但未在时限内返回（ReadTimeout / WriteTimeout）；
+                    #   502 —— 未能建立连接（ConnectTimeout / PoolTimeout / ConnectError）或
+                    #          上游中途断开 / 协议错误（ReadError / RemoteProtocolError）。
+                    # 混用会让监控与调用方把「慢」误判为「挂了」，也无法据此判断是否值得重试。
+                    raise self._transport_error(exc, method) from exc
+
+                if retry_index < self._retry.attempts and is_retryable_status(response.status_code, method):
+                    METRICS.inc_counter("engine_request_retries_total", {"method": method, "reason": "status"})
                     await asyncio.sleep(self._retry.delay_for(retry_index))
                     retry_index += 1
                     continue
-                self._breaker.record_failure()
-                # 严格区分「可达但慢」与「连不上」（RFC 9110）：
-                #   504 —— 连接已建立、引擎在处理但未在时限内返回（ReadTimeout / WriteTimeout）；
-                #   502 —— 未能建立连接（ConnectTimeout / PoolTimeout / ConnectError）或
-                #          上游中途断开 / 协议错误（ReadError / RemoteProtocolError）。
-                # 混用会让监控与调用方把「慢」误判为「挂了」，也无法据此判断是否值得重试。
-                raise self._transport_error(exc, method) from exc
 
-            if retry_index < self._retry.attempts and is_retryable_status(response.status_code, method):
-                METRICS.inc_counter("engine_request_retries_total", {"method": method, "reason": "status"})
-                await asyncio.sleep(self._retry.delay_for(retry_index))
-                retry_index += 1
-                continue
-
-            if response.status_code >= 500:
-                self._breaker.record_failure()
-                METRICS.inc_counter("engine_requests_total", {"method": method, "outcome": "server_error"})
-            else:
-                self._breaker.record_success()
-                METRICS.inc_counter("engine_requests_total", {"method": method, "outcome": "success"})
-            return response
+                if response.status_code >= 500:
+                    self._breaker.record_failure()
+                    METRICS.inc_counter("engine_requests_total", {"method": method, "outcome": "server_error"})
+                else:
+                    self._breaker.record_success()
+                    METRICS.inc_counter("engine_requests_total", {"method": method, "outcome": "success"})
+                return response
+        except asyncio.CancelledError:
+            # 取消不是引擎故障：不记失败、不改变状态，只归还本次探测名额
+            self._breaker.release_probe()
+            raise
+        except ApiError:
+            # 传输层错误已在上面按失败结算（record_failure），不可重复计数
+            raise
+        except BaseException:
+            # 其余未归类异常同样必须结算，否则会留下未归还的探测名额
+            self._breaker.record_failure()
+            raise
 
     @staticmethod
     def _merge_headers(headers: dict[str, str] | None) -> dict[str, str]:
@@ -215,9 +230,14 @@ class EngineClient:
         """
         if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout, asyncio.TimeoutError)):
             METRICS.inc_counter("engine_requests_total", {"method": method, "outcome": "timeout"})
-            return gateway_timeout(f"算法引擎处理超时（> {exc.__class__.__name__}）")
+            # 只把异常类型记到服务端日志：**异常类名同样属于内部实现细节**
+            # （暴露 httpx 的连接/协议错误类型会提示内部拓扑与库版本），不回显给调用方
+            logger.warning("引擎响应超时：method=%s type=%s detail=%s", method, exc.__class__.__name__, exc)
+            return gateway_timeout()
         METRICS.inc_counter("engine_requests_total", {"method": method, "outcome": "unreachable"})
-        return bad_gateway(f"算法引擎不可达：{exc.__class__.__name__}")
+        # 5xx 一律使用统一通用文案：不得泄漏上游连接细节、引擎地址或原始异常信息
+        logger.warning("引擎不可达：method=%s type=%s detail=%s", method, exc.__class__.__name__, exc)
+        return bad_gateway()
 
     @staticmethod
     def _to_api_error(response: httpx.Response) -> ApiError:
@@ -233,9 +253,11 @@ class EngineClient:
                 str(body["message"]),
                 body.get("details"),
             )
+        # 引擎返回了不符合契约的响应体（通常是 500 的 HTML / 纯文本页）：原文可能含堆栈与
+        # 内部地址，只记服务端日志，不放进 ``details`` 反射给调用方（保持 5xx 通用文案）
+        logger.warning("引擎返回非契约错误体：status=%s body=%s", response.status_code, response.text[:500])
         return ApiError(
             response.status_code,
             "ENGINE_ERROR",
             f"算法引擎返回异常状态：{response.status_code}",
-            response.text[:1000],
         )

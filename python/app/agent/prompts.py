@@ -135,6 +135,224 @@ def build_advice_instruction(plan: dict[str, Any]) -> str:
     )
 
 
+# ======================= What-if 沙盘（自然语言仿真） =======================
+
+WHATIF_PARSER_SYSTEM_PROMPT = """你是「迭代计划 · What-if 沙盘」的意图解析器。用户会用一句话描述一个情景改动假设（例如「后端延期 3 天」「再加 2 个人」「把数据库设计的工时提到 12 小时」）。
+
+你的唯一职责是把它解析为**结构化情景参数**，供系统调用算法引擎重算。你**不计算**任何工期、关键路径或风险。
+
+输出**严格 JSON**（不要任何解释文字、前后缀或 Markdown 代码块）：
+{
+  "intent": "一句话复述你所理解的情景改动",
+  "constraints": {"iterationDeadline": "YYYY-MM-DD", "iterationStartDate": "YYYY-MM-DD", "devMemberCount": 4},
+  "taskEdits": [{"task": "任务名称或 taskId", "field": "estimatedHours|assignee|priority|status", "value": 12, "reason": "为什么这样改"}]
+}
+
+规则：
+1. `constraints` **只填用户明确要求改动的字段**，未提及的字段一律省略（不要填空值、不要填基线值）。
+2. 延期语义请换算为绝对日期：若用户说「延期 3 天」，就在 `iterationDeadline` 上填**基线截止日期 + 3 天**的日期（基线日期见输入）。
+3. 「加 2 人 / 减少 1 人」按基线人数换算为 `devMemberCount` 的绝对值。
+4. 任务级扰动（改工时 / 改责任人 / 改优先级 / 改状态）放进 `taskEdits`，`task` 必须能与输入的任务清单匹配（任务名或 taskId），`value` 类型随 `field` 而定。
+5. 若用户的描述完全无法映射为上述字段，输出 `{"intent": "...", "constraints": {}, "taskEdits": [], "unparsed": true}`。
+6. 不得编造任务名：`task` 必须来自输入任务清单，找不到匹配时该条不要输出。"""
+
+
+def build_whatif_instruction(instruction: str, plan: dict[str, Any]) -> str:
+    """构造 What-if 解析指令（基线约束 + 任务清单作为数据处理）。"""
+    tasks = plan.get("taskList") or []
+    payload = {
+        "baseline": {
+            "iterationDeadline": plan.get("iterationDeadline"),
+            "iterationStartDate": plan.get("iterationStartDate"),
+            "devMemberCount": plan.get("devMemberCount"),
+        },
+        "tasks": [
+            {
+                "taskId": task.get("taskId"),
+                "taskName": task.get("taskName"),
+                "estimatedHours": task.get("estimatedHours"),
+                "assignee": task.get("assignee"),
+                "priority": task.get("priority"),
+                "status": task.get("status"),
+            }
+            for task in tasks
+        ],
+    }
+    return (
+        "以下是基线计划的约束与任务清单。请把用户的情景区改动解析为结构化参数。\n\n"
+        f"{wrap_untrusted(instruction)}\n\n"
+        f"【基线计划】\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+        "严格按给定 JSON 结构输出。"
+    )
+
+
+# =================== 多角色协作编排（plan-act-observe） ===================
+# 参考 OpenHands / CrewAI 的角色分工：每个角色只做一件事，产出**可核对**的结构化结果，
+# 且算法数值一律来自引擎工具，角色不得自行计算工期 / 关键路径 / 风险。
+
+PLANNER_ROLE_PROMPT = """你是迭代规划的「需求分析角色」。你的产出会作为**需求补充说明**送入算法引擎，
+影响引擎的拆解粒度与验收边界，因此必须严谨、无臆造。
+
+只做三件事：
+1. 补全需求的**业务边界与验收标准**（用户没写清的，按行业惯例给出明确假设，并标注「假设」）；
+2. 列出建议的**拆解维度与必须产出的交付物**（如接口协议、数据库变更、灰度方案）；
+3. 标出需求中**相互矛盾或高风险**的表述。
+
+禁止：计算或给出任何工时、工期、关键路径、风险等级数值（这些由算法引擎产出）。
+输出结构化 JSON：{"brief": "补全后的需求补充说明（可直接并入需求原文）", "acceptance": ["验收点1", "验收点2"], "assumptions": ["假设1"], "risks": ["需人工确认的矛盾点"]}
+严格 JSON，不要解释文字与代码块。"""
+
+ESTIMATOR_ROLE_PROMPT = """你是迭代计划的「估算审阅角色」。系统会给你**算法引擎刚产出的真实任务清单**
+（含 taskId / taskName / estimatedHours / predecessorTaskIds / assignee / slack）。
+
+你的职责：
+1. 找出**工时明显偏离常识**或**粒度失衡**的任务（过大/过小/含糊到无法执行）；
+2. 找出**依赖关系可疑**的任务（该有前置却没有、前置指向了无关任务）；
+3. 对每个问题给出**具体可执行的修正建议**，并说明理由。
+
+严禁编造 taskId 或任务名：`task` 必须严格取自输入清单（用 taskName 或 taskId 原文）。
+严禁自行推算工期 / 关键路径 / 风险等级。
+输出结构化 JSON：{"summary": "整体估算研判", "changes": [{"task": "任务名或taskId", "field": "estimatedHours|predecessorTaskIds", "value": 12, "reason": "理由"}]}
+若无需修正，输出 {"summary": "估算合理", "changes": []}。严格 JSON。"""
+
+CRITIC_ROLE_PROMPT = """你是迭代计划的「质量校验角色」。系统会给你：①需求补充说明与验收点；②算法引擎产出的任务清单、
+关键路径、风险清单、迭代约束。你要做**独立复核**，回答「这份计划是否真的覆盖了需求、是否可交付」。
+
+检查清单：
+1. 每个验收点是否都有对应任务承接（缺失即列为缺口）；
+2. 关键路径任务是否都有明确责任人（assignee 为空即列为缺口）；
+3. 是否存在「孤立任务」（既无前置也无后继且与交付无关）；
+4. 排期是否满足截止日期（以引擎返回的完成日期与截止日期比较为准，不得自行推算）；
+5. 风险清单中的高风险项是否在计划里有对应动作。
+
+输出结构化 JSON：{"ready": true|false, "gaps": ["缺口1"], "recommendations": ["改进建议1"], "verdict": "一句话结论"}
+`ready` 仅在**无阻断性缺口**时为 true。严格 JSON。"""
+
+
+def build_planner_instruction(requirement: str, *, iteration_deadline: str, dev_member_count: int) -> str:
+    """planner 角色指令。"""
+    return (
+        f"{wrap_untrusted(requirement)}\n\n"
+        f"【迭代截止日期】{iteration_deadline}\n【可用开发人数】{dev_member_count}\n\n"
+        "请按角色要求输出结构化 JSON（brief / acceptance / assumptions / risks）。"
+    )
+
+
+def build_estimator_instruction(plan: dict[str, Any], planner_brief: str) -> str:
+    """estimator 角色指令（引擎真实任务清单作为数据处理）。"""
+    tasks = plan.get("taskList") or []
+    payload = [
+        {
+            "taskId": task.get("taskId"),
+            "taskName": task.get("taskName"),
+            "taskType": task.get("taskType"),
+            "estimatedHours": task.get("estimatedHours"),
+            "predecessorTaskIds": task.get("predecessorTaskIds"),
+            "assignee": task.get("assignee"),
+            "slack": task.get("slack"),
+            "status": task.get("status"),
+        }
+        for task in tasks
+    ]
+    brief = f"【需求补充说明】\n{planner_brief}\n\n" if planner_brief else ""
+    return (
+        f"{brief}"
+        f"【引擎产出的真实任务清单】\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+        "请按角色要求输出结构化 JSON（summary / changes）。"
+    )
+
+
+def build_critic_instruction(plan: dict[str, Any], acceptance: list[str], planner_brief: str) -> str:
+    """critic 角色指令（引擎指标与风险作为数据处理）。"""
+    tasks = plan.get("taskList") or []
+    payload = {
+        "iterationDeadline": plan.get("iterationDeadline"),
+        "totalDurationHours": plan.get("totalDurationHours"),
+        "totalEstimatedHours": plan.get("totalEstimatedHours"),
+        "criticalPath": plan.get("criticalPath") or [],
+        "risks": [
+            {"level": risk.get("level"), "description": risk.get("description"), "taskIds": risk.get("taskIds") or []}
+            for risk in (plan.get("riskList") or [])
+            if isinstance(risk, dict)
+        ],
+        "tasks": [
+            {
+                "taskId": task.get("taskId"),
+                "taskName": task.get("taskName"),
+                "assignee": task.get("assignee"),
+                "predecessorTaskIds": task.get("predecessorTaskIds"),
+                "estimatedHours": task.get("estimatedHours"),
+            }
+            for task in tasks
+        ],
+        "plannedEndDate": (plan.get("burndownRawData") or [{}])[-1].get("time")
+        if plan.get("burndownRawData")
+        else None,
+    }
+    brief = f"【需求补充说明】\n{planner_brief}\n\n" if planner_brief else ""
+    return (
+        f"{brief}"
+        f"【验收点】\n{json.dumps(acceptance, ensure_ascii=False)}\n\n"
+        f"【引擎产出的事实】\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+        "请按角色要求输出结构化 JSON（ready / gaps / recommendations / verdict）。"
+    )
+
+
+# =================== 迭代复盘 + 学习 ===================
+
+RETRO_ANALYST_SYSTEM_PROMPT = """你是资深研发项目经理，擅长做**迭代复盘**与**估算校准**。
+
+系统会给你一份由确定性代码统计好的复盘指标（工时偏差、交付偏移、风险兑现率、估算校准分桶、相对基线的范围变更），
+以及引擎当前计划的任务清单与风险清单。你的职责是把它**翻译成可执行的改进结论**，并给出下一迭代的口径调整建议。
+
+严格遵守：
+1. 所有数值均来自输入的统计数据与引擎事实，你**不得重新计算或改写**任何数字；
+2. 结论必须具体、可执行，禁止「加强沟通」「注意风险」这类空泛套话；
+3. `memories` 是写回长期记忆的**校准结论**（每条自包含、含具体口径，例如「本团队 API 开发类任务平均超支约 30%，下一轮按 1.3 倍系数预估」），
+   最多 4 条，禁止把一次性数字（如某个 taskId 的工时）写成长期记忆。
+
+输出**严格 JSON**（不要解释文字与代码块）：
+{"summary": "整体复盘结论", "highlights": ["做得好的地方"], "problems": ["主要问题"], "actions": ["下一迭代的改进动作（按优先级）"], "memories": ["可长期复用的校准结论"]}"""
+
+
+def build_retro_instruction(plan: dict[str, Any], metrics: dict[str, Any]) -> str:
+    """构造复盘分析指令（统计数据与引擎事实作为数据处理）。"""
+    tasks = plan.get("taskList") or []
+    payload = {
+        "plan": {
+            "iterationDeadline": plan.get("iterationDeadline"),
+            "iterationStartDate": plan.get("iterationStartDate"),
+            "devMemberCount": plan.get("devMemberCount"),
+            "totalDurationHours": plan.get("totalDurationHours"),
+            "totalEstimatedHours": plan.get("totalEstimatedHours"),
+            "criticalPath": plan.get("criticalPath") or [],
+            "risks": [
+                {"level": risk.get("level"), "description": risk.get("description"), "taskIds": risk.get("taskIds") or []}
+                for risk in (plan.get("riskList") or [])
+                if isinstance(risk, dict)
+            ],
+            "tasks": [
+                {
+                    "taskId": task.get("taskId"),
+                    "taskName": task.get("taskName"),
+                    "taskType": task.get("taskType"),
+                    "estimatedHours": task.get("estimatedHours"),
+                    "status": task.get("status"),
+                }
+                for task in tasks
+            ],
+        },
+        "computed": metrics,
+    }
+    requirement = plan.get("rawRequirement") or ""
+    return (
+        "以下是一个迭代的复盘统计数据与计划事实，请给出复盘结论与下一迭代的改进口径。\n\n"
+        f"{wrap_untrusted(requirement)}\n\n"
+        f"【复盘数据】\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+        "严格按给定 JSON 结构输出（summary / highlights / problems / actions / memories）。"
+    )
+
+
 __all__ = [
     "ITERATION_PLANNER_SYSTEM_PROMPT",
     "RISK_ADVISOR_SYSTEM_PROMPT",
@@ -142,6 +360,16 @@ __all__ = [
     "build_advice_instruction",
     "transient_hint",
     "describe_tools",
+    "WHATIF_PARSER_SYSTEM_PROMPT",
+    "build_whatif_instruction",
+    "PLANNER_ROLE_PROMPT",
+    "ESTIMATOR_ROLE_PROMPT",
+    "CRITIC_ROLE_PROMPT",
+    "build_planner_instruction",
+    "build_estimator_instruction",
+    "build_critic_instruction",
+    "RETRO_ANALYST_SYSTEM_PROMPT",
+    "build_retro_instruction",
 ]
 
 

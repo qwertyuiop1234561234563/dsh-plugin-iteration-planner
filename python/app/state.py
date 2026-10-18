@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .agent import AgentRunner
 from .agent.memory import MemoryService
@@ -19,10 +20,14 @@ from .engine_client import EngineClient
 from .kb.embedder import Embedder
 from .kb.pipeline import KnowledgeBaseService
 from .metrics import Metrics
+from .patrol import PatrolService
 from .security import RateLimitBackend
 from .sessions import SessionStore
 from .workstore import WorkspaceStore
 from .ws import EngineEventBridge, WsBroadcaster
+
+if TYPE_CHECKING:
+    from .agent.tools import ToolDispatcher
 
 
 @dataclass
@@ -32,6 +37,8 @@ class AppContext:
     settings: Settings
     engine: EngineClient
     runner: AgentRunner
+    #: 工具调度器（多角色协作与 Agent 编排共用同一份工具实现，避免两处口径漂移）
+    dispatcher: "ToolDispatcher"
     broadcaster: WsBroadcaster
     bridge: EngineEventBridge
     metrics: Metrics
@@ -39,6 +46,8 @@ class AppContext:
     workspace: WorkspaceStore
     started_at: float
     version: str
+    #: 主动巡检服务；``PATROL_ENABLED=false`` 时为 ``None``（相关端点返回未启用）
+    patrol: PatrolService | None = None
     #: 知识库服务；未配置向量化模型时为 ``None``（相关端点返回 503 并说明原因）
     knowledge: KnowledgeBaseService | None = None
     #: 长期记忆服务；未配置向量化模型或显式关闭时为 ``None``

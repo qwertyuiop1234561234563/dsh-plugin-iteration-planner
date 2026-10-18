@@ -373,7 +373,7 @@ Demo 依次演示：
 除作为 dsh 插件嵌入 Harness 外，本项目额外提供**可独立落地的企业级控制台**：
 一套 Vue3 SPA + Python 对外服务（FastAPI）+ 内部算法引擎（Fastify）。三者共用同一份算法层与服务层，**算法与服务代码零改动**。
 
-### 10.1 架构与数据流
+### 9.1 架构与数据流
 
 ```
 浏览器 (Vue3 SPA)
@@ -401,7 +401,7 @@ Python 对外服务（FastAPI 网关 + LLM Agent 编排）  ← 唯一对外入�
 - **多计划隔离**：每个计划一个独立 `PlannerService` 实例，由 `PlanSessionManager` 懒加载并在首次写操作时从仓储恢复。
 - **实时性**：任一客户端的写操作成功后，经事件总线通过 WebSocket 广播，其他页面自动刷新。
 
-### 10.2 本地开发（前后端分离）
+### 9.2 本地开发（前后端分离）
 
 ```bash
 # 终端 1：启动 API 服务（默认 http://localhost:8080）
@@ -414,7 +414,12 @@ npm run web:dev
 
 打开 `http://localhost:5173` 即进入控制台。开发态由 Vite 代理转发到 API，无需处理跨域。
 
-### 10.3 生产构建（同域一体化托管）
+> **上面只起了「引擎 + 前端」两件套**（不含 Agent 能力，`/api/agent/*` 会返回 404）：
+> AI 助手、知识库与长期记忆等 Agent 能力都由 **Python 对外服务** 提供，需另按 §10.2 启动
+> （`ENGINE_BASE_URL=http://127.0.0.1:8080 GATEWAY_PORT=8000 python python/run.py`，前端代理指向它）。
+> 生产一体化托管（含 Agent）见 §10.7。
+
+### 9.3 生产构建（同域一体化托管）
 
 API 服务会自动托管 `WEB_STATIC_DIR` 指定的前端产物，并支持 history 路由回落 `index.html`：
 
@@ -423,7 +428,7 @@ npm run web:build                                        # 产物输出到 web/d
 WEB_STATIC_DIR=web/dist npm run api:start                # 访问 http://localhost:8080
 ```
 
-### 10.4 Docker Compose 一键部署（app + PostgreSQL）
+### 9.4 Docker Compose 一键部署（app + PostgreSQL）
 
 ```bash
 # 1) 准备环境变量（账号体系默认开启；引导管理员口令留空会自动生成并打印一次）
@@ -443,13 +448,14 @@ docker compose up -d --build
 
 > 需要 TLS 终止或统一网关时，可选用 [`deploy/nginx.conf`](./deploy/nginx.conf) 作为反代示例（含 WebSocket 升级与长超时配置）。
 
-### 10.5 关键环境变量
+### 9.5 关键环境变量
 
 完整清单见 [`.env.example`](./.env.example)。核心项：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `API_HOST` / `API_PORT` | `0.0.0.0` / `8080` | 监听地址与端口 |
+| `API_HOST` / `API_PORT` | `0.0.0.0` / `8080` | **TS 算法引擎**监听地址与端口（引擎与网关共用仓库根同一份 `.env`，故端口变量必须区分） |
+| `GATEWAY_PORT` | `8080` | **Python 网关**监听端口（本地联调推荐 `8000`，见 §10.2）。刻意不复用 `API_PORT`：同名会让引擎与网关抢同一个端口 |
 | `API_BASE_PATH` | `/api` | REST 路由前缀（Swagger UI 位于 `<前缀>/docs`） |
 | `API_TOKEN` | 空 | **机器 / CI 令牌**（服务账号语义，等价管理员但无人类身份）；**留空表示不启用机器令牌**（健康检查、文档、静态资源始终放行）。人类用户一律走登录 + 会话 Cookie，见 §10.10 |
 | `AUTH_ENABLED` | `true` | 登录 + 角色鉴权总开关；关闭后 `/api/**` 与 `/ws` 整体不鉴权（仅用于本地排障） |
@@ -474,8 +480,15 @@ docker compose up -d --build
 | `API_MAX_BODY_BYTES` | `33554432` | 请求体大小上限（字节，`0` 关闭）；超限即 413 `PAYLOAD_TOO_LARGE`，须 ≥ `KB_MAX_DOCUMENT_BYTES` + multipart 开销 |
 | `KB_DETAIL_PREVIEW_CHUNKS` | `50` | 文档详情返回的分块**预览**条数上限（`chunkCount` 始终为真实总数）；超大文档分块上万，全量返回会让单次响应达数十 MB |
 | `WS_SEND_TIMEOUT_SECONDS` / `WS_MAX_CLIENTS` | `5.0` / `512` | 单客户端单条事件下发超时（秒，超时即断开该连接）/ 在线客户端上限（`0` 不限，超出以 close code `1013` 拒绝）；扇出为并发下发，慢客户端不会拖住其余客户端 |
+| `AGENT_COLLAB_MAX_STEPS` | `6` | 多角色协作（需求分析 / 引擎排期 / 估算审阅 / 风险缓解 / 质量校验）单次最多产出的角色步骤数 |
+| `PATROL_ENABLED` / `PATROL_INTERVAL_SECONDS` | `true` / `300` | 主动巡检开关 / 巡检周期（秒）；首轮**延迟一个周期**执行，不在启动瞬间集中打引擎 |
+| `PATROL_MAX_PLANS` / `PATROL_ALERT_COOLDOWN_SECONDS` | `20` / `1800` | 单轮最多巡检计划数（截断保护引擎）/ 同一信号重复推送的冷却时间（秒，`0` 表示不去重） |
+| `PATROL_FINDING_TTL_SECONDS` / `PATROL_MAX_FINDINGS` | `86400` / `200` | 巡检发现保留时长（秒）/ 条数上限（限制长期运行的内存增长） |
+| `PATROL_ESCALATE_SEVERITY` | `critical` | 达到该严重度即视为「需立即处理」并升级通知：`info` \| `warning` \| `critical` |
+| `RETRO_WRITE_MEMORY` / `RETRO_MAX_MEMORIES` | `true` / `4` | 复盘结论是否写回长期记忆（闭环学习）/ 单次最多写回条数 |
+| `WHATIF_MAX_TASK_EDITS` | `10` | What-if 沙盘单次最多接受的任务级扰动条数（防止临时计划失去可比性） |
 
-### 10.6 开放 API 一览
+### 9.6 开放 API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -502,7 +515,7 @@ docker compose up -d --build
 `ENGINE_TIMEOUT`(504，可达但超时，带 `Proxy-Status: iteration_planner; error="http_response_timeout"`)、`ENGINE_UNAVAILABLE`(502，连不上)、
 `JOB_NOT_FOUND`(404)、`JOB_CONFLICT`(409)、`JOB_STORE_UNAVAILABLE`(503)、`IDEMPOTENCY_IN_PROGRESS`(409，带 `Retry-After`)、`IDEMPOTENCY_KEY_REUSE`(422)、`PAYLOAD_TOO_LARGE`(413)。
 
-### 10.7 控制台页面功能
+### 9.7 控制台页面功能
 
 | 页面 | 能力 |
 |---|---|
@@ -513,6 +526,7 @@ docker compose up -d --build
 | 依赖 DAG | AntV X6 画布，按拓扑层级自动布局；关键路径红色、环内橙色虚线、孤立灰底；环 / 悬空依赖顶部告警；缩放与平移；节点详情面板 |
 | 知识库 | 文档清单（格式 / 分块数 / 字符数 / 标签）、上传文件或粘贴文本入库、分块预览、删除；检索试跑展示命中片段与得分，并可切换混合 / 纯向量模式 |
 | 长期记忆 | 记忆清单（类型 / 重要度 / 状态 / 来源 / 最近使用）、按状态与类型过滤、关键词搜索、启用停用、删除与清空、手工新增（写入前自动去重）；语义召回试跑展示相似度排序 |
+| AI 助手 | 全局悬浮球 + 会话抽屉（SSE 逐字流式、工具调用明细、知识库引用与召回记忆卡片、写操作两阶段确认）；顶部可在**对话 / 多角色协作 / What-if 沙盘 / 迭代复盘 / 主动巡检**之间切换，后四者见 §10.3.1 |
 | 审计日志 | 按计划过滤、条数上限、成功/失败与耗时统计、展开查看入参与返回值完整 JSON |
 | 账号与权限 | **仅管理员可见**：账号清单（角色 / 状态 / 最近登录）、新建账号、变更角色与状态、重置口令、删除；为访客（guest）指派可见计划白名单 |
 | 登录页 | 账号口令登录；登录态为服务端会话 Cookie，成功后跳回被守卫拦下的目标页 |
@@ -546,13 +560,15 @@ docker compose up -d --build
 # 终端 1：内部算法引擎（TS，默认 http://localhost:8080）
 npm run api:start
 
-# 终端 2：Python 对外服务（默认 http://localhost:8000）
+# 终端 2：Python 对外服务（默认 http://localhost:8000；端口变量为 GATEWAY_PORT，不是 API_PORT）
 python -m venv python/.venv
 python -m pip install -r python/requirements-dev.txt
-ENGINE_BASE_URL=http://127.0.0.1:8080 API_PORT=8000 python python/run.py
+ENGINE_BASE_URL=http://127.0.0.1:8080 GATEWAY_PORT=8000 python python/run.py
 ```
 
-> Windows PowerShell：`$env:ENGINE_BASE_URL="http://127.0.0.1:8080"; $env:API_PORT="8000"; python python/run.py`
+> Windows PowerShell：`$env:ENGINE_BASE_URL="http://127.0.0.1:8080"; $env:GATEWAY_PORT="8000"; python python/run.py`
+> **端口变量必须区分**：`API_PORT` 属于 TS 引擎，`GATEWAY_PORT` 属于 Python 网关。二者共用仓库根同一份 `.env`，
+> 若统一用 `API_PORT`，两个进程会去绑定同一个端口（先起者占用、后起者启动失败）。
 > 便捷脚本：`npm run py:install` / `npm run py:start` / `npm run py:test`。
 > 启用知识库与长期记忆：在仓库根 `.env` 中配置 `EMBEDDING_API_KEY`（留空则回落 `LLM_API_KEY`）；
 > 未配置时二者自动降级为「不可用」，主链路（算法与对话）不受影响。**注意 `Settings` 按进程当前目录读取 `.env`，需从仓库根启动。**
@@ -590,6 +606,13 @@ EMBEDDING_MODEL=BAAI/bge-m3
 | `POST` | `/api/agent/plan` | 自然语言需求 → 完整迭代计划（一次端到端编排） |
 | `POST` | `/api/agent/chat` | 会话式对话（携带上下文，多轮修改计划） |
 | `POST` | `/api/agent/chat/stream` | 同上，但以 **SSE 流式输出**（逐字下发 + 工具/待确认事件） |
+| `POST` | `/api/agent/collab/stream` | **多角色协作**（SSE 步骤流：需求分析 → 引擎排期 → 估算审阅 → 风险缓解 → 质量校验） |
+| `GET` | `/api/agent/collab/steps` | 协作角色与步骤说明（前端时间线图例） |
+| `POST` | `/api/agent/whatif` | **What-if 沙盘**：自然语言情景 → 引擎重算 → before/after 增量对比 |
+| `POST` | `/api/agent/retro` | **迭代复盘 + 学习**：确定性统计 + 结论（可选写回长期记忆） |
+| `GET` | `/api/agent/patrol/findings` | 主动巡检发现清单（含运行状态与信号图例） |
+| `POST` | `/api/agent/patrol/run` | 立即执行一轮巡检（只读 + 推送增量预警） |
+| `GET` | `/api/agent/patrol/signals` | 巡检信号与严重度说明（前端图例） |
 | `GET` | `/api/agent/tools` | Agent 可调用工具清单（OpenAI function calling 格式） |
 | `DELETE` | `/api/agent/sessions/:id` | 清空指定会话上下文 |
 
@@ -610,6 +633,7 @@ EMBEDDING_MODEL=BAAI/bge-m3
 | `tool_start` | `{ name, arguments }` | 开始调用某个引擎工具 |
 | `tool_result` | `{ name, arguments, ok, error? }` | 工具返回摘要（明细在 `final.toolCalls`） |
 | `pending` | `{ actions }` | 待用户确认的写操作（两阶段确认，确认前不落库） |
+| `step` | `{ role, status, title, detail, at }` | **仅多角色协作**（`/api/agent/collab/stream`）角色时间线，见 §10.3.1 |
 | `final` | `AgentChatResponse` | 收尾帧，与非流式 `/api/agent/chat` 响应结构一致 |
 | `error` | `{ code, message, details }` | 编排失败，随后关闭连接 |
 
@@ -619,6 +643,70 @@ EMBEDDING_MODEL=BAAI/bge-m3
 > **反代部署注意**：SSE 会被 Nginx / Ingress 的默认响应缓冲吃掉（表现为「一次性吐出全部内容」）。
 > 应用已回 `X-Accel-Buffering: no` 与 `Cache-Control: no-cache, no-transform`，若仍被缓冲，请在该路径上显式关闭：
 > `location /api/agent/chat/stream { proxy_buffering off; proxy_cache off; proxy_read_timeout 3600s; }`。
+
+### 10.3.1 进阶 Agent 能力（多角色协作 / What-if 沙盘 / 迭代复盘 / 主动巡检）
+
+四项能力都遵循同一条硬约束：**不重写算法**。所有工期、关键路径、风险均取自引擎返回值，
+Python 侧只做「解析 + 编排 + 确定性算术聚合」（[`agent/analytics.py`](./python/app/agent/analytics.py) 为纯函数层，无 IO、无状态）。
+
+**① 多角色协作（plan-act-observe 步骤流）**
+
+`POST /api/agent/collab/stream` 把一句话需求交给多角色跑完整链路，中间步骤**可见、可中断**：
+
+| 角色 | 职责 | 是否建模 |
+|---|---|---|
+| 需求分析（planner） | 需求 → 任务拆解草案 | 是（未配置 LLM 时用确定性拆解） |
+| 排期计算（scheduler） | 调引擎完成 拆解 → DAG → AOE → 风险 → 燃尽，**真实创建计划** | 否（纯引擎调用） |
+| 估算审阅（estimator） | 审阅工时与依赖，给出**建议** | 是 |
+| 风险缓解（risk） | 复用风险顾问口径给出缓解动作 | 是 |
+| 质量校验（critic） | 验收点覆盖 / 关键路径责任人 / 交付日期核对 | 是 + 确定性核对合并 |
+
+事件在对话流（`meta`/`delta`/`tool_start`/`tool_result`/`pending`/`final`/`error`）之上**新增 `step`**：
+
+```jsonc
+// event: step  data: { "role": "scheduler", "status": "running", "title": "排期计算（算法引擎）", "detail": "…", "at": 1760000000 }
+```
+
+`step.status ∈ pending | running | done | failed | skipped`。估算审阅给出的修正只进 `pending`
+（两阶段确认，**不自动落库**）；需要 `agent:write` 权限。
+
+**② What-if 沙盘（自然语言仿真）**
+
+`POST /api/agent/whatif` `{ planId, instruction }`。解析路径优先用 LLM，未配置时降级为正则规则解析
+（`mode=rule` + `degradedReason`），支持「延期 N 天」「提前 N 天」「加/减 N 人」「工时改为 N」「责任人改为 X」「状态改为 X」。
+
+实现要点：**先建临时计划 → 逐条 `PATCH` 落地扰动 → 重读快照 → 在 `finally` 中删除临时计划**，
+因此仿真**不会污染基线**，返回体带 `ephemeral: true`；`edits[]` 逐条回传是否应用成功及原因，
+无法映射为改动时 `unparsed: true`（不编造结论）。
+
+**③ 迭代复盘 + 学习**
+
+`POST /api/agent/retro` `{ planId, actualHours?, materializedRiskIds?, scopeChanges?, writeMemory? }`。
+
+- 统计**确定性可复算**：进度（`doneRatio`/`elapsedRatio`/`driftDays`）、交付偏移、风险兑现率、工时偏差与校准曲线；
+- 实际工时与「已兑现风险」是**外部事实**，引擎计划中不存在：未提供时 `effort.available=false` 并给出原因，**绝不编造**；
+- `writeMemory=true` 时把校准结论写回长期记忆（`add_memory` 去重，`memoryWritten` 回传实际条数），闭环反哺后续规划；
+- 未配置 LLM 时用规则结论（`_rule_conclusions`），同样显式标注 `mode`。
+
+**④ 主动巡检 Agent（后台定时 + 增量预警）**
+
+后台任务按 `PATROL_INTERVAL_SECONDS` 周期巡检可见计划，只做两件事：**聚合引擎事实** + **与上一次快照增量比对**。
+
+| 信号 | 来源（全部为引擎事实） |
+|---|---|
+| `progress_drift` 进度偏差 | 任务状态 + 燃尽数据（`driftDays` ≥ 1 或存在 DELAYED） |
+| `critical_path_drift` 关键路径漂移 | 引擎 `criticalPath` 变化（独立记录上一轮指纹，避免误报） |
+| `resource_overload` 人员过载 | 引擎 `riskList` 中的单日工时超限 |
+| `dependency_blocked` 依赖阻塞 | 引擎 `riskList` 中的循环依赖 / 孤立任务 |
+| `deadline_risk` 交付风险 | 引擎 `riskList` 中的关键路径 DELAYED + 计划完成晚于截止 |
+
+去重与止损：同一信号在 `PATROL_ALERT_COOLDOWN_SECONDS` 冷却期内不重复推送；信号消失时下发
+`resolved`（恢复）通知；`PATROL_MAX_FINDINGS` / `PATROL_FINDING_TTL_SECONDS` 限制内存增长；
+引擎不可达时返回空摘要并记录错误，**不抛异常、不阻断交互式请求**。发现经 WebSocket
+（`type=patrol.finding`）推送，前端由通知中心接住，越权计划不下发（按用户可见范围过滤）。
+
+前端呈现：AI 助手抽屉顶部可在「对话 / 多角色协作 / What-if 沙盘 / 迭代复盘 / 主动巡检」之间切换
+（见 [`AgentWorkbench.vue`](./web/src/components/AgentWorkbench.vue)），写类入口按 `agent:write` 收敛。
 
 ### 10.4 Agent 工具 → 内部引擎 REST 映射
 
@@ -652,14 +740,16 @@ Python 新增：`ENGINE_UNAVAILABLE`(502，引擎不可达)、`ENGINE_CIRCUIT_OP
 npm run py:test          # 等价于 python -m pytest -c python/pyproject.toml
 ```
 
-304 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
+382 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
 Agent 工具调度、工具失败容忍、会话上下文、步数上限，企业级加固能力（限流 / 请求体上限 / 安全头 / 关联 ID /
 指标 / 就绪探针 / 断路器 / 重试 / 并行工具调用 / 上下文裁剪 / 会话存储 / LLM 调用重试 / WS 断线重放 /
 工具异常兜底 / 错误响应脱敏 / 输入边界包裹 / 会话 ID 白名单），**访问控制全链路**（scrypt 口令 / 角色权限矩阵 /
 账号 CRUD 与最后管理员保护 / 会话创建吊销过期 / 改角色与停用即时踢下线 / 访客计划作用域 404 与列表过滤 /
 WS 握手 Cookie 鉴权与广播过滤），以及**知识库全链路**（分块 / 文档解析 /
 BM25 / RRF / 向量库增删查 / 入库-检索-删除 REST）与**长期记忆**（候选解析 / 去重 / 语义召回 / 停用治理 /
-自动提取 / 后台提取失败消费 / agentic RAG 工具）。
+自动提取 / 后台提取失败消费 / agentic RAG 工具），以及**进阶 Agent 能力**（协作步骤流与无 LLM 降级 /
+估算建议两阶段不落库 / 沙盘规则与 LLM 解析路径 + 临时计划回收 + 非法扰动丢弃 / 巡检增量·冷却·恢复·引擎故障不影响 /
+复盘规则降级 + 记忆写回与检索校验 + 无实际工时标记不可用）。
 
 ### 10.7 Docker Compose（Python 对外，引擎内网）
 

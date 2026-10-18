@@ -151,7 +151,17 @@ def required_permission(method: str, path: str, base: str) -> str | None:
         return PERM_AUDIT_READ
     if rel.startswith("/agent/"):
         # 写确认属于「真正落库」的动作，单独用 agent:write 区分于只读对话
-        return PERM_AGENT_WRITE if rel.startswith("/agent/confirm") else PERM_AGENT_CHAT
+        if rel.startswith("/agent/confirm"):
+            return PERM_AGENT_WRITE
+        # 多角色协作会**持久化**一份真实计划（不是临时仿真），按写权限收紧
+        if rel.startswith("/agent/collab"):
+            return PERM_AGENT_WRITE
+        # 主动巡检只读（不改数据），按计划读权限放行
+        if rel.startswith("/agent/patrol"):
+            return PERM_PLAN_READ
+        # What-if 沙盘 / 复盘都是「读计划 + 派生结论」：沙盘的临时计划用完即回收，
+        # 与既有 /scenario/compare 同一性质，因此与对话同级（agent:chat）
+        return PERM_AGENT_CHAT
     if rel == "/jobs" or rel.startswith("/jobs/"):
         # 作业查询 / 订阅进度是只读；取消作业等价于「放弃这次写」，按写权限收紧
         return PERM_PLAN_READ if verb == "GET" else PERM_PLAN_WRITE

@@ -206,11 +206,71 @@ SSE_TOOL_RESULT = "tool_result"  #: 工具调用结果（只读工具即时执�
 SSE_PENDING = "pending"  #: 待用户确认的写操作清单
 SSE_FINAL = "final"  #: 终态事件，携带完整结果（工具明细 / 计划 / 引用 / 记忆）
 SSE_ERROR = "error"  #: 流式过程中的错误（已建立连接后以事件形式下发）
+#: 多角色协作编排的**步骤**事件：``{role, status, title, detail}``（中间过程可见 / 可中断）
+SSE_STEP = "step"
 #: 内部标记：编排内部结果事件（不直接下发，由流式入口转换为 ``final``）
 SSE_RESULT = "__result"
 
 #: SSE 心跳间隔（秒）：空闲超过该时长即发送注释行，避免代理/网关因空闲断开长连接
 SSE_HEARTBEAT_SECONDS = 15.0
+
+# ------------------------ 主动巡检（后台巡检 Agent） ------------------------
+# 巡检只做「把引擎已经算出来的事实聚合 + 与上一次快照比对」，不引入任何新算法：
+# 进度偏差来自任务状态与燃尽数据，关键路径漂移来自引擎的 criticalPath，
+# 资源过载 / 依赖阻塞 / 交付风险来自引擎的 riskList（风险识别唯一事实来源）。
+
+PATROL_SIGNAL_PROGRESS_DRIFT = "progress_drift"  #: 进度偏差（延期任务 / 燃尽落后）
+PATROL_SIGNAL_CRITICAL_PATH_DRIFT = "critical_path_drift"  #: 关键路径漂移
+PATROL_SIGNAL_RESOURCE_OVERLOAD = "resource_overload"  #: 人员过载
+PATROL_SIGNAL_DEPENDENCY_BLOCKED = "dependency_blocked"  #: 依赖阻塞 / 孤立任务
+PATROL_SIGNAL_DEADLINE_RISK = "deadline_risk"  #: 交付日期风险（计划完成晚于截止）
+PATROL_SIGNALS: tuple[str, ...] = (
+    PATROL_SIGNAL_PROGRESS_DRIFT,
+    PATROL_SIGNAL_CRITICAL_PATH_DRIFT,
+    PATROL_SIGNAL_RESOURCE_OVERLOAD,
+    PATROL_SIGNAL_DEPENDENCY_BLOCKED,
+    PATROL_SIGNAL_DEADLINE_RISK,
+)
+#: 巡检信号 → 中文名（前端展示，集中登记避免字符串散落）
+PATROL_SIGNAL_LABELS: dict[str, str] = {
+    PATROL_SIGNAL_PROGRESS_DRIFT: "进度偏差",
+    PATROL_SIGNAL_CRITICAL_PATH_DRIFT: "关键路径漂移",
+    PATROL_SIGNAL_RESOURCE_OVERLOAD: "人员过载",
+    PATROL_SIGNAL_DEPENDENCY_BLOCKED: "依赖阻塞",
+    PATROL_SIGNAL_DEADLINE_RISK: "交付风险",
+}
+
+PATROL_SEVERITY_INFO = "info"
+PATROL_SEVERITY_WARNING = "warning"
+PATROL_SEVERITY_CRITICAL = "critical"
+PATROL_SEVERITIES: tuple[str, ...] = (PATROL_SEVERITY_INFO, PATROL_SEVERITY_WARNING, PATROL_SEVERITY_CRITICAL)
+#: 严重度排序（用于取「本次巡检最高严重度」与前端排序）
+PATROL_SEVERITY_RANK: dict[str, int] = {
+    PATROL_SEVERITY_INFO: 0,
+    PATROL_SEVERITY_WARNING: 1,
+    PATROL_SEVERITY_CRITICAL: 2,
+}
+
+#: 巡检发现经 WS 推送的事件类型（与引擎事件 `plan.created|plan.updated` 并列）
+WS_EVENT_PATROL_FINDING = "patrol.finding"
+#: 巡检发现状态：新出现 / 仍存在 / 已恢复（仅「新出现」与「已恢复」推送，避免刷屏）
+PATROL_FINDING_NEW = "new"
+PATROL_FINDING_ONGOING = "ongoing"
+PATROL_FINDING_RESOLVED = "resolved"
+
+# ------------------------ 迭代复盘 + 学习 ------------------------
+
+#: 复盘结论写回长期记忆时的来源标记（便于在记忆治理页按来源筛选）
+RETRO_MEMORY_SOURCE = "retro"
+#: 工时偏差校准分桶（按「实际/预估」比值分档，用于估算校准曲线）
+RETRO_CALIBRATION_BUCKETS: tuple[tuple[str, float, float], ...] = (
+    ("<0.8", 0.0, 0.8),
+    ("0.8-1.0", 0.8, 1.0),
+    ("1.0-1.2", 1.0, 1.2),
+    ("1.2-1.5", 1.2, 1.5),
+    ("≥1.5", 1.5, float("inf")),
+)
+
 
 # ------------------------ 异步作业（长耗时写链路） ------------------------
 
@@ -364,7 +424,26 @@ __all__ = [
     "SSE_FINAL",
     "SSE_ERROR",
     "SSE_RESULT",
+    "SSE_STEP",
     "SSE_HEARTBEAT_SECONDS",
+    "PATROL_SIGNAL_PROGRESS_DRIFT",
+    "PATROL_SIGNAL_CRITICAL_PATH_DRIFT",
+    "PATROL_SIGNAL_RESOURCE_OVERLOAD",
+    "PATROL_SIGNAL_DEPENDENCY_BLOCKED",
+    "PATROL_SIGNAL_DEADLINE_RISK",
+    "PATROL_SIGNALS",
+    "PATROL_SIGNAL_LABELS",
+    "PATROL_SEVERITY_INFO",
+    "PATROL_SEVERITY_WARNING",
+    "PATROL_SEVERITY_CRITICAL",
+    "PATROL_SEVERITIES",
+    "PATROL_SEVERITY_RANK",
+    "WS_EVENT_PATROL_FINDING",
+    "PATROL_FINDING_NEW",
+    "PATROL_FINDING_ONGOING",
+    "PATROL_FINDING_RESOLVED",
+    "RETRO_MEMORY_SOURCE",
+    "RETRO_CALIBRATION_BUCKETS",
     "SSE_PROGRESS",
     "SSE_DONE",
     "JOB_STATUS_PENDING",

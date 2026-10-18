@@ -4,6 +4,9 @@
     python -m run              # 在 python/ 目录下执行，读取 .env
     uvicorn app.main:app --host 0.0.0.0 --port 8080 --no-proxy-headers
 
+本网关端口由 ``GATEWAY_PORT`` 决定（不是 ``API_PORT``）：后者属于 TS 算法引擎，两者共用
+仓库根同一份 ``.env``，同名会让引擎与网关在本地联调时抢同一个端口。
+
 多进程：设置 ``API_WORKERS>1`` 时启用多 worker（进程数）。注意此时：
 - Agent 会话需共享存储（``SESSION_STORE=redis`` + ``REDIS_URL``），否则各 worker 各存一份；
 - WebSocket 需在网关层做粘性会话（同一客户端固定落到同一 worker）。
@@ -31,7 +34,7 @@ def main() -> None:
     uvicorn.run(
         "app.main:app",
         host=settings.api_host,
-        port=settings.api_port,
+        port=settings.gateway_port,
         log_level=settings.log_level,
         workers=settings.api_workers,
         # 关闭 uvicorn 自带日志配置，统一走我们的 JSON 处理器

@@ -52,6 +52,7 @@ from .jobs import build_job_store
 from .kb import CachedEmbedder, ChromaVectorStore, Embedder, OpenAiEmbedder, build_knowledge_base
 from .logging_config import configure_logging, request_id_var
 from .metrics import METRICS
+from .patrol import PatrolService
 from .resilience import CircuitBreaker, RetryPolicy
 from .routes.agent import build_agent_router
 from .routes.auth import build_auth_router
@@ -333,6 +334,21 @@ def create_app(
         max_clients=settings.ws_max_clients,
     )
     bridge = EngineEventBridge(derive_engine_ws_url(settings.engine_base_url, settings.api_ws_path), broadcaster)
+    #: 主动巡检 Agent：后台定时把「引擎事实 → 异常信号」聚合并增量推送预警（只读，不改数据）
+    patrol = (
+        PatrolService(
+            resolved_engine,
+            broadcaster,
+            interval_seconds=settings.patrol_interval_seconds,
+            max_plans=settings.patrol_max_plans,
+            cooldown_seconds=settings.patrol_alert_cooldown_seconds,
+            escalate_severity=settings.resolved_patrol_escalate_severity,
+            finding_ttl_seconds=settings.patrol_finding_ttl_seconds,
+            max_findings=settings.patrol_max_findings,
+        )
+        if settings.patrol_enabled
+        else None
+    )
     limiter = build_rate_limiter(
         per_minute=settings.api_rate_limit_per_minute,
         burst=settings.api_rate_limit_burst or None,
@@ -384,11 +400,16 @@ def create_app(
                 )
         if start_bridge:
             bridge.start()
+        if patrol is not None and start_bridge:
+            # 巡检随进程生命周期启停；首轮延迟一个周期，避免启动瞬间集中打引擎
+            patrol.start()
         try:
             yield
         finally:
             # 优雅关机：先置「未就绪」拒绝新请求，再排空后台任务与连接
             _app.state.ctx.shutting_down = True
+            if patrol is not None:
+                await patrol.stop()
             await _drain_jobs(_app.state.ctx)
             if start_bridge:
                 await bridge.stop()
@@ -419,6 +440,8 @@ def create_app(
         settings=settings,
         engine=resolved_engine,
         runner=runner,
+        dispatcher=dispatcher,
+        patrol=patrol,
         broadcaster=broadcaster,
         bridge=bridge,
         metrics=METRICS,

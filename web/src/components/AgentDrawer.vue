@@ -11,13 +11,18 @@
  *  - **规则降级**：未配置 LLM 网关（`/agent/health` 的 `enabled=false`）时，自动切换为
  *    内置规则问答（`utils/agentFaq.ts`），不白屏、不静默失败；
  *  - **计划上下文**：把「当前正在查看的计划」随每轮消息上报（后端做白名单校验后作为可信
- *    上下文注入），因此「给这个计划加个任务」这类指代能落到正确的 planId 上。
+ *    上下文注入），因此「给这个计划加个任务」这类指代能落到正确的 planId 上；
+ *  - **进阶能力工作台**：抽屉顶部可在「对话 / 多角色协作 / What-if 沙盘 / 迭代复盘 / 主动巡检」
+ *    之间切换，后四者由 :component:`AgentWorkbench` 呈现（角色协作步骤流可中断、沙盘与复盘
+ *    只调引擎不重算算法、巡检展示后台 Agent 的增量预警）。写类入口按 `agent:write` 权限收敛。
  */
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ApiClientError, api } from '@/api/client'
 import type { AgentHealth, AgentPendingAction, AgentToolCallRecord, KbHit, MemoryItem } from '@/api/types'
+import AgentWorkbench, { type WorkbenchMode } from '@/components/AgentWorkbench.vue'
+import { useAuthStore } from '@/stores/auth'
 import { useNotifyStore } from '@/stores/notify'
 import { usePlanStore } from '@/stores/plan'
 import { FAQ_FALLBACK, faqPrompts, matchFaq } from '@/utils/agentFaq'
@@ -35,6 +40,25 @@ const visible = defineModel<boolean>({ default: false })
 const router = useRouter()
 const store = usePlanStore()
 const notify = useNotifyStore()
+const auth = useAuthStore()
+
+/** 抽屉模式：chat（会话）| 进阶能力工作台四种 */
+const mode = ref<'chat' | WorkbenchMode>('chat')
+
+const MODE_OPTIONS: { label: string; value: 'chat' | WorkbenchMode }[] = [
+  { label: '对话', value: 'chat' },
+  { label: '多角色协作', value: 'collab' },
+  { label: 'What-if 沙盘', value: 'whatif' },
+  { label: '迭代复盘', value: 'retro' },
+  { label: '主动巡检', value: 'patrol' },
+]
+
+/** 工作台模式（null 表示会话模式） */
+const workbenchMode = computed<WorkbenchMode | null>(() => (mode.value === 'chat' ? null : mode.value))
+
+/** 前端展示收敛：写能力以服务端权限为准（真正的拦截始终在服务端） */
+const canAgentWrite = computed(() => auth.can('agent:write'))
+const canMemoryWrite = computed(() => auth.can('memory:write'))
 
 /** 会话消息（工具中间态与待确认动作挂在对应助手消息上，随消息一起滚动） */
 interface ChatMessage {
@@ -402,9 +426,24 @@ watch(visible, (open) => {
             记忆{{ health?.memoryAutoExtract ? '自动提取' : '已启用' }}
           </el-tag>
           <span class="ip-agent__spacer" />
-          <el-button size="small" :icon="'Delete'" :disabled="messages.length === 0" @click="clearSession">清空会话</el-button>
+          <el-button
+            size="small"
+            :icon="'Delete'"
+            :disabled="mode !== 'chat' || messages.length === 0"
+            @click="clearSession"
+          >
+            清空会话
+          </el-button>
         </div>
 
+        <!-- 模式切换：对话 + 四项进阶能力（工作台见 AgentWorkbench） -->
+        <el-radio-group v-model="mode" size="small" class="ip-agent__modes">
+          <el-radio-button v-for="option in MODE_OPTIONS" :key="option.value" :value="option.value">
+            {{ option.label }}
+          </el-radio-button>
+        </el-radio-group>
+
+        <template v-if="!workbenchMode">
         <el-alert v-if="!llmReady && !healthLoading" type="info" :closable="false" class="ip-agent__notice">
           未配置 LLM 网关，当前为<strong>内置规则问答</strong>模式：可回答算法口径与平台功能问题，并给出页面跳转。
           配置 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL 后重启服务即可启用模型问答与「改计划」能力；
@@ -517,6 +556,19 @@ watch(visible, (open) => {
             <el-button type="primary" size="small" :icon="'Promotion'" :loading="sending" @click="send()">发送</el-button>
           </div>
         </div>
+        </template>
+
+        <!-- 进阶能力工作台：协作 / 沙盘 / 复盘 / 巡检（数值全部来自后端与算法引擎） -->
+        <div v-else class="ip-agent__workbench">
+          <AgentWorkbench
+            :mode="workbenchMode"
+            :plan-id="props.planId"
+            :plan-label="props.planLabel"
+            :can-write="canAgentWrite"
+            :can-write-memory="canMemoryWrite"
+            @open-plan="openPlan"
+          />
+        </div>
       </div>
     </el-drawer>
   </div>
@@ -572,6 +624,20 @@ watch(visible, (open) => {
 
 .ip-agent__notice {
   margin-bottom: 10px;
+}
+
+/* 模式切换（对话 / 协作 / 沙盘 / 复盘 / 巡检） */
+.ip-agent__modes {
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+/* 进阶能力工作台：撑满抽屉剩余高度并独立滚动 */
+.ip-agent__workbench {
+  flex: 1;
+  overflow: auto;
+  padding-right: 4px;
+  min-height: 220px;
 }
 
 /* 消息流：撑满中部，独立滚动 */

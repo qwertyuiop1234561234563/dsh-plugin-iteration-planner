@@ -24,7 +24,7 @@ PLAN_JSON: dict[str, Any] = {
     "iterationDeadline": "2026-10-30",
     "iterationStartDate": "2026-10-12",
     "devMemberCount": 3,
-    "taskList": [{"taskId": "t1", "taskName": "数据库设计"}],
+    "taskList": [{"taskId": "t1", "taskName": "数据库设计", "estimatedHours": 8}],
     "riskList": [{"riskId": "r1", "level": "MEDIUM", "taskIds": ["t1"], "description": "人员过载", "suggest": "加人"}],
     "criticalPath": ["t1"],
     "burndownRawData": [{"time": "2026-10-12", "remainingHours": 8}],

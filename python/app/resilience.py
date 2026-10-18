@@ -86,6 +86,18 @@ class CircuitBreaker:
         if self._failures >= self._failure_threshold:
             self._trip()
 
+    def release_probe(self) -> None:
+        """归还一次半开探测名额（调用被**取消**、未按失败结算时调用）。
+
+        半开态只放行 ``half_open_max_calls`` 次探测，名额在 :meth:`allow` 放行时即被占用。
+        若探测调用因取消（客户端断连、服务端关机）等原因未结算，名额不会被归还，
+        之后 :meth:`allow` 将永远返回 False——断路器表面停在 ``half_open``，实际却
+        持续阻断全部引擎调用且不会自动恢复。因此取消路径必须显式归还名额；
+        取消不是引擎故障，故不计失败、也不改变状态。
+        """
+        if self._state is CircuitState.HALF_OPEN and self._half_open_calls > 0:
+            self._half_open_calls -= 1
+
     def _trip(self) -> None:
         self._state = CircuitState.OPEN
         self._opened_at = time.monotonic()

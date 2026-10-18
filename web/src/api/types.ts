@@ -252,7 +252,7 @@ export interface HealthResult {
   wsSubscribers: number
 }
 
-/** WebSocket 推送事件 */
+/** WebSocket 推送事件（计划变更；巡检发现见 :interface:`PatrolFindingEvent`） */
 export interface PlanEventMessage {
   type: 'connected' | 'plan.created' | 'plan.updated' | 'plan.deleted'
   planId?: string
@@ -386,6 +386,164 @@ export interface AgentConfirmResult {
   remainingActions: AgentPendingAction[]
   /** 是否走了驳回模式（true 表示本轮未执行任何写操作） */
   rejected: boolean
+}
+
+/* ------------------------- Agent 高级能力（协作 / 沙盘 / 复盘 / 巡检） ------------------------- */
+
+/* ---- 多角色协作（plan-act-observe：每步可见、可中断） ---- */
+
+/** 多角色协作请求：一句话需求 → 需求分析 / 引擎排期 / 估算审阅 / 风险缓解 / 质量校验 */
+export interface AgentCollabRequest {
+  requirement: string
+  iterationDeadline?: string
+  iterationStartDate?: string
+  devMemberCount?: number
+}
+
+/** 协作角色步骤（前端时间线；status 与后端 STEP_* 常量对齐） */
+export type AgentCollabStepStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+
+export interface AgentCollabStep {
+  role: string
+  title: string
+  status: AgentCollabStepStatus | string
+  detail: string
+  at: number
+}
+
+/* ---- What-if 沙盘（自然语言仿真，临时计划即时回收） ---- */
+
+export interface WhatIfTaskEdit {
+  task: string
+  taskId?: string | null
+  field: string
+  value?: unknown
+  before?: unknown
+  after?: unknown
+  applied: boolean
+  error?: string | null
+  reason?: string | null
+}
+
+export interface WhatIfRequest {
+  planId: string
+  instruction: string
+}
+
+export interface WhatIfResult {
+  planId: string
+  /** llm | rule（解析路径；rule 表示未用模型，附带 degradedReason） */
+  mode: AdviceMode
+  model: string | null
+  degradedReason?: string
+  /** 服务端理解到的情景意图（回显给用户核对） */
+  intent: string
+  constraints: ScenarioConstraints
+  baselineConstraints: ScenarioConstraints
+  baseline: ScenarioMetrics
+  scenario: ScenarioMetrics
+  delta: ScenarioDelta
+  /** 预计完成日期偏移天数（正值为推迟） */
+  deadlineShiftDays?: number | null
+  criticalPathAdded: string[]
+  criticalPathRemoved: string[]
+  newRisks: string[]
+  resolvedRisks: string[]
+  edits: WhatIfTaskEdit[]
+  /** 描述无法映射为任何可执行改动 */
+  unparsed: boolean
+  summary: string
+  notes: string[]
+  /** 情景计划已即时回收，不污染持久化存储 */
+  ephemeral: boolean
+}
+
+/* ---- 迭代复盘 + 学习 ---- */
+
+export interface RetroRequest {
+  planId: string
+  /** 实际工时映射（键为 taskId 或任务名）；不提供则跳过工时偏差与估算校准 */
+  actualHours?: Record<string, number>
+  /** 人工判定「确实发生了」的风险 ID */
+  materializedRiskIds?: string[]
+  /** 相对基线的范围变更说明 */
+  scopeChanges?: string[]
+  /** 是否把复盘结论写回长期记忆 */
+  writeMemory?: boolean
+}
+
+export interface RetroResult {
+  planId: string
+  /** 确定性统计（可复算；缺数据的分区带 available=false 与原因） */
+  metrics: Record<string, unknown>
+  mode: AdviceMode
+  model: string | null
+  degradedReason?: string
+  summary: string
+  highlights: string[]
+  problems: string[]
+  actions: string[]
+  memories: string[]
+  /** 实际写回长期记忆的条数（去重后可能少于 memories） */
+  memoryWritten: number
+  memoryEnabled: boolean
+}
+
+/* ---- 主动巡检 Agent ---- */
+
+export type PatrolSeverity = 'info' | 'warning' | 'critical'
+
+/** 一条巡检发现（信号 + 严重度 + 可读描述，全部源于引擎事实） */
+export interface PatrolFinding {
+  findingId: string
+  planId: string
+  planRequirement: string
+  signal: string
+  signalLabel: string
+  severity: PatrolSeverity | string
+  title: string
+  detail: string
+  /** new | ongoing | resolved */
+  status: string
+  escalated: boolean
+  /** 发现时间（Unix 秒，与引擎事件的时间口径一致） */
+  at: number
+}
+
+export interface PatrolFindingsResult {
+  items: PatrolFinding[]
+  total: number
+  running: boolean
+  enabled: boolean
+  intervalSeconds: number
+  lastRunAt: number | null
+  lastSummary: Record<string, unknown>
+  signals: string[]
+}
+
+export interface PatrolRunResult {
+  plans: number
+  signals: number
+  alerts: number
+  resolved: number
+  errors: string[]
+  durationMs: number
+  at: number | null
+}
+
+export interface PatrolSignalInfo {
+  name: string
+  label: string
+}
+
+export interface PatrolSignalsResult {
+  signals: PatrolSignalInfo[]
+  severities: string[]
+}
+
+/** 巡检发现的 WebSocket 推送载荷（携带 planId，受限连接按可见范围过滤） */
+export interface PatrolFindingEvent extends PatrolFinding {
+  type: 'patrol.finding'
 }
 
 /* ------------------------------ What-if 情景 ----------------------------- */

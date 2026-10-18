@@ -69,8 +69,12 @@ def not_found(message: str) -> ApiError:
     return ApiError(404, "NOT_FOUND", message)
 
 
-def bad_gateway(message: str, details: Any | None = None) -> ApiError:
-    """内部算法引擎不可达 / 返回异常。"""
+def bad_gateway(message: str = "算法引擎暂不可达，请稍后重试", details: Any | None = None) -> ApiError:
+    """内部算法引擎不可达 / 返回异常。
+
+    默认文案为**统一通用文案**：不得泄漏上游连接细节（httpx 异常类名）、引擎地址或原始
+    异常信息；这些细节只记录到服务端日志（见 :meth:`EngineClient._transport_error`）。
+    """
     return ApiError(502, "ENGINE_UNAVAILABLE", message, details)
 
 

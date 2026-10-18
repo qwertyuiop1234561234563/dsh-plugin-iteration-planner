@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from ..agent.analytics import metrics_delta, plan_metrics
 from ..agent.sanitize import unwrap_untrusted
 from ..engine_client import EngineClient
 from ..errors import ApiError, bad_request
@@ -35,48 +36,14 @@ from ..state import AppContext
 logger = logging.getLogger("iteration_planner.scenario")
 
 
-def _as_float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def _metrics(plan: dict[str, Any]) -> ScenarioMetrics:
-    """从引擎返回的计划快照中汇总对比指标（不引入任何算法推导）。"""
-    tasks = plan.get("taskList") or []
-    risks = [risk for risk in (plan.get("riskList") or []) if isinstance(risk, dict)]
-    burndown = plan.get("burndownRawData") or []
-    # 燃尽数据的末点即引擎推算的计划完成日期
-    planned_end = burndown[-1].get("time") if burndown else None
-    deadline = plan.get("iterationDeadline")
-    deadline_met: bool | None = None
-    if planned_end and deadline:
-        # ISO 日期（YYYY-MM-DD）可直接按字典序比较先后
-        deadline_met = str(planned_end) <= str(deadline)
-    return ScenarioMetrics(
-        totalDurationHours=_as_float(plan.get("totalDurationHours")),
-        totalEstimatedHours=_as_float(plan.get("totalEstimatedHours")),
-        taskCount=len(tasks),
-        criticalTaskCount=len(plan.get("criticalPath") or []),
-        riskCount=len(risks),
-        highRiskCount=sum(1 for risk in risks if str(risk.get("level")).upper() == "HIGH"),
-        plannedEndDate=str(planned_end) if planned_end else None,
-        deadline=str(deadline) if deadline else None,
-        deadlineMet=deadline_met,
-    )
+    """从引擎返回的计划快照中汇总对比指标（汇总口径见 :mod:`..agent.analytics`）。"""
+    return ScenarioMetrics(**plan_metrics(plan))
 
 
 def _delta(baseline: ScenarioMetrics, scenario: ScenarioMetrics) -> ScenarioDelta:
     """情景 − 基线。"""
-    return ScenarioDelta(
-        totalDurationHours=round(scenario.totalDurationHours - baseline.totalDurationHours, 4),
-        totalEstimatedHours=round(scenario.totalEstimatedHours - baseline.totalEstimatedHours, 4),
-        taskCount=scenario.taskCount - baseline.taskCount,
-        criticalTaskCount=scenario.criticalTaskCount - baseline.criticalTaskCount,
-        riskCount=scenario.riskCount - baseline.riskCount,
-        highRiskCount=scenario.highRiskCount - baseline.highRiskCount,
-    )
+    return ScenarioDelta(**metrics_delta(baseline.model_dump(), scenario.model_dump()))
 
 
 async def _discard(engine: EngineClient, plan_id: str | None) -> None:

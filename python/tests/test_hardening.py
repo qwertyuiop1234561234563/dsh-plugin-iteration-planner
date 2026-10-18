@@ -19,7 +19,7 @@ from app.engine_client import EngineClient
 from app.errors import ApiError
 from app.main import create_app
 from app.metrics import Metrics
-from app.resilience import CircuitBreaker, RetryPolicy
+from app.resilience import CircuitBreaker, CircuitState, RetryPolicy
 from app.security import RateLimiter, constant_time_equals
 from app.sessions import InMemorySessionStore
 from app.ws import WsBroadcaster
@@ -186,6 +186,48 @@ def test_engine_circuit_breaker_opens(settings: Settings):
         tripped = c.get("/api/plans", headers=auth())
         assert tripped.status_code == 503
         assert tripped.json()["code"] == "ENGINE_CIRCUIT_OPEN"
+
+
+def test_circuit_breaker_half_open_probe_must_be_returnable():
+    """半开探测名额必须可归还，否则断路器会永久阻断引擎调用（回归 F2）。
+
+    半开态只放行 ``half_open_max_calls`` 次探测，名额在放行时即被占用；一旦调用未结算
+    （如被取消），名额不会归还，``allow()`` 将永远返回 False——状态停在 ``half_open``
+    却持续快速失败且无法自愈。
+    """
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0.0, half_open_max_calls=1)
+    breaker.record_failure()  # → OPEN；recovery_timeout=0 使读取状态即进入 HALF_OPEN
+
+    assert breaker.allow() is True  # 占用唯一探测名额
+    assert breaker.allow() is False  # 名额耗尽（取消未结算时的真实表现）
+    breaker.release_probe()
+    assert breaker.state is CircuitState.HALF_OPEN  # 取消不是故障：状态不变
+    assert breaker.allow() is True  # 名额已归还，可继续探测
+    breaker.record_success()
+    assert breaker.state is CircuitState.CLOSED
+
+
+async def test_cancelled_engine_call_returns_half_open_slot():
+    """引擎调用被取消时，半开探测名额必须归还（否则引擎调用被永久阻断）。"""
+
+    def cancelled(_request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError()
+
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0.0, half_open_max_calls=1)
+    engine = EngineClient(
+        "http://engine.test",
+        "/api",
+        5.0,
+        transport=httpx.MockTransport(cancelled),
+        retry=RetryPolicy(attempts=0),
+        breaker=breaker,
+    )
+    breaker.record_failure()  # 开路 → 下次读取状态即 HALF_OPEN
+    with pytest.raises(asyncio.CancelledError):
+        await engine.request("GET", "/plans")
+    # 修复前这里为 False：探测名额被取消的调用永久占住，所有引擎调用持续被阻断
+    assert breaker.allow() is True
+    await engine.aclose()
 
 
 async def test_engine_retries_connect_failures():
@@ -769,6 +811,43 @@ def test_gateway_does_not_leak_internal_details_on_unexpected_error(settings: Se
     assert body["code"] == "ENGINE_UNAVAILABLE"
     assert "__BOOM__" not in body["message"]
     assert "engine.internal" not in body["message"]
+
+
+def test_502_message_is_generic_without_exception_type(settings: Settings):
+    """502/504 必须使用统一通用文案：连异常**类名**也不能回显（它同样是内部实现细节）。
+
+    回归 F1：早前实现把 ``exc.__class__.__name__``（``ConnectError`` / ``ReadTimeout`` 等）
+    拼进 message，等于向调用方暴露 httpx 的连接/协议错误类型与内部拓扑线索。
+    """
+
+    def connect_boom(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused by 10.1.2.3:8080")
+
+    def timeout_boom(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out")
+
+    for transport, status, code in (
+        (httpx.MockTransport(connect_boom), 502, "ENGINE_UNAVAILABLE"),
+        (httpx.MockTransport(timeout_boom), 504, "ENGINE_TIMEOUT"),
+    ):
+        engine = EngineClient(
+            "http://engine.test",
+            "/api",
+            5.0,
+            transport=transport,
+            retry=RetryPolicy(attempts=0),
+        )
+        app = create_app(settings, engine=engine, llm=None, start_bridge=False)
+        with TestClient(app, raise_server_exceptions=False) as c:
+            response = c.get("/api/plans", headers=auth())
+        assert response.status_code == status
+        text = response.text
+        assert response.json()["code"] == code
+        # 异常类名 / 内部地址 / 原始异常文本，全都不得出现在响应里
+        assert "ConnectError" not in text
+        assert "ReadTimeout" not in text
+        assert "connection refused" not in text
+        assert "10.1.2.3" not in text
 
 
 def test_sse_error_event_masks_internal_details(make_client):

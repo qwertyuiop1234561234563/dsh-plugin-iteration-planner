@@ -11,7 +11,7 @@ import { ElMessage } from 'element-plus'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiClientError, api, jobStream, resolveWsUrl } from '@/api/client'
-import { useNotifyStore } from '@/stores/notify'
+import { useNotifyStore, type NotifyLevel } from '@/stores/notify'
 import type {
   AdviceResult,
   AgentHealth,
@@ -24,6 +24,7 @@ import type {
   JobProgressItem,
   JobSnapshot,
   JobStatus,
+  PatrolFindingEvent,
   PlanEventMessage,
   PlanSummary,
   ProjectPlan,
@@ -679,11 +680,43 @@ export const usePlanStore = defineStore('plan', () => {
     wsStatus.value = 'closed'
   }
 
+  /**
+   * 巡检发现 → 通知中心。
+   *
+   * 严重度映射到通知级别（critical → danger），已恢复的信号给 success 提示；
+   * `escalated` 表示同一问题持续存在且已升级，标题加前缀以便与首次发现区分。
+   */
+  function handlePatrolFinding(finding: PatrolFindingEvent): void {
+    const resolved = finding.status === 'resolved'
+    const level: NotifyLevel = resolved
+      ? 'success'
+      : finding.severity === 'critical'
+        ? 'danger'
+        : finding.severity === 'warning'
+          ? 'warning'
+          : 'info'
+    const prefix = resolved ? '已恢复：' : finding.escalated ? '升级：' : '巡检预警：'
+    const parts = [`信号：${finding.signalLabel || finding.signal}`]
+    if (finding.planRequirement) parts.push(`计划：${finding.planRequirement}`)
+    if (finding.detail) parts.push(finding.detail)
+    notify.push({
+      level,
+      title: `${prefix}${finding.title}`,
+      detail: parts.join(' · '),
+      planId: finding.planId,
+    })
+  }
+
   async function handleMessage(raw: string): Promise<void> {
-    let message: PlanEventMessage
+    let message: PlanEventMessage | PatrolFindingEvent
     try {
-      message = JSON.parse(raw) as PlanEventMessage
+      message = JSON.parse(raw) as PlanEventMessage | PatrolFindingEvent
     } catch {
+      return
+    }
+    // 主动巡检发现：由后台巡检 Agent 增量推送，直接沉淀为预警通知（不改变计划状态）
+    if (message.type === 'patrol.finding') {
+      handlePatrolFinding(message)
       return
     }
     if (message.type === 'connected' || !message.planId) return
