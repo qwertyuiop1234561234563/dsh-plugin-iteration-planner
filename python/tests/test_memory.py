@@ -269,6 +269,42 @@ def test_memory_status_validation(kb_client):
         assert c.patch("/api/memories/missing", json={"status": "active"}, headers=headers).status_code == 404
 
 
+# ================== 入参校验收紧：不再「静默改写」与「脏数据落库」 ==================
+
+
+def test_memory_create_rejects_unknown_type_instead_of_silent_rewrite(kb_client):
+    """实测缺陷：``type="BOGUS"`` 会被静默改写成 ``other`` 并以 200 落库。
+
+    调用方以为自己的分类生效了，实际存进去的是另一类；这类静默改写让数据在不知不觉中
+    失真，且无从追溯。入参非法就必须明确报错。
+    """
+    with kb_client() as c:
+        headers = auth()
+        created = c.post("/api/memories", json={"text": "x", "type": "BOGUS"}, headers=headers)
+
+        assert created.status_code == 400
+        assert created.json()["code"] == "VALIDATION_ERROR"
+        # 校验失败不得落库
+        assert c.get("/api/memories", headers=headers).json()["data"]["total"] == 0
+
+
+def test_memory_create_rejects_unknown_importance_and_blank_text(kb_client):
+    with kb_client() as c:
+        headers = auth()
+        assert c.post("/api/memories", json={"text": "x", "importance": "URGENT"}, headers=headers).status_code == 400
+        # 仅空白的记忆文本没有语义价值，且会污染召回结果
+        assert c.post("/api/memories", json={"text": "   "}, headers=headers).status_code == 400
+        assert c.post("/api/memories", json={"text": "正常内容"}, headers=headers).status_code == 200
+
+
+def test_memory_text_is_normalized_before_storage(kb_client):
+    with kb_client() as c:
+        headers = auth()
+        created = c.post("/api/memories", json={"text": "  两端有空白  "}, headers=headers).json()["data"]
+
+        assert created["text"] == "两端有空白"
+
+
 # ============================ Agent 编排集成 ============================
 
 

@@ -10,7 +10,7 @@
 import { ElMessage } from 'element-plus'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { ApiClientError, api, resolveWsUrl } from '@/api/client'
+import { ApiClientError, api, jobStream, resolveWsUrl } from '@/api/client'
 import { useNotifyStore } from '@/stores/notify'
 import type {
   AdviceResult,
@@ -19,6 +19,11 @@ import type {
   CreatePlanPayload,
   EnumMeta,
   GraphPayload,
+  JobHandle,
+  JobKind,
+  JobProgressItem,
+  JobSnapshot,
+  JobStatus,
   PlanEventMessage,
   PlanSummary,
   ProjectPlan,
@@ -33,6 +38,30 @@ import type {
 
 /** WebSocket 连接状态 */
 export type WsStatus = 'closed' | 'connecting' | 'open'
+
+/**
+ * 当前正在跑的异步写作业（建计划 / 重规划）。
+ *
+ * 长耗时写被拆成「提交即返回 + 进度流」后，UI 必须能回答三个问题：**在跑什么**、
+ * **跑到哪了**、**能不能停**——这三件事都由这个状态承载。
+ */
+export interface WriteJobState {
+  jobId: string
+  kind: JobKind
+  /** 人读标签（「新建迭代计划」/「重新规划」），用于进度条标题 */
+  label: string
+  status: JobStatus
+  progress: JobProgressItem[]
+  /** 最近一条进度文案（无进度时为「已提交，等待引擎受理」） */
+  message: string
+  startedAt: number
+}
+
+/** 一次异步作业的终态结论（三态互斥，调用方必须穷尽处理） */
+type WriteJobOutcome =
+  | { kind: 'succeeded'; snapshot: JobSnapshot }
+  | { kind: 'failed'; error: { code: string; message: string } }
+  | { kind: 'cancelled' }
 
 /** 把异常转换为用户可读文案（保留原错误码供页面差异化处理） */
 export function errorText(error: unknown): string {
@@ -68,11 +97,127 @@ export const usePlanStore = defineStore('plan', () => {
   const adviceLoading = ref(false)
   const scenarioLoading = ref(false)
   const wsStatus = ref<WsStatus>('closed')
+  /** 进行中的异步写作业；null 表示没有长耗时写在跑 */
+  const writeJob = ref<WriteJobState | null>(null)
+
+  /** 进度流取消句柄（仅在组件卸载 / 切换作业时中断订阅，不作为「取消作业」手段） */
+  let writeAbort: AbortController | null = null
 
   /** 开始一次本地写操作：置忙并记录时间戳（供 WebSocket 通知去重） */
   function beginWrite(): void {
     mutating.value = true
     lastWriteAt = Date.now()
+  }
+
+  /**
+   * 跑一次异步写作业：受理回执 → 订阅 SSE 进度 → 归一化为三态结论。
+   *
+   * **为什么不能只用 HTTP 状态码**：`202 Accepted` 只表示「已受理」，作业此刻**还没落库**。
+   * 若把 202 当成功，用户会在进度条还没走完时看到「计划已生成」，随后页面拉取详情失败；
+   * 若把「流断开」当失败，又会在引擎其实已经算完时误报失败（孤儿写的老问题换个方向重演）。
+   * 因此这里**只认终态**：`succeeded` / `cancelled` / `failed`，其余一律以作业快照接口兜底。
+   */
+  async function runWriteJob(handle: JobHandle, label: string): Promise<WriteJobOutcome> {
+    writeAbort?.abort()
+    const controller = new AbortController()
+    writeAbort = controller
+    writeJob.value = {
+      jobId: handle.jobId,
+      kind: handle.kind,
+      label,
+      status: handle.status,
+      progress: [],
+      message: '已提交，等待引擎受理',
+      startedAt: Date.now(),
+    }
+
+    let snapshot: JobSnapshot | null = null
+    let failure: { code: string; message: string } | null = null
+
+    const applyStatus = (status: JobStatus, message?: string): void => {
+      const current = writeJob.value
+      if (!current || current.jobId !== handle.jobId) return
+      current.status = status
+      if (message !== undefined) current.message = message
+    }
+
+    try {
+      await jobStream(
+        handle.jobId,
+        {
+          onProgress: (item, status) => {
+            const current = writeJob.value
+            if (!current || current.jobId !== handle.jobId) return
+            current.progress = [...current.progress, item]
+            applyStatus((status as JobStatus) || 'running', item.message)
+          },
+          onDone: (done) => {
+            snapshot = done
+            applyStatus(done.status)
+          },
+          onError: (error) => {
+            failure = error
+            applyStatus('failed', error.message)
+          },
+        },
+        controller.signal,
+      )
+    } catch (error) {
+      // ABORTED 是主动中断订阅（组件卸载 / 切换作业），不是作业失败，交给兜底逻辑判定
+      if (!(error instanceof ApiClientError && error.code === 'ABORTED')) {
+        failure = { code: 'STREAM_ERROR', message: errorText(error) }
+      }
+    }
+
+    // 流结束但没有终态：以快照接口兜底，避免把「其实还在跑」的作业单方面判失败
+    if (!snapshot && !failure && !controller.signal.aborted) {
+      try {
+        const latest = await api.jobStatus(handle.jobId)
+        snapshot = latest
+        applyStatus(latest.status)
+      } catch (error) {
+        failure = { code: 'JOB_STATUS_UNAVAILABLE', message: errorText(error) }
+      }
+    }
+
+    if (writeAbort === controller) {
+      writeAbort = null
+      writeJob.value = null
+    }
+
+    // 订阅被主动中断（本地上一次作业被新的写操作取代 / 页面卸载）：不再等待结论，
+    // 按「已放弃等待」处理——报成「流中断失败」会把主动放弃说成故障，误导用户。
+    if (!snapshot && controller.signal.aborted) return { kind: 'cancelled' }
+
+    if (snapshot) {
+      if (snapshot.status === 'succeeded') return { kind: 'succeeded', snapshot }
+      if (snapshot.status === 'cancelled') return { kind: 'cancelled' }
+      return {
+        kind: 'failed',
+        error: snapshot.error ?? { code: 'JOB_FAILED', message: '作业执行失败' },
+      }
+    }
+    return {
+      kind: 'failed',
+      error: failure ?? { code: 'STREAM_ERROR', message: '作业进度流中断，请稍后重试' },
+    }
+  }
+
+  /**
+   * 取消进行中的异步写作业。
+   *
+   * 刻意**不** abort 进度流：终态（`cancelled`）要由服务端经流下发，本地单方面断开会让
+   * `runWriteJob` 走兜底分支去查快照，反而多一次请求、且时序更难推理。
+   * 引擎侧同步处理无法被单方面中断，取消只保证「不再把结果写回计划」，见后端说明。
+   */
+  async function cancelWrite(): Promise<void> {
+    const current = writeJob.value
+    if (!current || current.status === 'succeeded' || current.status === 'failed') return
+    try {
+      await api.cancelJob(current.jobId)
+    } catch (error) {
+      ElMessage.error(`取消作业失败：${errorText(error)}`)
+    }
   }
 
   /** 当前计划 ID */
@@ -266,7 +411,26 @@ export const usePlanStore = defineStore('plan', () => {
   async function createPlan(payload: CreatePlanPayload): Promise<ProjectPlan | null> {
     beginWrite()
     try {
-      const created = await api.createPlan(payload)
+      // ① 只提交，不等算法算完（引擎侧同步阻塞 80s+，挂连接等必然被中间层超时切断）
+      const handle = await api.createPlan(payload)
+      // ② 订阅进度流，直到拿到终态
+      const outcome = await runWriteJob(handle, '新建迭代计划')
+      if (outcome.kind === 'cancelled') {
+        ElMessage.info('已取消创建计划')
+        return null
+      }
+      if (outcome.kind === 'failed') {
+        ElMessage.error(`创建计划失败：${outcome.error.message}`)
+        return null
+      }
+      const planId = outcome.snapshot.planId
+      if (!planId) {
+        // 终态报成功却没有 planId = 服务端契约破损：宁可明确报错，绝不假装成功
+        ElMessage.error('创建计划失败：服务端未返回计划 ID')
+        return null
+      }
+      // ③ 详情必须另取：作业只回执「算完了」，不把整棵树塞进响应
+      const created = await api.getPlan(planId)
       ElMessage.success(`计划已生成：共 ${created.taskList.length} 个任务`)
       notify.push({
         level: created.riskList.length > 0 ? 'warning' : 'success',
@@ -299,17 +463,30 @@ export const usePlanStore = defineStore('plan', () => {
 
   async function replan(payload: ReplanPayload): Promise<void> {
     if (!plan.value) return
+    const planId = plan.value.planId
     beginWrite()
     try {
-      plan.value = await api.replan(plan.value.planId, payload)
-      ElMessage.success(`重规划完成：总工期 ${plan.value.totalDurationHours}h，风险 ${plan.value.riskList.length} 条`)
-      notify.push({
-        level: plan.value.riskList.some((risk) => risk.level === 'HIGH') ? 'warning' : 'success',
-        title: '计划已重新规划',
-        detail: `关键工期 ${plan.value.totalDurationHours}h · 风险 ${plan.value.riskList.length} 条`,
-        planId: plan.value.planId,
-      })
+      const handle = await api.replan(planId, payload)
+      const outcome = await runWriteJob(handle, '重新规划')
+      if (outcome.kind === 'cancelled') {
+        ElMessage.info('已取消重规划')
+        return
+      }
+      if (outcome.kind === 'failed') {
+        ElMessage.error(`重规划失败：${outcome.error.message}`)
+        return
+      }
+      // 重新拉取权威详情（而不是把作业回执当计划对象）：并发的其他写会让本地副本过时
       await refreshCurrent()
+      const current = plan.value
+      if (!current) return
+      ElMessage.success(`重规划完成：总工期 ${current.totalDurationHours}h，风险 ${current.riskList.length} 条`)
+      notify.push({
+        level: current.riskList.some((risk) => risk.level === 'HIGH') ? 'warning' : 'success',
+        title: '计划已重新规划',
+        detail: `关键工期 ${current.totalDurationHours}h · 风险 ${current.riskList.length} 条`,
+        planId: current.planId,
+      })
       await loadPlans()
     } catch (error) {
       ElMessage.error(`重规划失败：${errorText(error)}`)
@@ -572,6 +749,7 @@ export const usePlanStore = defineStore('plan', () => {
     adviceLoading,
     scenarioLoading,
     wsStatus,
+    writeJob,
     // 派生
     currentPlanId,
     taskIndex,
@@ -594,6 +772,7 @@ export const usePlanStore = defineStore('plan', () => {
     createPlan,
     removePlan,
     replan,
+    cancelWrite,
     addTask,
     updateTask,
     batchUpdateTasks,

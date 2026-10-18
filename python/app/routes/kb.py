@@ -70,10 +70,11 @@ def build_kb_router(base: str) -> APIRouter:
         ctx: AppContext = request.app.state.ctx
         knowledge = _require_knowledge(ctx)
         # 复用统一的解析 / 分块链路：把正文包装为 Markdown 文档，扩展名后缀便于元数据展示
+        # ``title`` 已由入参校验器规范化（去空白且非空），此处不再重复 strip
         document = await knowledge.ingest(
-            f"{payload.title.strip()}.md",
+            f"{payload.title}.md",
             payload.content.encode("utf-8"),
-            title=payload.title.strip(),
+            title=payload.title,
             source=(payload.source or "").strip(),
             tags=payload.tags,
         )

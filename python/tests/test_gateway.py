@@ -23,6 +23,16 @@ def test_healthz_is_public(client):
         assert response.json()["status"] == "ok"
 
 
+def test_health_reports_job_and_idempotency_backends(client):
+    """运维必须能一眼确认「作业 / 幂等键是否真的多副本共享」——后端名不透出就无从核对。"""
+    with client as c:
+        python_block = c.get("/api/health").json()["python"]
+
+        assert python_block["jobStore"]["backend"] == "memory"
+        assert python_block["jobStore"]["ttlSeconds"] > 0
+        assert python_block["idempotencyStore"]["backend"] == "memory"
+
+
 def test_list_plans_preserves_envelope(client):
     with client as c:
         response = c.get("/api/plans", headers=auth())

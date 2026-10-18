@@ -5,11 +5,12 @@
  * 流水线（后端固定顺序）：
  *   需求拆解 → 工时缓冲修正 → Kahn 拓扑环检测 → AOE 关键路径排期 → 风险扫描 → 燃尽数据 → 完整计划
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, onUnmounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
 import { usePlanStore } from '@/stores/plan'
+import type { JobPhase } from '@/api/types'
 import { BUILTIN_TEMPLATES, newTemplateId, readCustomTemplates, writeCustomTemplates } from '@/utils/templates'
 import type { IterationTemplate } from '@/utils/templates'
 import { addDays, formatISODate, parseISODate } from '@/utils/workday'
@@ -18,6 +19,68 @@ const store = usePlanStore()
 const router = useRouter()
 const formRef = ref<FormInstance>()
 const submitting = ref(false)
+
+/* ------------------------------ 异步作业进度 ------------------------------ */
+
+/** 秒级时钟：作业可能跑几分钟，「已提交 mm:ss」必须自己走，否则用户以为页面卡死 */
+const now = ref(Date.now())
+let ticker: ReturnType<typeof setInterval> | null = null
+ticker = setInterval(() => {
+  now.value = Date.now()
+}, 1000)
+onUnmounted(() => {
+  if (ticker) clearInterval(ticker)
+  ticker = null
+})
+
+const JOB_STATUS_TEXT: Record<string, string> = {
+  pending: '排队中',
+  running: '处理中',
+  succeeded: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+}
+
+/** 各阶段对应的进度百分比（阶段是离散的，进度条只表达「走到哪一段」） */
+const PHASE_PERCENT: Record<JobPhase, number> = { queued: 10, engine: 60, settled: 90 }
+
+const jobStatusText = computed(() => JOB_STATUS_TEXT[store.writeJob?.status ?? 'pending'] ?? '处理中')
+
+const jobTagType = computed(() => {
+  const status = store.writeJob?.status
+  if (status === 'succeeded') return 'success'
+  if (status === 'failed') return 'danger'
+  if (status === 'cancelled') return 'info'
+  return 'warning'
+})
+
+const jobProgressStatus = computed(() => {
+  const status = store.writeJob?.status
+  if (status === 'succeeded') return 'success' as const
+  if (status === 'failed') return 'exception' as const
+  return undefined
+})
+
+const jobPercent = computed(() => {
+  const job = store.writeJob
+  if (!job) return 0
+  if (job.status === 'succeeded') return 100
+  const last = job.progress[job.progress.length - 1]
+  if (!last) return job.status === 'pending' ? 2 : 5
+  return PHASE_PERCENT[last.phase as JobPhase] ?? 60
+})
+
+const cancellable = computed(() => {
+  const status = store.writeJob?.status
+  return status === 'pending' || status === 'running'
+})
+
+const elapsedText = computed(() => {
+  const startedAt = store.writeJob?.startedAt ?? now.value
+  const seconds = Math.max(0, Math.floor((now.value - startedAt) / 1000))
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes.toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`
+})
 
 /** 样例需求：便于快速体验完整流程 */
 const SAMPLE_REQUIREMENT = [
@@ -250,12 +313,40 @@ async function submit(): Promise<void> {
           </el-form-item>
 
           <el-form-item>
-            <el-button type="primary" :loading="submitting" :icon="'Promotion'" @click="submit">
+            <el-button
+              type="primary"
+              :loading="submitting"
+              :disabled="submitting"
+              :icon="'Promotion'"
+              @click="submit"
+            >
               生成迭代计划
             </el-button>
-            <el-button @click="router.push({ name: 'plan-list' })">返回列表</el-button>
+            <el-button :disabled="submitting" @click="router.push({ name: 'plan-list' })">返回列表</el-button>
           </el-form-item>
         </el-form>
+
+        <!-- 进度面板：长耗时写已改为「提交即返回 + 进度流」，必须让用户看见它在跑，并允许放弃 -->
+        <div v-if="store.writeJob" class="ip-job">
+          <div class="ip-job__head">
+            <span class="ip-job__title">{{ store.writeJob.label }}</span>
+            <el-tag size="small" effect="plain" :type="jobTagType">{{ jobStatusText }}</el-tag>
+          </div>
+          <el-progress :percentage="jobPercent" :status="jobProgressStatus" :stroke-width="6" />
+          <p class="ip-job__message">{{ store.writeJob.message }}</p>
+          <div class="ip-job__foot">
+            <span class="ip-muted">已提交 {{ elapsedText }}</span>
+            <el-button
+              size="small"
+              type="danger"
+              plain
+              :disabled="!cancellable"
+              @click="store.cancelWrite()"
+            >
+              取消
+            </el-button>
+          </div>
+        </div>
       </div>
 
       <div class="ip-panel">

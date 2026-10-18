@@ -72,13 +72,40 @@ function openReplan(): void {
 
 async function submitReplan(): Promise<void> {
   if (replanForm.iterationDeadline < replanForm.iterationStartDate) return
+  // 先关弹窗：重规划是异步作业，可能跑几分钟，把用户晾在模态框里等是不合理的
+  replanVisible.value = false
   await store.replan({
     iterationStartDate: replanForm.iterationStartDate,
     iterationDeadline: replanForm.iterationDeadline,
     devMemberCount: replanForm.devMemberCount,
   })
-  replanVisible.value = false
 }
+
+/* --------------------------- 重规划作业进度（展示态） --------------------------- */
+
+/** 阶段 → 百分比（与 PlanCreateView 同口径：阶段离散，进度条只表达「走到哪一段」） */
+const PHASE_PERCENT: Record<string, number> = { queued: 10, engine: 60, settled: 90 }
+
+const jobStatusText = computed(() => (store.writeJob?.status === 'running' ? '处理中' : '排队中'))
+
+const jobProgressStatus = computed(() =>
+  store.writeJob?.status === 'failed' ? ('exception' as const) : undefined,
+)
+
+/** 进度百分比：阶段离散，进度条只表达「走到哪一段」 */
+const jobPercent = computed(() => {
+  const job = store.writeJob
+  if (!job) return 0
+  if (job.status === 'succeeded') return 100
+  const last = job.progress[job.progress.length - 1]
+  if (!last) return job.status === 'pending' ? 2 : 5
+  return (PHASE_PERCENT as Record<string, number>)[last.phase] ?? 60
+})
+
+const cancellable = computed(() => {
+  const status = store.writeJob?.status
+  return status === 'pending' || status === 'running'
+})
 
 /** 切换计划时关闭遗留弹窗 */
 watch(
@@ -200,6 +227,21 @@ watch(
 
       <div class="ip-muted ip-updated">最后更新：{{ lastUpdated }}</div>
     </template>
+
+    <!-- 重规划进度：已改为异步作业，弹窗关掉后必须留一条可见的「还在跑 + 可取消」的线 -->
+    <div v-if="store.writeJob" class="ip-job">
+      <div class="ip-job__head">
+        <span class="ip-job__title">{{ store.writeJob.label }}</span>
+        <el-tag size="small" effect="plain" type="warning">{{ jobStatusText }}</el-tag>
+      </div>
+      <el-progress :percentage="jobPercent" :status="jobProgressStatus" :stroke-width="6" />
+      <p class="ip-job__message">{{ store.writeJob.message }}</p>
+      <div class="ip-job__foot">
+        <el-button size="small" type="danger" plain :disabled="!cancellable" @click="store.cancelWrite()">
+          取消
+        </el-button>
+      </div>
+    </div>
 
     <!-- 重规划弹窗 -->
     <el-dialog v-model="replanVisible" title="重新规划" width="480px">

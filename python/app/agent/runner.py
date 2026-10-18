@@ -46,7 +46,7 @@ from .llm import LlmClient, strip_protocol_leak
 from .memory import MemoryService
 from .prompts import ITERATION_PLANNER_SYSTEM_PROMPT, build_chat_instruction, build_plan_instruction
 from .sanitize import unwrap_arguments
-from .schemas import TOOL_SPECS, WRITE_TOOLS, describe_action
+from .schemas import TOOL_RESULT_PENDING_CONFIRMATION, TOOL_SPECS, WRITE_TOOLS, describe_action
 from .tools import ToolDispatcher
 
 logger = logging.getLogger("iteration_planner.agent")
@@ -82,7 +82,8 @@ _PENDING_TOOL_RESULT = (
 
 #: 识别「模型宣称自己已经完成了写操作」的措辞（用于拦截无任何写操作却谎报完成）
 _WRITE_CLAIM_RE = re.compile(
-    r"已(?:成功)?(?:修改|更改|变更|更新|调整|设置|删除|新增|添加|登记|提交|执行|改为|改好)"
+    r"已(?:成功)?(?:修改|更改|变更|更新|调整|设置|删除|新增|添加|登记|提交|执行|改为|改好"
+    r"|规划|创建|生成|发起|完成|处理)"
     r"|操作后(?:的)?(?:任务|计划|结果|详情|数据)"
 )
 
@@ -101,6 +102,106 @@ _FALSE_COMPLETION_NOTICE = (
     "请明确告知要操作的计划与任务（例如「把计划 XXX 中『数据库设计』的工时改为 12 小时」），"
     "或先切换到目标计划页面再发起请求。"
 )
+
+#: 「已登记待确认、但尚未落库」时的确定性文案。
+#:
+#: 实测缺陷：模型在把 ``plan_iteration`` 登记为待确认动作后，照样回复「已成功规划迭代…计划ID为
+#: [planId]」——用户会以为计划已经建好，而实际上什么都没落库。这类声明的危害与「什么都没做却
+#: 说做了」等同，因此必须与 :data:`_FALSE_COMPLETION_NOTICE` 一样被服务端覆盖。
+#: 措辞刻意避开 :data:`_WRITE_CLAIM_RE` 的「已+动词」形态，保证本函数对同一文本重复施加也稳定。
+_PENDING_CLAIM_NOTICE = (
+    "⚠️ 本轮变更**尚未落库**：改动只被登记为「待确认动作」，需要你确认后才会真正执行，"
+    "当前计划数据**没有任何变化**。"
+)
+
+#: 模型可能拿**占位符**冒充计划 ID（实测：``计划ID为[planId]``）
+_PLAN_ID_PLACEHOLDER_RE = re.compile(r"[\[{<【(]\s*plan_?id\s*[\]}>】)]", re.IGNORECASE)
+
+#: 模型已**如实披露**「改动只是待确认、尚未落库」的语料特征。命中即视为正确表述，不再覆盖。
+#:
+#: 刻意收紧到「待确认 / 尚未落库 / 需要您确认 / 确认后」这类明确措辞：不能把任何含「请确认」的
+#: 句子都当作披露——「已成功创建计划，请确认」这种句尾带确认的**虚假完成声明**照样必须被拦下。
+_PENDING_DISCLOSURE_RE = re.compile(r"待确认|尚未落库|需(?:要)?(?:您|你)?确认|确认后")
+
+#: 计划 ID 的真实形态：UUID（引擎由 ``uuid4`` 生成）或 32 位十六进制串。
+#: 用于识别「文本里出现了 ID，但本轮根本没有产生任何计划」的**伪造 ID**。
+_PLAN_ID_SHAPED_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+    r"|\b[0-9a-fA-F]{32}\b"
+)
+
+#: 本轮未产生任何计划却提到 ID 时，替换 ID 片段所用的占位文本 + 追加的确定性说明
+_PLAN_ID_ABSENT_TOKEN = "（无）"
+_PLAN_ID_ABSENT_NOTICE = (
+    "\n\n（系统说明：本轮**没有产生任何计划**，上一步答复里出现的计划 ID 并不存在，"
+    "不能用于后续操作或分享。）"
+)
+
+
+def _has_landed_write(records: list[ToolCallRecord]) -> bool:
+    """本轮是否存在**真正落库**的写操作。
+
+    不能只看 ``ok``：登记为待确认动作的写工具同样返回 ``ok=True``（调用确实被成功受理），
+    但数据**尚未写入**。因此以 :data:`TOOL_RESULT_PENDING_CONFIRMATION` 把「仅登记」剔除，
+    剩下的才算落库。
+    """
+    for record in records:
+        if not (record.ok and record.name in WRITE_TOOLS):
+            continue
+        result = record.result if isinstance(record.result, dict) else {}
+        if result.get("status") == TOOL_RESULT_PENDING_CONFIRMATION:
+            continue
+        return True
+    return False
+
+
+def _enforce_authoritative_reply(
+    text: str, *, records: list[ToolCallRecord], plan_id: str | None, pending: list[PendingAction]
+) -> str:
+    """服务端对模型答复的**最终事实校验与重写**（输出护栏）。
+
+    立场（对齐 OpenAI Agents SDK 的 ``outputGuardrails`` 与 CRITIC 的「结论须有外部凭据」）：
+    模型自述是否可信，不由模型自己判断，而由服务端拿**工具的真实执行结果**核对。凡与真实
+    执行状态冲突的表述一律以服务端事实为准——因为用户会依据答复采取行动，虚假的「已完成」
+    比一句「未完成」危险得多。
+
+    两处必须在服务端兜底：
+
+    1. **完成声明**：命中 :data:`_WRITE_CLAIM_RE` 但本轮没有任何**真正落库**的写操作时，
+       整体替换为确定性文案（有 ``pending`` → 「尚未落库」；无 ``pending`` → 「没有任何变更」）。
+       唯一例外是模型已**如实披露**了待确认状态（命中 :data:`_PENDING_DISCLOSURE_RE`）——
+       那种表述本身正确，覆盖它只会丢掉模型给出的细节。
+    2. **计划 ID**：占位符（``[planId]``）与凭空捏造的 ID 都不得下发。本轮确实产出计划时
+       用真实 ID 替换占位符；未产出计划时删除 ID 片段并明确说明。
+
+    顺序不可颠倒：完成声明会**整体替换**文本（连带其中的 ID），先替换再处理 ID 才能保证
+    最终文本里既没有虚假声明、也没有虚假 ID。
+    """
+    # ---- 1. 完成声明事实校验（整体替换，故放在前面）----
+    if _WRITE_CLAIM_RE.search(text) and not _has_landed_write(records):
+        if pending and _PENDING_DISCLOSURE_RE.search(text):
+            # 模型已如实说明「只是待确认、还没落库」：表述正确，保留原文
+            pass
+        elif pending:
+            METRICS.inc_counter("agent_false_completion_total", {"action": "pending_notice"})
+            logger.warning("模型在仅登记待确认动作（尚未落库）时宣称已完成变更，已替换为确定性提示")
+            return _PENDING_CLAIM_NOTICE
+        else:
+            METRICS.inc_counter("agent_false_completion_total", {"action": "notice"})
+            logger.warning("模型在无任何写操作的情况下宣称已完成变更，已替换为确定性提示")
+            return _FALSE_COMPLETION_NOTICE
+
+    # ---- 2. 计划 ID 事实校验 ----
+    if plan_id:
+        text = _PLAN_ID_PLACEHOLDER_RE.sub(plan_id, text)
+    elif _PLAN_ID_PLACEHOLDER_RE.search(text) or _PLAN_ID_SHAPED_RE.search(text):
+        text = _PLAN_ID_PLACEHOLDER_RE.sub(_PLAN_ID_ABSENT_TOKEN, text)
+        text = _PLAN_ID_SHAPED_RE.sub(_PLAN_ID_ABSENT_TOKEN, text)
+        text = f"{text}{_PLAN_ID_ABSENT_NOTICE}"
+        METRICS.inc_counter("agent_reply_fabricated_plan_id_total")
+        logger.warning("模型答复中出现并不存在的计划 ID，已由服务端剔除并说明")
+    return text
+
 
 #: 「当前计划状态」类问题的特征词：这类问题的答案只能是工具实时结果，不能来自长期记忆。
 _STATE_QUESTION_RE = re.compile(
@@ -827,6 +928,15 @@ class AgentRunner:
                     METRICS.inc_counter("agent_write_intent_noop_total", {"action": "unresolved"})
                     logger.warning("模型重复忽略用户的写指令，本轮未登记任何待确认写动作")
                     final_text = _FALSE_COMPLETION_NOTICE
+
+                # 输出护栏：模型答复的最终事实以**服务端校验结果**为准（对齐 OpenAI Agents SDK 的
+                # ``outputGuardrails`` 与 CRITIC 的「结论须有外部凭据」）。此处必须在 ``pending``
+                # 分支**之外**执行——早期实现只在「无任何写操作」的分支里校验，于是「登记为待确认后
+                # 照样宣称已完成、并给出并不存在的 planId」这更常见、更危险的谎报被整条漏过。
+                final_text = _enforce_authoritative_reply(
+                    final_text, records=records, plan_id=plan_id, pending=pending
+                )
+
                 if pending:
                     # 本回合登记过写操作：以服务端确定性摘要收尾，保证展示清单与真实登记项一致。
                     # 注意只增量下发**摘要**：模型叙述若在生成过程中已逐字下发过，这里再带上就会重复。

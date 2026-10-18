@@ -152,6 +152,9 @@ def required_permission(method: str, path: str, base: str) -> str | None:
     if rel.startswith("/agent/"):
         # 写确认属于「真正落库」的动作，单独用 agent:write 区分于只读对话
         return PERM_AGENT_WRITE if rel.startswith("/agent/confirm") else PERM_AGENT_CHAT
+    if rel == "/jobs" or rel.startswith("/jobs/"):
+        # 作业查询 / 订阅进度是只读；取消作业等价于「放弃这次写」，按写权限收紧
+        return PERM_PLAN_READ if verb == "GET" else PERM_PLAN_WRITE
     if rel.startswith("/scenario/"):
         return PERM_PLAN_READ
     if rel == "/kb" or rel.startswith("/kb/"):

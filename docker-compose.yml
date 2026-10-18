@@ -83,6 +83,10 @@ services:
       ENGINE_BASE_URL: http://engine:8080
       ENGINE_TIMEOUT_SECONDS: ${ENGINE_TIMEOUT_SECONDS:-60}
       ENGINE_CONNECT_TIMEOUT_SECONDS: ${ENGINE_CONNECT_TIMEOUT_SECONDS:-5}
+      # 长耗时写（建计划 / 重规划）的读超时；引擎侧这两个接口同步阻塞 80s+，
+      # 沿用 60s 会导致「客户端报失败、引擎已落库」的孤儿写（超时→504，连不上才是 502）
+      ENGINE_LONG_TIMEOUT_SECONDS: ${ENGINE_LONG_TIMEOUT_SECONDS:-600}
+      ENGINE_JOB_TIMEOUT_SECONDS: ${ENGINE_JOB_TIMEOUT_SECONDS:-600}
       ENGINE_RETRY_ATTEMPTS: ${ENGINE_RETRY_ATTEMPTS:-2}
       ENGINE_BREAKER_THRESHOLD: ${ENGINE_BREAKER_THRESHOLD:-5}
       ENGINE_BREAKER_RECOVERY_SECONDS: ${ENGINE_BREAKER_RECOVERY_SECONDS:-30}
@@ -119,6 +123,12 @@ services:
       CACHE_BACKEND: ${CACHE_BACKEND:-auto}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-3600}
       CACHE_MAX_ENTRIES: ${CACHE_MAX_ENTRIES:-2048}
+      # 异步写作业 + 幂等键：作业是**状态**而非缓存，多副本/多 worker 必须 JOB_STORE=redis
+      # （显式填 redis 却缺 REDIS_URL 或未装 redis 依赖会启动失败，不静默降级）
+      JOB_STORE: ${JOB_STORE:-auto}
+      JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
+      JOB_MAX_ENTRIES: ${JOB_MAX_ENTRIES:-1024}
+      IDEMPOTENCY_TTL_SECONDS: ${IDEMPOTENCY_TTL_SECONDS:-86400}
       # 知识库（RAG）与长期记忆：默认硅基流动 BAAI/bge-m3（长期免费，固定 1024 维）；
       # 两行 EMBEDDING_BASE_URL / EMBEDDING_API_KEY 均留空时才回落 LLM_*（智谱同一端点兼做 embeddings）
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}

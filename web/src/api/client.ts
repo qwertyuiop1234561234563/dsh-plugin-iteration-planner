@@ -41,6 +41,9 @@ import type {
   HealthResult,
   ImportPayload,
   ImportResult,
+  JobHandle,
+  JobProgressItem,
+  JobSnapshot,
   KbDeleteResult,
   KbDocument,
   KbDocumentCreatePayload,
@@ -79,6 +82,14 @@ import type {
 /** REST 基地址（同域部署时为 /api） */
 export const API_BASE = import.meta.env.VITE_API_BASE ?? '/api'
 
+/**
+ * 异步写请求首部（RFC 7240 `Prefer`）。
+ *
+ * 声明「我可以接受受理回执，不等结果」——后端据此走 `202 + 作业资源`，而不是挂住连接
+ * 等引擎算完。写成模块级常量是为了让「哪些写是异步的」在这一处可审计。
+ */
+const PREFER_ASYNC_HEADERS = { Prefer: 'respond-async' } as const
+
 /** 401 处理器：由鉴权 Store 注册，用于跳转登录页并清空本地用户态 */
 type UnauthorizedHandler = () => void
 
@@ -115,7 +126,10 @@ export class ApiClientError extends Error {
 /** axios 实例 */
 export const http = axios.create({
   baseURL: API_BASE,
-  timeout: 60_000,
+  // **快速失败**：普通接口应在 30s 内返回。长耗时写（建计划 / 重规划）不再挂在这里等
+  // 算法算完，而是走「202 + 作业 + SSE 进度」（见 `createPlanAsync` / `jobStream`），
+  // 因此把默认超时收到 30s 只会让「服务端真的卡住」更早暴露，不会误伤正常写。
+  timeout: 30_000,
   headers: { 'content-type': 'application/json' },
   // 会话 Cookie 需随请求发送；同源请求默认即带 Cookie，跨域开发场景需显式开启
   withCredentials: true,
@@ -128,7 +142,13 @@ http.interceptors.response.use(
     const body = error.response?.data
     const message =
       body?.message ??
-      (status === 0 ? '无法连接到服务端，请确认 API 服务已启动' : error.message)
+      (status === 0
+        ? '无法连接到服务端，请确认 API 服务已启动'
+        : // 504 表示「可达但处理超时」：服务端可能仍在计算（引擎无法被单方面中断），
+          // 因此提示要看进度而不是直接报「失败」，语义与 RFC 9110 一致。
+          status === 504
+          ? '服务端仍在处理，请稍后查看进度'
+          : error.message)
     const code = body?.code ?? (status === 0 ? 'NETWORK_ERROR' : 'HTTP_ERROR')
     if (status === 401) onUnauthorized?.()
     return Promise.reject(new ApiClientError(message, code, status, body?.details))
@@ -194,14 +214,31 @@ export const api = {
   /** 计划详情 */
   getPlan: (planId: string) => unwrap<ProjectPlan>(http.get(`/plans/${planId}`)),
 
-  /** 新建计划（完整规划流水线） */
-  createPlan: (payload: CreatePlanPayload) => unwrap<ProjectPlan>(http.post('/plans', payload)),
+  /**
+   * 新建计划（**异步作业**：`Prefer: respond-async` → `202` + 作业句柄）。
+   *
+   * 建计划在引擎侧是同步阻塞的算法计算（实测 80s+），挂连接等它算完必然撞上中间层
+   * 超时，产生「客户端报失败、引擎已落库」的孤儿写。因此这里只提交、拿回作业 ID，
+   * 进度与结果经 {@link jobStream} / {@link api.jobStatus} 获取。
+   */
+  createPlan: (payload: CreatePlanPayload, signal?: AbortSignal) =>
+    unwrap<JobHandle>(http.post('/plans', payload, { headers: PREFER_ASYNC_HEADERS, signal })),
 
   /** 删除计划 */
   deletePlan: (planId: string) => http.delete(`/plans/${planId}`).then(() => undefined),
 
-  /** 全量重规划 */
-  replan: (planId: string, payload: ReplanPayload) => unwrap<ProjectPlan>(http.post(`/plans/${planId}/replan`, payload)),
+  /** 全量重规划（**异步作业**，语义同 {@link api.createPlan}） */
+  replan: (planId: string, payload: ReplanPayload, signal?: AbortSignal) =>
+    unwrap<JobHandle>(
+      http.post(`/plans/${planId}/replan`, payload, { headers: PREFER_ASYNC_HEADERS, signal }),
+    ),
+
+  /** 作业快照（状态 / 进度 / 结果）；非属主或不存在的作业一律 404 */
+  jobStatus: (jobId: string) => unwrap<JobSnapshot>(http.get(`/jobs/${encodeURIComponent(jobId)}`)),
+
+  /** 取消作业（尽力而为：引擎侧同步处理无法被单方面中断，语义见后端说明） */
+  cancelJob: (jobId: string) =>
+    unwrap<JobSnapshot>(http.post(`/jobs/${encodeURIComponent(jobId)}/cancel`)),
 
   /** DAG 视图数据 */
   graph: (planId: string) => unwrap<GraphPayload>(http.get(`/plans/${planId}/graph`)),
@@ -436,12 +473,12 @@ export interface AgentStreamHandlers {
 }
 
 /**
- * 解析单个 SSE 帧并回调。
+ * 解析单个 SSE 帧：事件名 + JSON 数据。
  *
- * 支持：注释行（`: ping` 心跳，忽略）、`event:` / `data:` 字段、CRLF 归一化后的单行 JSON。
- * `error` 事件以 {@link ApiClientError} 抛出，由调用方统一处理（含 LLM 降级判定）。
+ * 支持：注释行（`: ping` 心跳，返回 `null` 被忽略）、`event:` / `data:` 字段、多行 `data`
+ * 拼接。无数据或非法 JSON 返回 `null`（丢弃而不是抛错——单个坏帧不该中断整条流）。
  */
-function dispatchSseFrame(frame: string, handlers: AgentStreamHandlers, status: number): void {
+function parseSseFrame(frame: string): { name: string; data: unknown } | null {
   let name = 'message'
   const dataLines: string[] = []
   for (const line of frame.split('\n')) {
@@ -453,14 +490,23 @@ function dispatchSseFrame(frame: string, handlers: AgentStreamHandlers, status: 
     if (field === 'event') name = value
     else if (field === 'data') dataLines.push(value)
   }
-  if (dataLines.length === 0) return
-
-  let data: unknown
+  if (dataLines.length === 0) return null
   try {
-    data = JSON.parse(dataLines.join('\n'))
+    return { name, data: JSON.parse(dataLines.join('\n')) }
   } catch {
-    return
+    return null
   }
+}
+
+/**
+ * 解析 Agent 流式帧并回调。
+ *
+ * `error` 事件以 {@link ApiClientError} 抛出，由调用方统一处理（含 LLM 降级判定）。
+ */
+function dispatchSseFrame(frame: string, handlers: AgentStreamHandlers, status: number): void {
+  const parsed = parseSseFrame(frame)
+  if (!parsed) return
+  const { name, data } = parsed
 
   switch (name) {
     case 'meta':
@@ -496,34 +542,32 @@ function dispatchSseFrame(frame: string, handlers: AgentStreamHandlers, status: 
 }
 
 /**
- * SSE 流式会话对话。
+ * 通用 SSE 读取器：`fetch` + `ReadableStream` 增量解析，逐帧回调。
  *
- * 用 `fetch` + `ReadableStream` 读取（axios 无法增量读取响应体），因此需手工注入
- * Bearer 令牌；`AbortSignal` 支持「停止生成」；错误统一归一化为 {@link ApiClientError}
- * （含 `ABORTED` 取消码），与 axios 链路保持一致的错误契约。
+ * 用 `fetch` 而非 axios —— axios（浏览器适配器）无法增量读取响应体。只依赖会话 Cookie
+ * 鉴权（同源默认携带，跨域需与服务端 CORS 凭证配置一致），因此不注入任何自定义凭据头。
+ * 错误统一归一化为 {@link ApiClientError}（含 `ABORTED` 取消码），与 axios 链路同契约，
+ * 调用方可用同一套 `errorText` / 错误码分支处理。
  */
-export async function agentChatStream(
-  payload: AgentChatRequest,
-  handlers: AgentStreamHandlers,
-  signal?: AbortSignal,
+async function streamSse(
+  url: string,
+  init: { method?: string; body?: string; contentType?: string; signal?: AbortSignal },
+  onFrame: (frame: string, status: number) => void,
 ): Promise<void> {
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    accept: 'text/event-stream',
-  }
+  const headers: Record<string, string> = { accept: 'text/event-stream' }
+  if (init.contentType) headers['content-type'] = init.contentType
 
   let response: Response
   try {
-    response = await fetch(`${API_BASE}/agent/chat/stream`, {
-      method: 'POST',
+    response = await fetch(url, {
+      method: init.method ?? 'GET',
       headers,
-      body: JSON.stringify(payload),
-      // 会话 Cookie 需随流式请求发送（同源默认携带，跨域需与服务端 CORS 凭证配置一致）
+      body: init.body,
       credentials: 'include',
-      signal,
+      signal: init.signal,
     })
   } catch {
-    if (signal?.aborted) throw new ApiClientError('已取消生成', 'ABORTED', 0)
+    if (init.signal?.aborted) throw new ApiClientError('已取消', 'ABORTED', 0)
     throw new ApiClientError('无法连接到服务端，请确认 API 服务已启动', 'NETWORK_ERROR', 0)
   }
 
@@ -556,17 +600,81 @@ export async function agentChatStream(
       while (boundary >= 0) {
         const frame = buffer.slice(0, boundary)
         buffer = buffer.slice(boundary + 2)
-        dispatchSseFrame(frame, handlers, response.status)
+        onFrame(frame, response.status)
         boundary = buffer.indexOf('\n\n')
       }
     }
   } catch (error) {
     if (error instanceof ApiClientError) throw error
-    if (signal?.aborted) throw new ApiClientError('已取消生成', 'ABORTED', 0)
+    if (init.signal?.aborted) throw new ApiClientError('已取消', 'ABORTED', 0)
     throw new ApiClientError('流式响应中断，请重试', 'STREAM_ERROR', response.status)
   } finally {
     reader.releaseLock()
   }
+}
+
+/**
+ * SSE 流式会话对话。
+ *
+ * `AbortSignal` 支持「停止生成」；帧解析与错误归一化复用 {@link streamSse}。
+ */
+export async function agentChatStream(
+  payload: AgentChatRequest,
+  handlers: AgentStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  await streamSse(
+    `${API_BASE}/agent/chat/stream`,
+    { method: 'POST', body: JSON.stringify(payload), contentType: 'application/json', signal },
+    (frame, status) => dispatchSseFrame(frame, handlers, status),
+  )
+}
+
+/* --------------------------- 异步写作业（/api/jobs/**） --------------------------- */
+
+/** 作业进度流事件回调 */
+export interface JobStreamHandlers {
+  /** 新进度项（作业内阶段推进） */
+  onProgress?: (item: JobProgressItem, status: string) => void
+  /** 终态：作业快照（`succeeded` 时 `planId` 非空） */
+  onDone?: (snapshot: JobSnapshot) => void
+  /** 终态失败：作业快照（含 `error`），或流自身报错时的稳定错误码 */
+  onError?: (error: { code: string; message: string }) => void
+}
+
+/**
+ * 订阅作业进度流（SSE：`progress` → `done` / `error`）。
+ *
+ * 后端的 `done` / `error` 终态事件携带**作业快照**；而流建立后发生存储故障 / 作业过期时，
+ * `error` 事件携带的是标准错误信封（`{code,message}`）。两者都归一化为 `{code,message}`
+ * 回调给上层，避免调用方为「作业失败」与「流失败」写两套分支。
+ */
+export function jobStream(
+  jobId: string,
+  handlers: JobStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  return streamSse(`${API_BASE}/jobs/${encodeURIComponent(jobId)}/stream`, { signal }, (frame) => {
+    const parsed = parseSseFrame(frame)
+    if (!parsed) return
+    const { name, data } = parsed
+    if (name === 'progress') {
+      handlers.onProgress?.(data as JobProgressItem, (data as { status?: string }).status ?? 'running')
+      return
+    }
+    if (name === 'done') {
+      handlers.onDone?.(data as JobSnapshot)
+      return
+    }
+    if (name === 'error') {
+      const payload = data as Partial<JobSnapshot> & { code?: string; message?: string }
+      if (payload.code) {
+        handlers.onError?.({ code: payload.code, message: payload.message ?? '作业进度流出错' })
+        return
+      }
+      handlers.onError?.(payload.error ?? { code: 'JOB_FAILED', message: '作业执行失败' })
+    }
+  })
 }
 
 /** 推导 WebSocket 地址（开发环境由 Vite 代理 /ws）

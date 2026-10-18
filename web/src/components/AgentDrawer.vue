@@ -209,8 +209,10 @@ async function send(raw?: string): Promise<void> {
         },
         onFinal: (result) => {
           sessionId.value = result.sessionId
-          // final 为权威结果：仅在流式内容缺失时兜底，避免重复追加
-          if (!assistant.content) assistant.content = result.content
+          // final 是**权威结果**：服务端已在终态做过事实校验（剔除并不存在的 planId、把虚假的
+          // 「已完成」声明覆盖为确定性文案）。因此这里**整体替换**流式草稿——只在草稿为空时兜底
+          // 会让被服务端纠正过的内容继续留在界面上，用户看到的仍是那句「已成功…」。
+          if (result.content) assistant.content = result.content
           assistant.toolCalls = result.toolCalls.length > 0 ? result.toolCalls : assistant.toolCalls
           assistant.pending = result.pendingActions.length > 0 ? result.pendingActions : undefined
           assistant.planId = result.planId ?? undefined

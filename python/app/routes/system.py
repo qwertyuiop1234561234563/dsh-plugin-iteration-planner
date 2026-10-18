@@ -59,6 +59,10 @@ async def _collect_health(ctx: AppContext) -> dict:
             # 缓存是纯优化项：透出后端与命中率，便于判断「加速是否真的生效」
             "cache": ctx.cache.describe() if ctx.cache is not None else None,
             "rateLimitBackend": ctx.rate_limit.name if ctx.rate_limit is not None else None,
+            # 作业存储与幂等后端：多副本部署时两者都必须落在 Redis，否则「异步作业」与
+            # 「幂等键」只在单个副本内可见。透出后端名，便于运维一眼确认集群配置是否一致。
+            "jobStore": ctx.jobs.describe() if ctx.jobs is not None else None,
+            "idempotencyStore": ctx.idempotency.describe() if ctx.idempotency is not None else None,
             # 访问控制状态：便于运维一眼判断「是否需要登录」「登录是否已启用」
             "authEnabled": ctx.settings.auth_enabled,
             "authStore": "sqlite" if getattr(ctx, "auth", None) is not None else None,

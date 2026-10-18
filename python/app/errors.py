@@ -30,12 +30,16 @@ class ApiError(Exception):
         code: str,
         message: str,
         details: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.details = details
+        #: 需要随响应下发的附加首部（如 ``Proxy-Status`` / ``Retry-After``）。
+        #: 由 :func:`app.main._register_exception_handlers` 写入响应，避免各路由重复处理。
+        self.headers = headers or {}
 
     def to_body(self) -> dict[str, Any]:
         """转换为标准错误响应体。"""
@@ -68,6 +72,46 @@ def not_found(message: str) -> ApiError:
 def bad_gateway(message: str, details: Any | None = None) -> ApiError:
     """内部算法引擎不可达 / 返回异常。"""
     return ApiError(502, "ENGINE_UNAVAILABLE", message, details)
+
+
+def gateway_timeout(message: str = "算法引擎处理超时，请稍后重试", details: Any | None = None) -> ApiError:
+    """算法引擎**可达但在超时内未返回**（与 :func:`bad_gateway` 严格区分）。
+
+    RFC 9110 语义：502 表示「作为网关收到了无效响应」（连不上 / 协议错），504 才是
+    「未能在时限内从上游收到响应」。二者混用会让调用方与监控误判为「引擎挂了」，
+    进而触发无意义的排障方向（真实原因是引擎**在跑**、只是慢），也无法据此区分
+    「可重试的慢」与「不可达」。
+
+    随响应附带 IANA Proxy-Status 首部（``error=http_response_timeout``），让上游代理与
+    可观测系统按标准语义识别本次失败原因。
+    """
+    return ApiError(
+        504,
+        "ENGINE_TIMEOUT",
+        message,
+        details,
+        headers={"Proxy-Status": 'iteration_planner; error="http_response_timeout"'},
+    )
+
+
+def idempotency_conflict(message: str = "相同 Idempotency-Key 的请求仍在处理中，请稍后重试") -> ApiError:
+    """同键请求正在处理中（RFC/draft-07：不得并发执行同一幂等键）。"""
+    return ApiError(409, "IDEMPOTENCY_IN_PROGRESS", message, headers={"Retry-After": "1"})
+
+
+def idempotency_mismatch(message: str = "该 Idempotency-Key 已被用于不同的请求内容") -> ApiError:
+    """同键但请求指纹不同：复用键会造成语义歧义，必须拒绝（Stripe / draft-07 口径）。"""
+    return ApiError(422, "IDEMPOTENCY_KEY_REUSE", message)
+
+
+def job_not_found(message: str = "作业不存在或已过期") -> ApiError:
+    """作业不存在 / 已过期（过期与不存在统一回报，避免探测作业是否存在）。"""
+    return ApiError(404, "JOB_NOT_FOUND", message)
+
+
+def job_conflict(message: str = "作业已处于终态，无法重复操作") -> ApiError:
+    """对已进入终态（succeeded / failed）的作业再次取消等。"""
+    return ApiError(409, "JOB_CONFLICT", message)
 
 
 def llm_unavailable(
@@ -142,6 +186,15 @@ def payload_too_large(message: str, details: Any | None = None) -> ApiError:
 def session_store_unavailable(message: str, details: Any | None = None) -> ApiError:
     """会话存储（Redis）不可用：明确失败，避免「以为存上了其实没存」的隐蔽故障。"""
     return ApiError(503, "SESSION_STORE_UNAVAILABLE", message, details)
+
+
+def job_store_unavailable(message: str = "作业存储暂不可用，请稍后重试") -> ApiError:
+    """作业存储不可用：必须显式失败。
+
+    作业是**状态资源**：若此处降级放行，会出现「已返回 202 + jobId，但该作业并不存在」
+    的假成功，客户端会永远轮询不到结果且无法察觉。宁可让提交明确失败（可重试）。
+    """
+    return ApiError(503, "JOB_STORE_UNAVAILABLE", message)
 
 
 def session_busy(message: str = "同一会话仍有请求在处理中，请稍后重试") -> ApiError:

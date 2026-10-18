@@ -212,6 +212,56 @@ SSE_RESULT = "__result"
 #: SSE 心跳间隔（秒）：空闲超过该时长即发送注释行，避免代理/网关因空闲断开长连接
 SSE_HEARTBEAT_SECONDS = 15.0
 
+# ------------------------ 异步作业（长耗时写链路） ------------------------
+
+#: 作业 SSE 事件名（与 ``/api/jobs/{id}/stream`` 契约共用）
+SSE_PROGRESS = "progress"  #: 阶段 / 进度推进（阶段名 + 人类可读说明）
+SSE_DONE = "done"  #: 作业成功结束，携带 planId 等终态信息
+
+#: 作业状态机：pending → running → succeeded | failed | cancelled
+JOB_STATUS_PENDING = "pending"
+JOB_STATUS_RUNNING = "running"
+JOB_STATUS_SUCCEEDED = "succeeded"
+JOB_STATUS_FAILED = "failed"
+JOB_STATUS_CANCELLED = "cancelled"
+JOB_STATUSES: tuple[str, ...] = (
+    JOB_STATUS_PENDING,
+    JOB_STATUS_RUNNING,
+    JOB_STATUS_SUCCEEDED,
+    JOB_STATUS_FAILED,
+    JOB_STATUS_CANCELLED,
+)
+#: 终态集合：进入终态后不再接受取消等写操作（避免「已成功后又被标记取消」）
+JOB_TERMINAL_STATUSES = frozenset({JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED})
+
+#: 作业种类（决定审计标签与前端文案；集中登记避免字符串散落）
+JOB_KIND_PLAN_CREATE = "plan.create"
+JOB_KIND_PLAN_REPLAN = "plan.replan"
+JOB_KINDS: tuple[str, ...] = (JOB_KIND_PLAN_CREATE, JOB_KIND_PLAN_REPLAN)
+
+#: 作业阶段（进度事件的 ``phase``：前端据此显示进度文案，集中登记避免字符串散落）
+JOB_PHASE_QUEUED = "queued"  #: 已受理，等待执行
+JOB_PHASE_ENGINE = "engine"  #: 已提交算法引擎计算（本阶段最耗时）
+JOB_PHASE_SETTLED = "settled"  #: 已收敛为终态
+JOB_PHASES: tuple[str, ...] = (JOB_PHASE_QUEUED, JOB_PHASE_ENGINE, JOB_PHASE_SETTLED)
+
+#: 异步请求约定首部（RFC 7240）：``Prefer: respond-async`` 表示「不要把连接挂到计算结束」
+PREFER_HEADER = "prefer"
+PREFER_RESPOND_ASYNC = "respond-async"
+
+#: 幂等键首部（IETF draft-ietf-httpapi-idempotency-key-header-07 约定）
+IDEMPOTENCY_KEY_HEADER = "idempotency-key"
+#: 幂等键长度上限（字符）：过长的键会被当作存储滥用面，直接拒绝
+IDEMPOTENCY_KEY_MAX_LEN = 255
+
+#: 作业请求体上限（字节）：作业记录会整体序列化进状态存储，必须防「大 body × 多作业」
+#: 把存储撑爆（全局 32 MiB 的 body 上限是给普通接口的，不适合当作状态载荷）
+JOB_MAX_REQUEST_BYTES = 4 * 1024 * 1024
+#: 作业结果体上限（字节）：超过则只保留状态码与 planId，客户端按 planId 自行拉取详情
+JOB_MAX_RESULT_BYTES = 256 * 1024
+#: 单个作业保留的进度条数上限（只保留最近 N 条，避免长任务把记录越写越大）
+JOB_MAX_PROGRESS_ITEMS = 50
+
 # ------------------------------ 工作区存储限额 ------------------------------
 
 #: 单个计划可保存的基线快照数量上限
@@ -315,6 +365,29 @@ __all__ = [
     "SSE_ERROR",
     "SSE_RESULT",
     "SSE_HEARTBEAT_SECONDS",
+    "SSE_PROGRESS",
+    "SSE_DONE",
+    "JOB_STATUS_PENDING",
+    "JOB_STATUS_RUNNING",
+    "JOB_STATUS_SUCCEEDED",
+    "JOB_STATUS_FAILED",
+    "JOB_STATUS_CANCELLED",
+    "JOB_STATUSES",
+    "JOB_TERMINAL_STATUSES",
+    "JOB_KIND_PLAN_CREATE",
+    "JOB_KIND_PLAN_REPLAN",
+    "JOB_KINDS",
+    "JOB_PHASE_QUEUED",
+    "JOB_PHASE_ENGINE",
+    "JOB_PHASE_SETTLED",
+    "JOB_PHASES",
+    "PREFER_HEADER",
+    "PREFER_RESPOND_ASYNC",
+    "IDEMPOTENCY_KEY_HEADER",
+    "IDEMPOTENCY_KEY_MAX_LEN",
+    "JOB_MAX_REQUEST_BYTES",
+    "JOB_MAX_RESULT_BYTES",
+    "JOB_MAX_PROGRESS_ITEMS",
     "default_store_path",
     "default_auth_store_path",
 ]

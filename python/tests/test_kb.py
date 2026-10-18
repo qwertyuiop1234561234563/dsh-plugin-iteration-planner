@@ -348,6 +348,40 @@ def test_kb_upload_rejects_empty_file(kb_client):
         assert response.status_code == 400
 
 
+def test_kb_create_document_rejects_whitespace_only_title(kb_client):
+    """实测缺陷：``{"title":"   ","content":"x"}`` 曾以 200 落库，标题变空、文件名退化成 ``.md``。
+
+    ``min_length=1`` 只约束原始字符串，因此校验必须在**去空白之后**判断是否为空。
+    """
+    with kb_client() as c:
+        headers = auth()
+        response = c.post("/api/kb/documents", json={"title": "   ", "content": "正文"}, headers=headers)
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "VALIDATION_ERROR"
+        assert response.json()["details"][0]["field"] == "title"
+        # 脏数据不得落库
+        assert c.get("/api/kb/documents", headers=headers).json()["data"]["total"] == 0
+
+
+def test_kb_create_document_normalizes_title_and_content(kb_client):
+    with kb_client() as c:
+        headers = auth()
+        created = c.post("/api/kb/documents", json={"title": "  设计  ", "content": "  正文  "}, headers=headers)
+
+        assert created.status_code == 200
+        assert created.json()["data"]["title"] == "设计"
+
+        # 正文两端空白被去掉后仍可检索到
+        hits = c.post("/api/kb/search", json={"query": "正文"}, headers=headers).json()["data"]
+        assert hits["items"]
+
+
+def test_kb_create_document_rejects_whitespace_only_content(kb_client):
+    with kb_client() as c:
+        assert c.post("/api/kb/documents", json={"title": "t", "content": "  "}, headers=auth()).status_code == 400
+
+
 def test_kb_dense_mode_endpoint(kb_client):
     with kb_client(overrides={"kb_hybrid": False}) as c:
         c.post("/api/kb/documents", json={"title": "t", "content": "关键路径计算"}, headers=auth())

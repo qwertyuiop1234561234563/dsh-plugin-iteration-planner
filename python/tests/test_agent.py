@@ -116,6 +116,18 @@ def _task_add_call(call_id: str = "call_add") -> dict:
     return tool_call("task_add", {"planId": "p1", "taskName": "补写接口用例", "estimatedHours": 4}, call_id)
 
 
+def _task_update_call(call_id: str = "call_upd") -> dict:
+    return tool_call(
+        "task_update",
+        {"planId": "p1", "taskId": "t1", "updateField": "estimatedHours", "newValue": 12},
+        call_id,
+    )
+
+
+def _plan_iteration_call(call_id: str = "call_plan") -> dict:
+    return tool_call("plan_iteration", _plan_args(), call_id)
+
+
 def test_agent_health_reports_write_tools(make_client):
     with make_client() as c:
         data = c.get("/api/agent/health", headers=auth()).json()["data"]
@@ -947,3 +959,118 @@ def test_agent_empty_reply_gets_explicit_hint(make_client):
         assert data["toolCalls"] == []
         assert data["content"].strip() != ""
         assert data["steps"] == 1
+
+
+# ---------------------- 服务端权威重写 + 输出护栏（终态事实校验） ----------------------
+
+
+def test_agent_rejects_fabricated_plan_id_in_pending_reply(make_client):
+    """实测缺陷复现：写操作只是**登记为待确认**，模型却回复「已成功规划迭代…计划ID为 [planId]」。
+
+    用户会以为计划已经建好。这里要求：占位符被剔除、虚假的完成声明被确定性文案覆盖，
+    且待确认清单仍然如实展示（用户仍可确认执行）。
+    """
+    # 登记待确认后编排会继续一步（好让模型补齐同一轮的其余改动），故脚本需给出收尾文本
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_plan_iteration_call()]},
+            {"role": "assistant", "content": "已成功规划迭代版本，计划ID为 [planId]。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "帮我规划一个迭代"}, headers=auth()).json()["data"]
+
+    assert data["planId"] is None
+    assert "[planId]" not in data["content"]
+    assert "已成功" not in data["content"]
+    # 只登记未落库：必须明确告知「尚未落库」，而不是让用户以为已经建好
+    assert "尚未落库" in data["content"]
+    # 护栏替换了模型叙述，但服务端摘要仍必须给出（否则用户不知道自己确认什么）
+    assert "待确认" in data["content"]
+    assert len(data["pendingActions"]) == 1
+
+
+def test_agent_substitutes_real_plan_id_for_placeholder(make_client):
+    """本轮**确实落库**并产出了计划时，占位符必须被**真实 ID** 替换（而不是一律剔除）。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_plan_iteration_call()]},
+            {"role": "assistant", "content": "计划已生成，ID 为 [planId]。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post(
+            "/api/agent/chat",
+            json={"message": "帮我规划一个迭代", "deferWrites": False},
+            headers=auth(),
+        ).json()["data"]
+
+    assert data["planId"] == "p1"
+    assert "[planId]" not in data["content"]
+    # 真实 ID 必须真的写进答复，用户才能据它继续操作
+    assert "p1" in data["content"]
+
+
+def test_agent_removes_wellformed_but_nonexistent_plan_id(make_client):
+    """模型可能编造一个**格式合法**的 UUID 冒充真实计划 ID：同样必须被剔除并说明。"""
+    fabricated = "9f1c0e6a-4b2d-4c3e-8a5b-1d2e3f4a5b6c"
+    llm = ScriptedLlm([{"role": "assistant", "content": f"您可以在计划列表中找到计划 {fabricated}。"}])
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "帮我规划一个迭代"}, headers=auth()).json()["data"]
+
+    assert fabricated not in data["content"]
+    assert "没有产生任何计划" in data["content"]
+
+
+def test_agent_keeps_pending_reply_that_discloses_confirmation(make_client):
+    """模型如实说明「已登记待确认、需确认后才执行」时不得被覆盖——护栏只拦虚假声明。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_task_update_call()]},
+            {"role": "assistant", "content": "已登记待确认动作：将「数据库设计」的工时调整为 12 小时，请确认后我再执行。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把数据库设计改成 12 小时"}, headers=auth()).json()["data"]
+
+    # 已经如实披露「待确认」：属于正确表述，不应被替换成「尚未落库」提示
+    assert "尚未落库" not in data["content"]
+    assert "没有任何变更被登记或执行" not in data["content"]
+    assert len(data["pendingActions"]) == 1
+
+
+def test_agent_replaces_claim_even_when_sentence_ends_with_confirm(make_client):
+    """句尾带「请确认」不足以豁免：**虚假的完成声明**照样必须被拦下。"""
+    llm = ScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_task_update_call()]},
+            {"role": "assistant", "content": "已成功修改该任务的工时，请确认。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        data = c.post("/api/agent/chat", json={"message": "把 t1 的工时改为 12 小时"}, headers=auth()).json()["data"]
+
+    assert "已成功" not in data["content"]
+    assert "尚未落库" in data["content"]
+
+
+def test_agent_stream_final_content_is_authoritative(make_client):
+    """流式场景：护栏纠正后的答复必须经 ``final`` 事件下发，覆盖逐字草稿里的虚假声明。"""
+    llm = StreamingScriptedLlm(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [_plan_iteration_call()]},
+            {"role": "assistant", "content": "已成功规划迭代，计划ID为 [planId]。"},
+        ]
+    )
+    with make_client(llm=llm) as c:
+        response = c.post(
+            "/api/agent/chat/stream",
+            json={"message": "帮我规划一个迭代"},
+            headers={**auth(), "Accept": "text/event-stream"},
+        )
+        events = _parse_sse(response.text)
+
+    final = [payload for name, payload in events if name == "final"][0]
+    assert "[planId]" not in final["content"]
+    assert "尚未落库" in final["content"]
+    assert len(final["pendingActions"]) == 1

@@ -481,10 +481,10 @@ docker compose up -d --build
 |---|---|---|
 | `GET` | `/api/health` | 健康检查（版本 / 存储类型 / 运行时长 / WS 订阅数） |
 | `GET` | `/api/meta/enums` | 枚举元数据 + 缓冲规则（前端下拉的唯一来源） |
-| `POST` | `/api/plans` | 新建计划（完整规划流水线） |
+| `POST` | `/api/plans` | 新建计划（完整规划流水线）。**带 `Prefer: respond-async` 时改为异步作业**：立即返回 `202` + 作业句柄，进度经 SSE 下发（详见 §10.12） |
 | `GET` | `/api/plans` | 计划摘要列表 |
 | `GET` / `DELETE` | `/api/plans/:planId` | 计划详情 / 删除 |
-| `POST` | `/api/plans/:planId/replan` | 全量重规划（可覆盖截止时间、开发人数） |
+| `POST` | `/api/plans/:planId/replan` | 全量重规划（可覆盖截止时间、开发人数）。同样支持 `Prefer: respond-async` 异步作业 |
 | `GET` / `POST` | `/api/plans/:planId/tasks` | 任务列表 / 新增任务 |
 | `PATCH` / `DELETE` | `/api/plans/:planId/tasks/:taskId` | 单字段更新（工时/依赖/状态/优先级/责任人）/ 删除 |
 | `GET` | `/api/plans/:planId/graph` | DAG 视图（节点含 critical/isolated/inCycle 标记） |
@@ -492,10 +492,15 @@ docker compose up -d --build
 | `GET` / `POST` | `/api/audit`、`/api/plans/:planId/dag-check` | 审计查询 / 手动校验 DAG |
 | `*` | `/api/kb/**`、`/api/memories/**` | 知识库（RAG）与长期记忆（Python 服务提供，详见 §10.9） |
 | `*` | `/api/auth/**` | 登录 / 注销 / 会话查询 / 改口令 / 账号管理 / 计划指派（Python 服务提供，详见 §10.10） |
+| `GET` | `/api/jobs/:jobId` | 异步写作业快照（状态 / 进度 / 结果）；**仅属主可读，否则 404**（详见 §10.12） |
+| `GET` | `/api/jobs/:jobId/stream` | 作业进度 SSE 流（`progress` → `done`/`error`，15s 心跳） |
+| `POST` | `/api/jobs/:jobId/cancel` | 取消作业（置终态，不保证中断引擎侧同步计算） |
 | `WS` | `/ws` | 计划创建/更新/删除事件推送（含 30s 心跳）。**握手需鉴权**：浏览器自动携带会话 Cookie（同源）；机器 / CI 用 `?token=<API_TOKEN>`（`WebSocket` 构造函数无法自定义请求头）。未通过即在握手阶段被拒（close code `1008`，HTTP 403），不下发任何事件。**访客（guest）只收到被指派计划的事件**，其余事件在扇出前即被过滤 |
 
 成功响应统一为 `{ "data": ... }`；错误统一为 `{ "code", "message", "details" }`，并映射到稳定错误码：
-`CYCLE_DEPENDENCY`(409)、`VALIDATION_ERROR`(400)、`LLM_FORMAT_ERROR`(422)、`STORAGE_UNAVAILABLE`(503)、`UNAUTHORIZED`(401)、`FORBIDDEN`(403)。
+`CYCLE_DEPENDENCY`(409)、`VALIDATION_ERROR`(400)、`LLM_FORMAT_ERROR`(422)、`STORAGE_UNAVAILABLE`(503)、`UNAUTHORIZED`(401)、`FORBIDDEN`(403)、
+`ENGINE_TIMEOUT`(504，可达但超时，带 `Proxy-Status: iteration_planner; error="http_response_timeout"`)、`ENGINE_UNAVAILABLE`(502，连不上)、
+`JOB_NOT_FOUND`(404)、`JOB_CONFLICT`(409)、`JOB_STORE_UNAVAILABLE`(503)、`IDEMPOTENCY_IN_PROGRESS`(409，带 `Retry-After`)、`IDEMPOTENCY_KEY_REUSE`(422)、`PAYLOAD_TOO_LARGE`(413)。
 
 ### 10.7 控制台页面功能
 
@@ -687,14 +692,15 @@ BM25 / RRF / 向量库增删查 / 入库-检索-删除 REST）与**长期记忆*
 | 注入消毒 | [`agent/sanitize.py`](./python/app/agent/sanitize.py) | 剥离用户输入中的伪角色前缀与 ChatML 特殊 token；送入模型前用 `<<<USER_INPUT ... USER_INPUT>>>` 显式边界包裹，让模型区分「指令」与「数据」 |
 | 结构化日志 | [`logging_config.py`](./python/app/logging_config.py) | 单行 JSON 日志，自动携带 `requestId` |
 | 全链路关联 | [`main.py`](./python/app/main.py) | 生成/透传 `X-Request-Id`，同步下发给引擎与前端 |
-| 指标 | [`metrics.py`](./python/app/metrics.py)、`GET /metrics` | Prometheus 文本（请求数/耗时直方图/引擎/Agent/WS/缓存命中），纯标准库零依赖；路径标签按路由模板降基数 |
+| 指标 | [`metrics.py`](./python/app/metrics.py)、`GET /metrics` | Prometheus 文本（请求数/耗时直方图/引擎/Agent/WS/缓存/作业/幂等/向量库），纯标准库零依赖；路径标签按路由模板降基数——**未匹配与 catch-all 一律折叠为 `{unmatched}` / `{id}` 形态**，客户端无法通过构造任意路径向 label 注入高基数（曾经 `/metrics` 里出现过 `/api/plans/doeotnotexist123`） |
 | 探针 | `GET /healthz`（存活）/ `GET /readyz`（就绪） | 就绪=引擎可达且未在关机；LLM 为可选能力不作门槛 |
-| 引擎韧性 | [`resilience.py`](./python/app/resilience.py)、[`engine_client.py`](./python/app/engine_client.py) | 连接/读取分离超时、连接池上限、指数退避重试（仅连接失败与幂等方法的 5xx）、三态断路器 |
-| 优雅关机 | [`main.py`](./python/app/main.py) | 关机时置 `shutting_down` → `/readyz` 返回 503，随后停止桥接并关闭连接池 |
+| 引擎韧性 | [`resilience.py`](./python/app/resilience.py)、[`engine_client.py`](./python/app/engine_client.py) | 连接/读取分离超时、连接池上限、指数退避重试（仅连接失败与幂等方法的 5xx）、三态断路器；**超时按 RFC 9110 分流**：读/写超时（可达但慢）→ `504 http_response_timeout`，连接失败 → `502`。长耗时写单独使用 `ENGINE_LONG_TIMEOUT_SECONDS` / `ENGINE_JOB_TIMEOUT_SECONDS`，不再被普通接口的 60s 切断 |
+| 优雅关机 | [`main.py`](./python/app/main.py) | 关机时置 `shutting_down` → `/readyz` 返回 503，随后**取消并回收后台作业任务**、关闭作业 / 幂等 / 会话 / 缓存 / 连接池（各有独立 `close()`，避免连接泄漏） |
 | Agent 增强 | [`agent/runner.py`](./python/app/agent/runner.py)、[`agent/llm.py`](./python/app/agent/llm.py) | 同一消息内**并行**执行工具调用（保序回填）、上下文预算超限自动裁剪最旧历史、工具入参结构校验、LLM 调用重试 |
+| Agent 输出护栏 | [`agent/runner.py`](./python/app/agent/runner.py)、[`agent/schemas.py`](./python/app/agent/schemas.py) | **服务端以工具真实结果为唯一事实来源重写答复**（对标 OpenAI Agents SDK `outputGuardrails` tripwire / Pydantic AI `ModelRetry` / LangGraph durable HITL）：① 无「已落库的写工具结果」却出现「已成功规划/创建/更新…」→ 整体替换为确定性说明（有 pending 时明确「**尚未落库，待确认**」），二次仍犯直接收敛不再重试；② 文本出现 `[planId]` / `{planId}` 等占位符或形似 ID 但实际 `planId` 为空 → 剔除并追加「未产生计划 ID」；③ `planId` 已产生而文本是占位符 → 替换为真实 ID。写类工具仍走**两阶段确认**（先登记为待确认、用户确认后才执行）；SSE 与同步两条链路的 `final` 内容**同为权威结果**，前端整段替换流式草稿 |
 | 会话存储 | [`sessions.py`](./python/app/sessions.py) | 可插拔：内存（LRU + TTL + 后台清理）或 Redis（多副本共享）；同会话串行化（**Redis 租约锁**：`SET NX PX` + Lua token 校验 + 续租，跨副本互斥，超时 `SESSION_BUSY`） |
 | 缓存加速 | [`cache.py`](./python/app/cache.py) | 可插拔（Redis / 进程内存 LRU）：缓存**确定性**的向量化结果（`CachedEmbedder`，含同批去重与在途合并），重复提问直接省掉上游往返；缓存是纯优化，**故障一律 fail-open**，不影响可用性。`/api/health` 的 `python.cache` 透出后端与命中率 |
-| 多进程 | `run.py`、`API_WORKERS` | 多 worker 需 `SESSION_STORE=redis` + 网关层 WS 粘性会话；配置 `REDIS_URL` 后限流与缓存亦自动切换为共享实现（断路器仍为进程内状态，必要时可上移到网关） |
+| 多进程 | `run.py`、`API_WORKERS` | 多 worker 需 `SESSION_STORE=redis` + `JOB_STORE=redis` + 网关层 WS 粘性会话；配置 `REDIS_URL` 后限流与缓存亦自动切换为共享实现（断路器仍为进程内状态，必要时可上移到网关） |
 
 运维端点：`http://<host>/healthz`、`/readyz`、`/metrics`（均免鉴权，便于 k8s 探针与 Prometheus 抓取）。
 `/ws` **不在豁免之列**：它与 `/api/**` 同样要求「会话 Cookie 或 `API_TOKEN`」，详见 §10.6 / §10.8 / §10.11。
@@ -821,6 +827,81 @@ Agent 侧新增三个**只读**检索工具（写类工具仍走两阶段确认�
 > 生产部署务必开启 HTTPS 并设 `AUTH_COOKIE_SECURE=true`；跨站场景请同时收紧 `AUTH_COOKIE_SAMESITE`。
 > 若只是想跑通演示，可临时 `AUTH_ENABLED=false`（等同于全部请求按机器主体放行），**切勿带入生产**。
 
+### 10.12 异步写链路（`Prefer: respond-async` + 作业资源 + SSE 进度）
+
+> **要解决的问题（真机复现）**：`POST /api/plans` 在引擎侧是**同步阻塞**的算法计算（实测 80s+）。
+> 网关 `ENGINE_TIMEOUT_SECONDS=60` 先到 → 返回 **502「算法引擎不可达」**，但 **70s 后引擎把计划落了库**：
+> 客户端看到失败并可能重试，服务端却已写入了孤儿计划。全链路缺少「长耗时写」的约定。
+
+**设计对齐**（业界通行做法，非自创）：
+
+| 参考 | 借鉴点 |
+|---|---|
+| Google LRO / Airflow REST / Dify / Superset | 长耗时写不挂连接，改为 `202` + **可轮询的状态资源** |
+| RFC 7240 `Prefer` | 客户端显式声明「可以接受受理回执」`Prefer: respond-async` |
+| RFC 9110 + IANA Proxy-Status | 可达但慢 → **504** `http_response_timeout`；连不上 → **502**（二者语义不可混用） |
+| Stripe / IETF `Idempotency-Key` draft-07 | 同键同载荷 → **回放**；处理中 → **409**；同键异载荷 → **422** |
+
+**协议**（`POST /api/plans`、`POST /api/plans/:planId/replan`）：
+
+```bash
+# ① 提交：拿到作业句柄（立即返回，不等待算法）
+curl -i -X POST http://localhost:8081/api/plans \
+  -H 'Content-Type: application/json' \
+  -H 'Prefer: respond-async' \
+  -H 'Idempotency-Key: 8f4c…（客户端生成的稳定键）' \
+  -d '{"requirement":"订单中心 v2.1","iterationStartDate":"2026-10-20","iterationDeadline":"2026-11-07","devMemberCount":3}'
+
+# HTTP/1.1 202 Accepted
+# Location: /api/jobs/3f2a…	  Prefer: respond-async
+# {"data":{"jobId":"3f2a…","kind":"plan.create","status":"pending",
+#          "pollUrl":"/api/jobs/3f2a…","streamUrl":"/api/jobs/3f2a…/stream","createdAt":1760000000}}
+
+# ② 订阅进度（SSE；也可用 pollUrl 轮询快照）
+curl -N http://localhost:8081/api/jobs/3f2a…/stream
+# event: progress  data: {"jobId":"3f2a…","status":"running","phase":"engine","message":"…","at":…}
+# event: done      data: {"jobId":"3f2a…","status":"succeeded","planId":"…","result":{...}}
+
+# ③ 取消（尽力而为，见下方边界）
+curl -X POST http://localhost:8081/api/jobs/3f2a…/cancel
+```
+
+**作业状态机**：`pending → running → succeeded | failed | cancelled`；查询 / 订阅**按属主隔离**，
+非属主或不存在的作业一律 **404**（不借状态码差异泄露作业是否存在）。`GET /api/health` 的
+`python.jobStore` 会透出后端名与 TTL，便于运维核对「是否真的多副本共享」。
+
+**不回 Prefer 的客户端行为不变**（仅超时语义修正为 504），避免破坏既有调用方；
+但同步路径会使用 `ENGINE_LONG_TIMEOUT_SECONDS`（默认 600s），不再用普通接口的 60s。
+
+**幂等键**（仅 `POST/PUT/PATCH/DELETE` 且带 `Idempotency-Key` 时生效）：
+
+| 场景 | 结果 |
+|---|---|
+| 首次请求 | 正常执行，完成后写回放记录（TTL `IDEMPOTENCY_TTL_SECONDS`，默认 24h） |
+| 同键 + 同载荷，已完成 | **回放**原状态码与原响应体（含 `Location`），带 `Idempotency-Replayed: true`；**不重复执行**。首执行不带该首部，调用方据此可区分 |
+| 同键 + 同载荷，仍在处理 | `409 IDEMPOTENCY_IN_PROGRESS` + `Retry-After: 1` |
+| 同键 + 异载荷 | `422 IDEMPOTENCY_KEY_REUSE`（键被错误复用，须换键） |
+| 请求失败（4xx/5xx） | 释放键，允许用同一键重试 |
+| 幂等存储不可用 | **放行**并在响应标注 `Idempotency-Status: skipped`，计数 `idempotency_total{outcome="degraded"}` |
+
+> 键按主体隔离（`owner:key`），长度上限 255；指纹 = `sha256(method + path + 排序后查询 + body)`，
+> 因此查询参数顺序不影响判定，**载荷不同则绝不复用**。
+> 首部命名沿用 IETF `draft-ietf-httpapi-idempotency-key-header`：回放用 `Idempotency-Replayed: true`。
+
+**关键边界（务必知晓）**：
+
+- **作业是状态而不是缓存**，因此它**不 fail-open**：存储不可用 → `503 JOB_STORE_UNAVAILABLE`。
+  `API_WORKERS>1` 或多副本部署**必须** `JOB_STORE=redis`（否则 A 副本受理、B 副本查不到，客户端会一直轮询到 404）；
+  显式填 `redis` 却缺 `REDIS_URL` 或未装依赖会**启动失败**，不静默降级。可选依赖：`python -m pip install -r python/requirements-redis.txt`。
+- **取消不保证中断引擎**：Fastify 侧同步处理器无法被客户端断连强制中断，`cancel` 只把作业置为终态
+  （不再把结果写回计划）。要真正中断引擎需改 `src/**`，本轮不做（硬约束：算法单一事实来源）。
+- **作业过期**：超过 `JOB_TTL_SECONDS` 后快照与进度不可查，SSE 会以 `error` 事件明确收尾，避免客户端无限等待。
+
+**可观测**：`jobs_total{kind,outcome}`、`job_duration_seconds{kind}`、`idempotency_total{outcome}`、
+`idempotency_store_errors_total{operation}`（后者只随存储真故障增长，适合直接配告警）、
+`kv_store_operations_total{store,operation,outcome}`；审计日志含 `requestId/user/planId/jobId/key/durationMs`，
+控制台「新建计划 / 重规划」在提交后会显示**进度条 + 已运行时长 + 取消按钮**。
+
 ---
 
 ## 十一、已知边界
@@ -828,6 +909,11 @@ Agent 侧新增三个**只读**检索工具（写类工具仍走两阶段确认�
 - **算法口径修正**：§5.2 表格中两处已与需求方确认，其余严格遵循需求文档。
 - **LLM 拆解质量**依赖所接入模型；未接入 LLM 时使用规则拆解（按需求关键词映射任务模板），保证离线可运行。
 - **扩展接口**（Jira / Git / CI-CD）当前仅为接口占位，尚未实现具体适配器。
+- **异步写作业的取消是「逻辑取消」**：`POST /api/jobs/:id/cancel` 只是把作业置为终态、不再把结果写回计划。
+  引擎侧这两个接口是 Fastify 同步处理器，客户端断连不会中断其计算（要真正中断需改 `src/**`，与「算法单一事实来源」硬约束冲突）。
+  因此取消后引擎可能仍完成计算并落库——这是**已知且明确披露**的边界，不是静默失败：作业与审计日志都会留下完整痕迹（详见 §10.12）。
+- **异步作业存储**：内存后端为**单进程**语义，`API_WORKERS>1` / 多副本必须 `JOB_STORE=redis`，
+  否则「A 副本受理作业、B 副本查不到」；作业是状态而非缓存，故存储故障**显式失败**（`503 JOB_STORE_UNAVAILABLE`），不 fail-open。
 - **知识库与长期记忆为可选增强**：需配置向量化模型（`EMBEDDING_API_KEY` 或复用 `LLM_API_KEY`）后启用，
   未配置时自动降级且主链路不受影响；向量库为**本地 Chroma 单进程库**，多 worker / 多副本部署需改用
   Chroma Server 或远端向量库（Milvus / pgvector），并在容器中挂载持久卷（默认 `python/.data/chroma`）。

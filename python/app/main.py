@@ -18,11 +18,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, Request
@@ -46,12 +47,15 @@ from .config import Settings, get_settings
 from .constants import KB_COLLECTION, MEMORY_COLLECTION, default_chroma_dir, default_store_path
 from .engine_client import EngineClient
 from .errors import ApiError, bad_request, forbidden, internal, not_found, rate_limited, unauthorized
+from .idempotency import build_idempotency_guard
+from .jobs import build_job_store
 from .kb import CachedEmbedder, ChromaVectorStore, Embedder, OpenAiEmbedder, build_knowledge_base
 from .logging_config import configure_logging, request_id_var
 from .metrics import METRICS
 from .resilience import CircuitBreaker, RetryPolicy
 from .routes.agent import build_agent_router
 from .routes.auth import build_auth_router
+from .routes.jobs import build_jobs_router
 from .routes.kb import build_kb_router
 from .routes.memory import build_memory_router
 from .routes.proxy import register_proxy_and_static
@@ -74,8 +78,91 @@ from .ws import EngineEventBridge, WsBroadcaster
 
 logger = logging.getLogger("iteration_planner.http")
 
-#: 形如 UUID / 长十六进制的路径片段（指标标签降基数用）
-_ID_SEGMENT = re.compile(r"^[0-9a-fA-F]{8,}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+#: 指标路径标签里代表「任意一个 ID」与「未匹配任何已知形状」的占位符
+_ANY_SEGMENT = "{id}"
+_UNMATCHED_PATH = "{unmatched}"
+
+#: 被代理的引擎路由「形状」白名单（``{id}`` 占位符匹配任意非空片段）。
+#:
+#: 为什么必须是**位置感知的模板**，而不是「片段名白名单 + 深度截断」：后者只约束单个片段，
+#: 却允许把白名单里的名字任意排列组合（``/api/plans/tasks/plans/tasks/…``），6 段即可产生
+#: ``40^6`` 种组合——基数照样爆炸，等于没治。模板匹配把取值收敛为「模板数 + 1（未匹配）」，
+#: 上限是与请求无关的常数，这正是 OTel ``http.route`` / prometheus-fastapi-instrumentator
+#: 的口径（未匹配统一归 ``none``）。
+#:
+#: 该表对应引擎 ``src/api/routes.ts`` 注册的路由形状（读 src 复制形状，不改 src）：
+#: 引擎新增路由而此处未同步时，指标会落到 ``{unmatched}``，可见且不自伤——不会造成基数爆炸。
+_PROXY_SHAPES: tuple[tuple[str, ...], ...] = (
+    ("health",),
+    ("meta", "enums"),
+    ("plans",),
+    ("plans", _ANY_SEGMENT),
+    ("plans", _ANY_SEGMENT, "replan"),
+    ("plans", _ANY_SEGMENT, "tasks"),
+    ("plans", _ANY_SEGMENT, "tasks", _ANY_SEGMENT),
+    ("plans", _ANY_SEGMENT, "graph"),
+    ("plans", _ANY_SEGMENT, "critical-path"),
+    ("plans", _ANY_SEGMENT, "risks"),
+    ("plans", _ANY_SEGMENT, "burndown"),
+    ("plans", _ANY_SEGMENT, "report"),
+    ("plans", _ANY_SEGMENT, "export"),
+    ("plans", _ANY_SEGMENT, "audit"),
+    ("plans", _ANY_SEGMENT, "dag-check"),
+    ("audit",),
+)
+
+#: 形状匹配允许的最大片段数：超过即判未匹配（防御超长路径带来的无谓匹配开销）
+_MAX_SHAPE_SEGMENTS = 8
+
+#: catch-all 代理路由在 ``path_format`` 里的参数名（用于识别并跳过它，并反推 API 前缀）
+_CATCH_ALL_PARAM = "/{full_path"
+
+#: 路由模板里参数位置的临时哨兵（转义后换回通配符，避免正则元字符被误当模式）
+_PARAM_SENTINEL = "\x00param\x00"
+
+
+class _MetricPathTable:
+    """把真实请求路径映射为**稳定指标标签**的模板表。
+
+    为什么需要它：本版本的 Starlette 不会把命中的路由写回 ``scope["route"]``，因此中间件里
+    拿不到路由模板；而直接用真实路径当标签就是客户端可控的基数炸弹。这里在启动后扫描
+    ``app.routes`` 自行建立模板表（顺序与路由匹配顺序一致），代理路径再按引擎路由形状折叠。
+
+    ``by_depth`` 按片段数分桶：绝大多数请求只需与「同片段数」的少数模板比对，避免每条请求
+    都线性扫描全部路由。
+    """
+
+    __slots__ = ("base", "by_depth")
+
+    def __init__(self, base: str, by_depth: dict[int, list[tuple[re.Pattern[str], str]]]) -> None:
+        self.base = base
+        self.by_depth = by_depth
+
+    def resolve(self, raw: str) -> str:
+        depth = raw.count("/") + 1
+        for pattern, template in self.by_depth.get(depth, ()):
+            if pattern.fullmatch(raw):
+                return template
+        return _fold_proxy_path(self.base, raw)
+
+
+def _build_metric_path_table(app: FastAPI, base: str) -> _MetricPathTable:
+    """由已注册路由建立指标标签模板表（catch-all 兜底路由除外）。
+
+    ``base`` 必须由调用方（配置）显式给出：兜底路由注册在 ``/{full_path:path}`` 上、不带
+    API 前缀，无法从它自身反推出 ``/api`` 这类前缀。
+    """
+    by_depth: dict[int, list[tuple[re.Pattern[str], str]]] = {}
+    for route in app.routes:
+        path_format = getattr(route, "path_format", None) or getattr(route, "path", None)
+        if not isinstance(path_format, str) or _CATCH_ALL_PARAM in path_format:
+            continue
+        # 模板里的 ``{param}`` 匹配任意非空片段：先把参数位置替换成哨兵，整体转义后再把
+        # 哨兵换回通配符，避免字面量里的正则元字符（如 ``.``）被误当模式
+        literal = re.sub(r"\{[^}]+?\}", _PARAM_SENTINEL, path_format).replace(":path", "")
+        regex = re.compile(re.escape(literal).replace(re.escape(_PARAM_SENTINEL), "[^/]+"))
+        by_depth.setdefault(path_format.count("/") + 1, []).append((regex, path_format))
+    return _MetricPathTable(base, by_depth)
 
 
 def derive_engine_ws_url(engine_base_url: str, ws_path: str) -> str:
@@ -83,6 +170,23 @@ def derive_engine_ws_url(engine_base_url: str, ws_path: str) -> str:
     parts = urlsplit(engine_base_url)
     scheme = "wss" if parts.scheme == "https" else "ws"
     return urlunsplit((scheme, parts.netloc, ws_path, "", ""))
+
+
+async def _drain_jobs(ctx: AppContext) -> None:
+    """关机时收敛本副本在跑的作业：取消任务并等待其把作业写成终态。
+
+    不收敛的后果是作业永远停在 ``running``：客户端一直轮询，直到 TTL 过期才收到 404。
+    带超时等待是必需的——作业可能在引擎调用中，不能为「写状态」把关机无限拖住。
+    多副本部署下只能取消本副本持有的任务，其他副本的作业由其自身停机流程收敛。
+    """
+    tasks = [task for task in ctx.job_tasks.values() if not task.done()]
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    with suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+    ctx.job_tasks.clear()
 
 
 def create_app(
@@ -236,6 +340,21 @@ def create_app(
         driver=settings.rate_limit_backend,
     )
     workspace = WorkspaceStore(settings.workspace_store_path or default_store_path())
+    #: 异步作业存储（长耗时写的状态资源）：内存 / Redis 可插拔；显式选 Redis 时缺依赖即启动失败
+    job_store = build_job_store(
+        driver=settings.job_store,
+        redis_url=settings.redis_url,
+        max_entries=settings.job_max_entries,
+        ttl_seconds=settings.job_ttl_seconds,
+    )
+    #: 幂等键守卫（长耗时写的防重放）：后端选择与作业存储共用同一驱动语义 ——
+    #: 多副本部署选 Redis 时，作业与幂等键才会在副本间一致可见
+    idempotency = build_idempotency_guard(
+        driver=settings.job_store,
+        redis_url=settings.redis_url,
+        max_entries=settings.job_max_entries * 4,
+        ttl_seconds=settings.idempotency_ttl_seconds,
+    )
     #: 账号 / 会话存储；``AUTH_ENABLED=false`` 时整套访问控制关闭（仅保留机器令牌语义）
     auth_store = (
         AuthStore(
@@ -270,6 +389,7 @@ def create_app(
         finally:
             # 优雅关机：先置「未就绪」拒绝新请求，再排空后台任务与连接
             _app.state.ctx.shutting_down = True
+            await _drain_jobs(_app.state.ctx)
             if start_bridge:
                 await bridge.stop()
             if auth_store is not None:
@@ -277,6 +397,8 @@ def create_app(
             await store.close()
             await workspace.close()
             await cache.close()
+            await job_store.close()
+            await idempotency.close()
             await resolved_engine.aclose()
             if isinstance(resolved_llm, OpenAiCompatibleClient):
                 await resolved_llm.aclose()
@@ -310,6 +432,8 @@ def create_app(
         cache=cache,
         rate_limit=limiter,
         auth=auth_store,
+        jobs=job_store,
+        idempotency=idempotency,
     )
 
     # 注册顺序：先注册的在内层，后注册的在外层（Starlette 语义），CORS 需最外层。
@@ -328,6 +452,8 @@ def create_app(
     # 访问控制端点必须最先注册（登录 / 会话查询），且早于 catch-all 静态与代理路由
     app.include_router(build_auth_router(settings.api_base_path))
     app.include_router(build_agent_router(settings.api_base_path))
+    # 异步作业端点必须先于 catch-all 静态/代理路由注册（否则会被 ``/api/**`` 透传吞掉）
+    app.include_router(build_jobs_router(settings.api_base_path))
     # 情景对比必须先于 catch-all 静态/代理路由注册（Starlette 先注册先匹配）
     app.include_router(build_scenario_router(settings.api_base_path))
     # 治理能力（导入 / 基线 / 登记册 / 负荷 / 燃尽分析 / 变更历史 / 质量 / 配置备份）
@@ -336,6 +462,8 @@ def create_app(
     app.include_router(build_kb_router(settings.api_base_path))
     app.include_router(build_memory_router(settings.api_base_path))
     register_proxy_and_static(app)
+    # 路由全部注册完毕后建表：指标路径标签只允许落入已知模板，避免客户端可控的基数爆炸
+    app.state.metric_path_table = _build_metric_path_table(app, settings.api_base_path)
     return app
 
 
@@ -559,19 +687,40 @@ def _record_metrics(request: Request, status: int, elapsed: float) -> None:
 
 
 def _metric_path(request: Request) -> str:
-    """计算指标用的路径标签：优先路由模板，兜底把 ID 片段归一化以控制基数。"""
-    route = request.scope.get("route")
-    path_format = getattr(route, "path_format", None)
-    if path_format and "{full_path" not in path_format:
-        return path_format
-    raw = request.scope.get("path", "/")
-    return "/".join("{id}" if _ID_SEGMENT.match(part) else part for part in raw.split("/"))
+    """计算指标用的路径标签：命中路由模板则用之，否则按已知引擎路由形状折叠。
+
+    直接拿真实路径当标签是**客户端可控的基数炸弹**：实测 ``/api/plans/doeotnotexist123``
+    与 ``/api/plans/__proto__/risks`` 都会被原样写进指标，任何人循环请求不同路径即可让
+    时间序列无限增长，把监控后端打爆。因此只允许落入「已知形状」，其余统一折叠。
+    """
+    table = getattr(request.app.state, "metric_path_table", None)
+    if table is None:
+        # 兜底（理论上不会发生：create_app 结束前已建表）：只折叠成未匹配，绝不回退到真实路径
+        return f"{_UNMATCHED_PATH}"
+    return table.resolve(request.scope.get("path", "/"))
+
+
+def _fold_proxy_path(base: str, raw: str) -> str:
+    """把被代理的真实路径折叠为「已知形状」之一；未匹配则返回 ``{unmatched}``。"""
+    remainder = raw[len(base):] if base and raw.startswith(base) else raw
+    segments = [segment for segment in remainder.split("/") if segment]
+    if not segments or len(segments) > _MAX_SHAPE_SEGMENTS:
+        return f"{base}/{_UNMATCHED_PATH}" if base else f"/{_UNMATCHED_PATH}"
+    for shape in _PROXY_SHAPES:
+        if len(shape) != len(segments):
+            continue
+        if all(expected == _ANY_SEGMENT or expected == actual for expected, actual in zip(shape, segments)):
+            template = "/".join(shape)
+            return f"{base}/{template}" if base else f"/{template}"
+    return f"{base}/{_UNMATCHED_PATH}" if base else f"/{_UNMATCHED_PATH}"
 
 
 def _register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content=exc.to_body())
+        # 附加首部随错误一起下发（如 504 的 Proxy-Status、429/409 的 Retry-After），
+        # 由异常自身携带，避免每个路由各自重复拼装。
+        return JSONResponse(status_code=exc.status_code, content=exc.to_body(), headers=exc.headers or None)
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation(_request: Request, exc: RequestValidationError) -> JSONResponse:

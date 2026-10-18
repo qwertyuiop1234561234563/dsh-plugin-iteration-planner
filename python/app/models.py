@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 from .constants import (
     MAX_PLAN_ASSIGNMENTS,
+    MEMORY_IMPORTANCE,
+    MEMORY_STATUSES,
+    MEMORY_TYPES,
     PASSWORD_MAX_LEN,
     PASSWORD_MIN_LEN,
     ROLES,
@@ -23,6 +26,41 @@ _ISO_DATE = r"^\d{4}-\d{2}-\d{2}$"
 #: 标识符字符集（计划 ID / 会话 ID：引擎与服务端均生成 UUID，仅接受字母数字与 ``-`` / ``_``）。
 #: 限制字符集可避免 ID 被拼进上游 URL 时产生路径穿越，也避免任意形态的键污染会话存储。
 _ID = r"^[A-Za-z0-9_-]{1,128}$"
+
+
+def _strip_nonempty(value: str) -> str:
+    """去首尾空白并拒绝「消毒后为空」。
+
+    ``min_length=1`` 只约束**原始**字符串：``"   "`` 能通过校验，但去空白后就没了内容。
+    实测缺陷：``POST /api/kb/documents {"title":"   ","content":"x"}`` 会以 ``title=""`` 落库，
+    文件名退化成 ``.md``——一条无法被检索、也无法辨认的脏数据。入参校验必须在**规范化之后**
+    判断是否为空，否则校验形同虚设。
+    """
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("不能为空或仅包含空白字符")
+    return cleaned
+
+
+def _enum_of(allowed: tuple[str, ...]):
+    """构造「取值必须属于给定集合」的校验器（不接受大小写 / 空格变体，避免静默改写）。"""
+
+    def _check(value: str) -> str:
+        if value not in allowed:
+            raise ValueError(f"取值必须是 {' | '.join(allowed)} 之一")
+        return value
+
+    return _check
+
+
+#: 去空白后必须非空，且返回**规范化后**的值（下游不再需要自行 strip）
+NonEmptyStr = Annotated[str, AfterValidator(_strip_nonempty)]
+#: 长期记忆类型（严格枚举；非法取值明确报错，不再静默改写成 other）
+MemoryType = Annotated[str, AfterValidator(_enum_of(MEMORY_TYPES))]
+#: 记忆重要度（严格枚举）
+MemoryImportance = Annotated[str, AfterValidator(_enum_of(MEMORY_IMPORTANCE))]
+#: 记忆状态（严格枚举）
+MemoryStatus = Annotated[str, AfterValidator(_enum_of(MEMORY_STATUSES))]
 
 
 class AgentPlanRequest(BaseModel):
@@ -354,8 +392,8 @@ class PlanAssignmentsRequest(BaseModel):
 class KbDocumentCreateRequest(BaseModel):
     """以「直接粘贴文本」的方式新建知识库文档（与文件上传接口互补）。"""
 
-    title: str = Field(min_length=1, max_length=200, description="文档标题")
-    content: str = Field(min_length=1, max_length=2_000_000, description="文档正文（纯文本 / Markdown）")
+    title: NonEmptyStr = Field(min_length=1, max_length=200, description="文档标题")
+    content: NonEmptyStr = Field(min_length=1, max_length=2_000_000, description="文档正文（纯文本 / Markdown）")
     source: str | None = Field(default=None, max_length=200, description="来源说明（如系统名、链接）")
     tags: list[str] = Field(default_factory=list, max_length=10, description="标签")
 
@@ -363,7 +401,7 @@ class KbDocumentCreateRequest(BaseModel):
 class KbSearchRequest(BaseModel):
     """知识库检索（混合检索试跑 / 外部系统调用）。"""
 
-    query: str = Field(min_length=1, max_length=2000, description="检索关键词或问题")
+    query: NonEmptyStr = Field(min_length=1, max_length=2000, description="检索关键词或问题")
     topK: int | None = Field(default=None, gt=0, le=50, description="返回条数（缺省取服务端配置）")
     hybrid: bool | None = Field(default=None, description="是否启用混合检索（缺省取服务端配置）")
 
@@ -453,9 +491,9 @@ class KbStats(BaseModel):
 class MemoryCreateRequest(BaseModel):
     """手工新增一条长期记忆（自动提取之外的治理入口）。"""
 
-    text: str = Field(min_length=1, max_length=500, description="记忆内容（自包含的一句话）")
-    type: str = Field(default="fact", description="fact | preference | decision | constraint | task | other")
-    importance: str = Field(default="medium", description="high | medium | low")
+    text: NonEmptyStr = Field(min_length=1, max_length=500, description="记忆内容（自包含的一句话）")
+    type: MemoryType = Field(default="fact", description="fact | preference | decision | constraint | task | other")
+    importance: MemoryImportance = Field(default="medium", description="high | medium | low")
     tags: list[str] = Field(default_factory=list, max_length=5)
     source: str | None = Field(default=None, max_length=128, description="来源标记（会话 ID 或手工）")
 
@@ -463,7 +501,7 @@ class MemoryCreateRequest(BaseModel):
 class MemoryStatusRequest(BaseModel):
     """启用 / 停用一条记忆。"""
 
-    status: str = Field(description="active | disabled")
+    status: MemoryStatus = Field(description="active | disabled")
 
 
 class MemoryItem(BaseModel):

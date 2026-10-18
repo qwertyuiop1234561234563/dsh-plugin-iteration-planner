@@ -372,6 +372,44 @@ h4 {
   color: var(--ip-text-secondary);
 }
 
+/* 异步作业进度条：长耗时写（建计划 / 重规划）的「在跑什么 · 跑到哪 · 可不可停」 */
+.ip-job {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--ip-border);
+  border-left: 4px solid var(--ip-brand);
+  border-radius: var(--ip-radius);
+  background: var(--ip-surface-sunk);
+}
+
+.ip-job__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ip-job__title {
+  font-weight: 600;
+}
+
+.ip-job__message {
+  margin: 0;
+  font-family: var(--ip-font-mono);
+  font-size: 12px;
+  color: var(--ip-text-secondary);
+}
+
+.ip-job__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+}
+
 .ip-mono {
   font-family: var(--ip-font-mono);
   font-size: 12px;

@@ -926,3 +926,52 @@ export interface AuthAccountUpdatePayload {
   displayName?: string
   password?: string
 }
+
+/* --------------------------- 异步写作业（/api/jobs/**） --------------------------- */
+
+/** 作业类型（与后端 `app/constants.py` JOB_KINDS 一致） */
+export type JobKind = 'plan.create' | 'plan.replan'
+
+/** 作业状态（terminal 取值：succeeded / failed / cancelled） */
+export type JobStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+
+/** 作业阶段（进度事件里的 phase） */
+export type JobPhase = 'queued' | 'engine' | 'settled'
+
+/** 202 受理后返回的作业句柄（调用方据此轮询或订阅进度） */
+export interface JobHandle {
+  jobId: string
+  kind: JobKind
+  status: JobStatus
+  /** 作业资源地址（GET 快照） */
+  pollUrl: string
+  /** 进度流地址（SSE） */
+  streamUrl: string
+  /** 创建时间（Unix 秒，与后端 JobRecord 一致） */
+  createdAt: number
+}
+
+/** 单条进度项 */
+export interface JobProgressItem {
+  /** 记录时间（Unix 秒） */
+  at: number
+  phase: JobPhase | string
+  message: string
+}
+
+/** 作业快照（GET /api/jobs/{id}）；终态时 result / error 二者之一非空 */
+export interface JobSnapshot {
+  jobId: string
+  kind: JobKind
+  status: JobStatus
+  planId: string | null
+  /** Unix 秒 */
+  createdAt: number
+  /** Unix 秒 */
+  updatedAt: number
+  progress: JobProgressItem[]
+  /** 成功时的引擎响应信封（`{data: ...}`） */
+  result: unknown
+  /** 失败时的稳定错误码与通用文案（绝不含内部栈信息） */
+  error: { code: string; message: string } | null
+}

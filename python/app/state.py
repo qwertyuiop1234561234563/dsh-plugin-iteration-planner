@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .agent import AgentRunner
 from .agent.memory import MemoryService
@@ -50,6 +51,12 @@ class AppContext:
     rate_limit: RateLimitBackend | None = None
     #: 账号 / 会话存储（登录 + 角色鉴权）；``AUTH_ENABLED=false`` 时为 ``None``
     auth: AuthStore | None = None
+    #: 异步作业存储（长耗时写的「状态资源」）：客户端凭 jobId 轮询 / 订阅进度
+    jobs: "JobStore | None" = None
+    #: 幂等键守卫：让「超时重试」不再变成「重复写」
+    idempotency: "IdempotencyGuard | None" = None
+    #: 在跑的作业任务句柄（jobId → Task）：仅本副本可见，跨副本取消依靠作业状态位
+    job_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     #: 优雅关机标志：置位后 /readyz 返回未就绪，拒绝新请求（在途请求自然排空）
     shutting_down: bool = False
 

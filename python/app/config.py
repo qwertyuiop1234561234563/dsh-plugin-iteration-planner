@@ -86,6 +86,11 @@ class Settings(BaseSettings):
     #: TypeScript 引擎（Fastify）基地址；Python 仅作为对外网关转发 REST 调用
     engine_base_url: str = "http://127.0.0.1:8080"
     engine_timeout_seconds: float = 60.0
+    #: **长耗时写**的独立读超时（秒）：建计划 / 重规划等算法计算可达数十秒，
+    #: 用普通接口的短超时会先到时并产生「网关报失败但引擎已落库」的孤儿写。
+    engine_long_timeout_seconds: float = 600.0
+    #: 异步作业调用引擎时的读超时（秒）；应为长任务的真实上界，而非短接口预算
+    engine_job_timeout_seconds: float = 600.0
     #: 建立连接的超时（快速失败；读取沿用 engine_timeout_seconds）
     engine_connect_timeout_seconds: float = 5.0
     #: 连接池上限 / 保活连接数
@@ -138,6 +143,20 @@ class Settings(BaseSettings):
     cache_ttl_seconds: float = 3600.0
     #: 限流后端：auto | memory | redis；多副本 / API_WORKERS>1 时用 redis 才能得到全局配额
     rate_limit_backend: str = "auto"
+
+    # ------------------------ 异步作业（长耗时写） ------------------------
+    #: 作业存储后端：auto（有 REDIS_URL 且依赖可用则 Redis，否则进程内存）| memory | redis。
+    #: 多副本 / API_WORKERS>1 必须用 redis，否则客户端轮询会打到「没有该作业」的副本上。
+    job_store: str = "auto"
+    #: 作业记录保留时长（秒）：需覆盖「提交 → 客户端取回终态」的最长间隔
+    job_ttl_seconds: float = 3600.0
+    #: 进程内存作业存储的 LRU 上限（条）
+    job_max_entries: int = 1024
+
+    # --------------------------- 幂等键（可选） ---------------------------
+    #: 幂等键记录保留时长（秒）。对齐 Stripe 的 24h 口径：足够覆盖客户端重试窗口，
+    #: 又不会让键空间无界增长；到期后同键会被视为新请求。
+    idempotency_ttl_seconds: float = 86400.0
 
     # ------------------------------ WS 推送 ------------------------------
     #: 断线重连时向前端重放最近 N 条事件（0 表示关闭）

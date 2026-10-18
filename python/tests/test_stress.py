@@ -458,7 +458,11 @@ def test_extreme_empty_and_whitespace_inputs_rejected(kb_client: Any):
     with kb_client() as client:
         blank = client.post("/api/kb/documents", json={"title": "空白", "content": "   "}, headers=auth())
         assert blank.status_code == 400
-        assert "分块" in blank.json()["message"] or "空" in blank.json()["message"]
+        # 校验层（Pydantic）比「分块后为空」更早、更准确地拦住空白正文：
+        # 顶层 message 是统一的「请求入参校验失败」，具体原因在 details 里按字段给出。
+        details = blank.json()["details"]
+        assert any(item["field"] == "content" for item in details), details
+        assert any("空" in item["message"] or "空白" in item["message"] for item in details), details
 
         upload = client.post(
             "/api/kb/documents/upload",
