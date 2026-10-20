@@ -40,6 +40,7 @@ import PortfolioView from '@/views/PortfolioView.vue'
 import ReportPrintView from '@/views/ReportPrintView.vue'
 import TaskTableView from '@/views/TaskTableView.vue'
 import TimelineView from '@/views/TimelineView.vue'
+import TracesView from '@/views/TracesView.vue'
 import WhatIfView from '@/views/WhatIfView.vue'
 import { useAuthStore } from '@/stores/auth'
 import type { AuthPermission } from '@/api/types'
@@ -130,6 +131,12 @@ const router = createRouter({
           name: 'checkpoints',
           component: CheckpointsView,
           meta: { title: 'Agent 运行台账', sheet: 'E-03', permission: 'agent:chat', writable: true },
+        },
+        {
+          path: 'agent/traces',
+          name: 'traces',
+          component: TracesView,
+          meta: { title: 'Agent 执行轨迹', sheet: 'E-05', permission: 'agent:chat' },
         },
         {
           path: 'evals',

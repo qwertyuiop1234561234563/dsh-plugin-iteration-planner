@@ -116,6 +116,15 @@ export const RISK_TAG: Record<RiskLevel, TagType> = {
   LOW: 'info',
 }
 
+/** 耗时（毫秒）→ 可读文案：调用链的水位差常在同一页里跨 3 个数量级 */
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  if (ms < 1) return '<1ms'
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`
+  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`
+}
+
 /** 时间戳 → 本地时间字符串 */
 export function formatTime(timestamp: number): string {
   if (!timestamp) return '—'
@@ -390,4 +399,133 @@ export const EVAL_OUTCOME_TAG: Record<string, TagType> = {
   pass: 'success',
   fail: 'danger',
   error: 'info',
+}
+
+/* ------------------- Agent 执行轨迹（观测设施：瀑布图 / 回放） ------------------- */
+
+/** 轨迹时间片类型中文名 */
+export const TRACE_KIND_LABEL: Record<string, string> = {
+  llm: '模型调用',
+  tool: '工具调用',
+  reflect: '自我诊断',
+  guard: '一致性护栏',
+  context: '上下文组装',
+  final: '收尾',
+}
+
+/** 轨迹时间片类型标签样式（一眼分清「模型想的」与「真的做了的」） */
+export const TRACE_KIND_TAG: Record<string, TagType> = {
+  llm: 'primary',
+  tool: 'success',
+  reflect: 'warning',
+  guard: 'danger',
+  context: 'info',
+  final: 'info',
+}
+
+/** 时间片状态中文名 */
+export const TRACE_SPAN_STATUS_LABEL: Record<string, string> = {
+  ok: '正常',
+  error: '失败',
+  deferred: '待确认',
+  degraded: '降级',
+}
+
+export const TRACE_SPAN_STATUS_TAG: Record<string, TagType> = {
+  ok: 'success',
+  error: 'danger',
+  deferred: 'warning',
+  degraded: 'warning',
+}
+
+/** 一次运行的终态中文名 */
+export const TRACE_RUN_STATUS_LABEL: Record<string, string> = {
+  ok: '正常收敛',
+  pending: '待用户确认',
+  degraded: '降级完成',
+  error: '编排失败',
+}
+
+export const TRACE_RUN_STATUS_TAG: Record<string, TagType> = {
+  ok: 'success',
+  pending: 'warning',
+  degraded: 'warning',
+  error: 'danger',
+}
+
+export function traceKindLabel(kind: string): string {
+  return TRACE_KIND_LABEL[kind] ?? kind
+}
+
+export function traceKindTag(kind: string): TagType {
+  return TRACE_KIND_TAG[kind] ?? 'info'
+}
+
+export function traceSpanStatusLabel(status: string): string {
+  return TRACE_SPAN_STATUS_LABEL[status] ?? status
+}
+
+export function traceSpanStatusTag(status: string): TagType {
+  return TRACE_SPAN_STATUS_TAG[status] ?? 'info'
+}
+
+export function traceRunStatusLabel(status: string): string {
+  return TRACE_RUN_STATUS_LABEL[status] ?? status
+}
+
+export function traceRunStatusTag(status: string): TagType {
+  return TRACE_RUN_STATUS_TAG[status] ?? 'info'
+}
+
+/* ------------------- 输出溯源（声明级引用 · 未核实计数） ------------------- */
+
+/** 证据来源中文名 */
+export const PROVENANCE_SOURCE_LABEL: Record<string, string> = {
+  tool: '工具返回',
+  kb: '知识库',
+  memory: '长期记忆',
+}
+
+/** 声明核实状态中文名 */
+export const PROVENANCE_STATUS_LABEL: Record<string, string> = {
+  verified: '有据可查',
+  unverified: '未核实',
+}
+
+/** 未核实用 warning 而非 danger：它是**诚实标注**，不是错误 */
+export const PROVENANCE_STATUS_TAG: Record<string, TagType> = {
+  verified: 'success',
+  unverified: 'warning',
+}
+
+export function provenanceSourceLabel(source: string): string {
+  return PROVENANCE_SOURCE_LABEL[source] ?? source
+}
+
+export function provenanceStatusLabel(status: string): string {
+  return PROVENANCE_STATUS_LABEL[status] ?? status
+}
+
+/* ------------------- 上下文预算（分区占比 · 被裁原因） ------------------- */
+
+/** 上下文分区中文名（缺省用后端回传的 label） */
+export const BUDGET_ZONE_LABEL: Record<string, string> = {
+  system: '系统提示词',
+  keep: '必保工作区',
+  current: '本轮输入',
+  recall: '检索增强',
+  history: '历史回合',
+}
+
+/** 各分区在预算条上的配色（固定区与弹性区色彩分离，一眼看出「谁被裁了」） */
+export const BUDGET_ZONE_COLOR: Record<string, string> = {
+  system: '#8c8c8c',
+  keep: '#2b6cb0',
+  current: '#12b76a',
+  recall: '#8b5cf6',
+  history: '#f79009',
+}
+
+export function budgetZoneLabel(zone: string, fallback = ''): string {
+  return BUDGET_ZONE_LABEL[zone] ?? fallback ?? zone
 }

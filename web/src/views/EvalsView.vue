@@ -18,9 +18,12 @@
  *    超时后出现「客户端看到失败、评测其实已跑完」的假失败。
  */
 import { computed, onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { ApiClientError, api, jobStream } from '@/api/client'
 import type {
+  CustomEvalCase,
+  CustomCaseListResult,
   EvalCaseKind,
   EvalCaseResult,
   EvalDescribeResult,
@@ -43,6 +46,14 @@ const loading = ref(false)
 /** 评测台未启用（503 EVALS_DISABLED）：整页降级为提示态 */
 const disabledReason = ref('')
 
+const router = useRouter()
+
+/** 自定义（回归）用例：由失败轨迹确定性推导，自动并入运行集与 CI 门禁 */
+const customCases = ref<CustomCaseListResult | null>(null)
+const customLoading = ref(false)
+/** 自定义用例存储未启用（503 EVALS_CASES_DISABLED）：只隐藏该面板，不影响黄金集评测 */
+const customDisabled = ref('')
+
 const running = ref(false)
 const progress = ref<JobProgressItem[]>([])
 const suite = ref<EvalSuiteResult | null>(null)
@@ -63,9 +74,16 @@ const kindOptions = computed(() => {
 
 const tiles = computed<StatTile[]>(() => {
   const current = suite.value
+  const customTotal = customCases.value?.total ?? 0
   if (!current) {
     return [
       { label: '黄金集用例', value: describe.value?.caseCount ?? 0, tone: 'brand', hint: '改动后跑一遍即可复算' },
+      {
+        label: '回归用例',
+        value: customTotal,
+        tone: customTotal > 0 ? 'warning' : 'success',
+        hint: '由失败轨迹沉淀，自动并入运行集与门禁',
+      },
       {
         label: 'LLM 评委',
         value: describe.value?.judgeEnabled ? '开启' : '关闭',
@@ -76,7 +94,6 @@ const tiles = computed<StatTile[]>(() => {
         value: `≥${Math.round((describe.value?.gates.passRate ?? 0) * 100)}%`,
         hint: `平均分 ≥ ${describe.value?.gates.minScore ?? 0}`,
       },
-      { label: '运行后端', value: describe.value?.backend || '—', hint: `作业存储 ${describe.value?.jobBackend || '—'}` },
     ]
   }
   return [
@@ -115,7 +132,61 @@ async function loadDescribe(): Promise<void> {
   }
 }
 
-/** 用例类型标签样式 */
+/**
+ * 加载自定义（回归）用例。
+ *
+ * 这一块回答的是「**改完之后有没有把踩过的坑一起修好**」：黄金集覆盖通用能力，
+ * 自定义用例覆盖本项目真实踩过的坑，两者都进门禁才叫回归。
+ */
+async function loadCustomCases(): Promise<void> {
+  customLoading.value = true
+  try {
+    customCases.value = await api.customCases()
+    customDisabled.value = ''
+  } catch (error) {
+    customCases.value = null
+    customDisabled.value = error instanceof ApiClientError ? error.message : String(error)
+  } finally {
+    customLoading.value = false
+  }
+}
+
+/** 删除自定义用例：删除后立即从门禁覆盖面移出（要先确认，避免误删回归防线） */
+async function removeCustomCase(row: CustomEvalCase): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `删除后「${row.case.title}」不再纳入评测运行集与 CI 门禁；事故只发生过一次，这条断言就是它留下的唯一防线。`,
+      `确认删除 ${row.case.id}？`,
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '保留' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await api.deleteCustomCase(row.case.id)
+    ElMessage.success('已移出门禁覆盖面')
+    await Promise.all([loadCustomCases(), loadDescribe()])
+  } catch (error) {
+    handleError(error, '删除自定义用例失败')
+  }
+}
+
+/**
+ * 失败用例一键跳回放 / 一键沉淀。
+ *
+ * 评测只告诉人「这条用例挂了」，要知道**为什么挂**必须看过程：带 traceId 跳到执行轨迹页，
+ * 瀑布图会自动选中第一条失败时间片；`replay=1` 直接按原请求重跑对照，`sink=1` 直接打开
+ * 「沉淀为回归用例」对话框 —— 事故闭环的入口就在失败那一行，不必让人自己去找轨迹。
+ */
+function openTrace(row: EvalCaseResult, action?: 'replay' | 'sink'): void {
+  if (!row.traceId) {
+    ElMessage.warning('本例未记录执行轨迹（可能是环境异常或轨迹存储未启用）')
+    return
+  }
+  void router.push({ path: '/agent/traces', query: { traceId: row.traceId, ...(action ? { [action]: '1' } : {}) } })
+}
+
+/** 用例结论标签样式 */
 function outcomeTag(outcome: string): 'primary' | 'success' | 'info' | 'warning' | 'danger' {
   return EVAL_OUTCOME_TAG[outcome] ?? 'info'
 }
@@ -193,7 +264,10 @@ function toggleCase(caseId: string): void {
     : [...selectedCaseIds.value, caseId]
 }
 
-onMounted(loadDescribe)
+onMounted(() => {
+  void loadDescribe()
+  void loadCustomCases()
+})
 </script>
 
 <template>
@@ -364,6 +438,24 @@ onMounted(loadDescribe)
             <span class="ip-mono ip-muted">{{ (row.durationMs / 1000).toFixed(1) }}s</span>
           </template>
         </el-table-column>
+        <el-table-column label="回放 / 沉淀" width="150" align="center" fixed="right">
+          <template #default="{ row }">
+            <div class="ip-eval__row-actions">
+              <el-button size="small" text type="primary" :disabled="!row.traceId" @click="openTrace(row, 'replay')">
+                看轨迹
+              </el-button>
+              <el-button
+                size="small"
+                text
+                type="danger"
+                :disabled="!row.traceId || row.outcome === 'pass'"
+                @click="openTrace(row, 'sink')"
+              >
+                沉淀用例
+              </el-button>
+            </div>
+          </template>
+        </el-table-column>
       </el-table>
     </div>
 
@@ -392,7 +484,7 @@ onMounted(loadDescribe)
         <el-table-column label="评什么（确定性断言）" min-width="260">
           <template #default="{ row }">
             <div class="ip-eval__expect">
-              <el-tag v-for="(value, key) in row.expect" :key="key" size="small" effect="plain">
+              <el-tag v-for="key in Object.keys(row.expect)" :key="key" size="small" effect="plain">
                 {{ key }}
               </el-tag>
             </div>
@@ -408,6 +500,78 @@ onMounted(loadDescribe)
         </el-table-column>
         <template #empty>
           <el-empty :description="disabledReason ? '评测台未启用' : '暂无黄金集用例'" />
+        </template>
+      </el-table>
+    </div>
+
+    <div v-if="!customDisabled" class="ip-panel">
+      <div class="ip-panel__title">
+        <span>自定义回归用例</span>
+        <span class="ip-muted ip-mono">
+          后端 {{ customCases?.backend || '—' }} · 上限 {{ customCases?.maxCases ?? '—' }} 条 ·
+          由失败轨迹的客观事实确定性推导，沉淀即自动并入运行集与 CI 门禁
+        </span>
+        <el-button size="small" :icon="'Refresh'" @click="loadCustomCases">刷新</el-button>
+      </div>
+
+      <el-alert v-if="(customCases?.items.length ?? 0) === 0" type="info" :closable="false" class="ip-eval__alert">
+        <template #title>还没有自定义回归用例</template>
+        <div class="ip-eval__alert-body">
+          在「执行轨迹」页对任意一条含事故信号的运行点「沉淀为回归用例」，或在上面评测结果的失败行点
+          「沉淀用例」—— 断言会由服务端从轨迹事实自动推导（失败过的工具要求不再失败、触发过的护栏要求归零），
+          不必手写。
+        </div>
+      </el-alert>
+
+      <el-table v-loading="customLoading" :data="customCases?.items ?? []" size="small" border row-key="case.id">
+        <el-table-column label="用例" min-width="240">
+          <template #default="{ row }">
+            <div class="ip-eval__title">{{ row.case.title }}</div>
+            <div class="ip-mono ip-muted ip-eval__case-id">{{ row.case.id }}</div>
+            <div v-if="row.note" class="ip-muted ip-eval__note">{{ row.note }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="来源" width="110" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain" :type="row.origin === 'incident' ? 'danger' : 'info'">
+              {{ row.origin === 'incident' ? '事故推导' : '人工登记' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="类型" width="130" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ KIND_LABEL[row.case.kind] ?? row.case.kind }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="断言（由事实推导）" min-width="260">
+          <template #default="{ row }">
+            <div class="ip-eval__expect">
+              <el-tag v-for="key in Object.keys(row.case.expect)" :key="key" size="small" effect="plain">
+                {{ key }}: {{ JSON.stringify(row.case.expect[key]) }}
+              </el-tag>
+            </div>
+            <div v-if="row.rationale.length > 0" class="ip-muted ip-eval__rubric">
+              依据：{{ row.rationale.join('；') }}
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="来源轨迹" width="150">
+          <template #default="{ row }">
+            <span class="ip-mono ip-muted">{{ row.originTraceId || '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="登记时间" width="150" align="right">
+          <template #default="{ row }">
+            <span class="ip-mono ip-muted">{{ formatTime(row.createdAt * 1000) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="110" align="center" fixed="right">
+          <template #default="{ row }">
+            <el-button size="small" text type="danger" @click="removeCustomCase(row)">移出门禁</el-button>
+          </template>
+        </el-table-column>
+        <template #empty>
+          <el-empty description="暂无自定义回归用例（事故沉淀后自动出现在这里）" />
         </template>
       </el-table>
     </div>
@@ -551,5 +715,19 @@ onMounted(loadDescribe)
   margin-top: 4px;
   font-size: 11.5px;
   line-height: 1.6;
+}
+
+.ip-eval__note {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.ip-eval__row-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+  flex-wrap: wrap;
 }
 </style>

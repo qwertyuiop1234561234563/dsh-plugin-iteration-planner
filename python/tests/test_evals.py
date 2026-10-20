@@ -344,7 +344,7 @@ def test_cases_for_preserves_golden_order() -> None:
 
 def test_build_eval_service_reads_settings(settings) -> None:
     service = build_eval_service(settings, runner=_StubRunner(), dispatcher=_StubDispatcher())
-    described = service.describe()
+    described = asyncio.run(service.describe())
     assert described["judgeEnabled"] == settings.evals_judge_enabled
     assert described["gates"] == {"passRate": settings.evals_gate_pass_rate, "minScore": settings.evals_gate_min_score}
     assert described["caseCount"] == len(GOLDEN_CASES)

@@ -60,6 +60,7 @@ class EvalService:
         max_cases: int = 100,
         gate_pass_rate: float = 0.8,
         gate_min_score: float = 0.7,
+        custom_cases: Any = None,
     ) -> None:
         self._runner = runner
         self._dispatcher = dispatcher
@@ -67,23 +68,36 @@ class EvalService:
         self._max_cases = max(1, max_cases)
         self._gate_pass_rate = gate_pass_rate
         self._gate_min_score = gate_min_score
+        #: 自定义（回归）用例存储：由失败轨迹沉淀，自动并入运行集与 CI 门禁
+        self._custom_cases = custom_cases
 
     @property
     def cases(self) -> tuple[EvalCaseSpec, ...]:
         return GOLDEN_CASES
 
-    def describe(self) -> dict[str, Any]:
+    async def custom_cases(self) -> tuple[EvalCaseSpec, ...]:
+        """当前生效的自定义用例（存储缺失时返回空集）。"""
+        if self._custom_cases is None:
+            return ()
+        return await self._custom_cases.specs()
+
+    async def describe(self) -> dict[str, Any]:
+        custom = await self.custom_cases()
         return {
             "judgeEnabled": self._judge_enabled,
             "gates": {"passRate": self._gate_pass_rate, "minScore": self._gate_min_score},
             "caseCount": len(GOLDEN_CASES),
             "cases": [case.model_dump() for case in GOLDEN_CASES],
+            "customCaseCount": len(custom),
+            "customCases": [case.model_dump() for case in custom],
             "model": getattr(self._runner, "model_name", None),
         }
 
     async def run(self, request: EvalRunRequest | None = None) -> EvalSuiteResult:
         request = request or EvalRunRequest()
-        selected = cases_for(request.caseIds, request.kinds)
+        # 自定义用例与黄金集合并后再筛选：事故沉淀的用例只需「存在」就会进入运行集，
+        # 不需要任何人手工把它加进某个清单——这是「事故 → 门禁」闭环成立的关键一步
+        selected = cases_for(request.caseIds, request.kinds, extra=await self.custom_cases())
         if not selected:
             raise bad_request("没有匹配的评测用例（请检查 caseIds / kinds）")
         limit = min(self._max_cases, len(selected))
@@ -309,6 +323,8 @@ class EvalService:
             reflection_strategies=[event.strategy for event in run.reflections],
             reflection_recovered=any(event.recovered for event in run.reflections),
             reflection_count=len(run.reflections),
+            guard_count=run.guardCount,
+            trace_id=run.traceId,
         )
 
     # ------------------------------- 结果与门禁 -------------------------------
@@ -345,6 +361,8 @@ class EvalService:
             steps=observation.steps,
             pendingCount=observation.pending_count,
             planId=observation.plan_id,
+            # 评测失败用例要能「一键跳回放」：把轨迹 ID 带进结果，前端据此打开同一份轨迹
+            traceId=observation.trace_id,
             content=observation.content[:2000],
             durationMs=int((time.monotonic() - started) * 1000),
         )
@@ -413,8 +431,10 @@ class EvalService:
             logger.warning("评测夹具计划 %s 回收失败（请手工清理）", plan_id)
 
 
-def build_eval_service(settings: Any, *, runner: Any, dispatcher: Any) -> EvalService:
-    """按配置装配评测服务。"""
+def build_eval_service(
+    settings: Any, *, runner: Any, dispatcher: Any, custom_cases: Any = None
+) -> EvalService:
+    """按配置装配评测服务（``custom_cases`` 为回归用例存储，``None`` 表示未启用）。"""
     return EvalService(
         runner=runner,
         dispatcher=dispatcher,
@@ -422,6 +442,7 @@ def build_eval_service(settings: Any, *, runner: Any, dispatcher: Any) -> EvalSe
         max_cases=settings.evals_max_cases,
         gate_pass_rate=settings.evals_gate_pass_rate,
         gate_min_score=settings.evals_gate_min_score,
+        custom_cases=custom_cases,
     )
 
 

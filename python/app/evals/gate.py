@@ -27,19 +27,23 @@ from ..agent import AgentRunner, OpenAiCompatibleClient, ToolDispatcher
 from ..config import get_settings
 from ..engine_client import EngineClient
 from ..evals import build_eval_service
+from ..evals.custom import build_custom_case_store
 from ..models import EvalRunRequest
 from ..resilience import CircuitBreaker, RetryPolicy
 from ..sessions import build_session_store
 
-logger = logging.getLogger("iteration_planner.evals.gate")
 
-
-def _build_service(settings: Any) -> tuple[Any, Any, Any]:
-    """装配「引擎 → 调度器 → 编排器 → 评测服务」。
+def _build_service(settings: Any) -> tuple[Any, Any, Any, Any]:
+    """装配「引擎 → 调度器 → 编排器 → 评测服务（含自定义回归用例）」。
 
     刻意与 ``app.main`` 的装配保持同样的参数口径（重试 / 断路器 / 会话存储），
     但**不复用 FastAPI 应用**：门禁不需要 HTTP 层，也不需要知识库 / 长期记忆
     （评测用例只打引擎与编排逻辑），少一层依赖就少一处环境坑。
+
+    自定义用例存储**必须一起装配**：否则「事故沉淀下来的回归用例」在 CI 里根本读不到，
+    门禁看起来通过，实际只跑了黄金集——这比没有闭环更危险（有闭环的错觉）。
+    跨进程可见性取决于驱动：进程内存驱动时，门禁进程看不到服务端进程沉淀的用例，
+    此时会显式给出提示（见 :func:`_run`），而不是静默按「没有自定义用例」放行。
     """
     engine = EngineClient(
         settings.engine_base_url,
@@ -79,6 +83,17 @@ def _build_service(settings: Any) -> tuple[Any, Any, Any]:
         lock_ttl_seconds=settings.agent_session_lock_ttl_seconds,
         lock_wait_seconds=settings.agent_session_lock_wait_seconds,
     )
+    custom_cases = (
+        build_custom_case_store(
+            driver=settings.evals_custom_case_store,
+            redis_url=settings.redis_url,
+            max_entries=settings.evals_max_custom_cases * 2,
+            ttl_seconds=settings.evals_custom_case_ttl_seconds,
+            max_cases=settings.evals_max_custom_cases,
+        )
+        if settings.evals_custom_cases_enabled
+        else None
+    )
     dispatcher = ToolDispatcher(engine)
     runner = AgentRunner(
         llm,
@@ -91,7 +106,8 @@ def _build_service(settings: Any) -> tuple[Any, Any, Any]:
         reflect_enabled=settings.agent_reflect_enabled,
         reflect_max_retries=settings.agent_reflect_max_retries,
     )
-    return build_eval_service(settings, runner=runner, dispatcher=dispatcher), engine, llm
+    service = build_eval_service(settings, runner=runner, dispatcher=dispatcher, custom_cases=custom_cases)
+    return service, engine, llm, custom_cases
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -108,7 +124,8 @@ async def _run(args: argparse.Namespace) -> int:
     if not settings.evals_enabled:
         print("评测台未启用（EVALS_ENABLED=false）：门禁无法给出结论", file=sys.stderr)
         return 1
-    service, engine, llm = _build_service(settings)
+    service, engine, llm, custom_cases = _build_service(settings)
+    custom_count = 0
     try:
         request = EvalRunRequest(
             caseIds=args.case or None,
@@ -116,10 +133,28 @@ async def _run(args: argparse.Namespace) -> int:
             judge=False if args.no_judge else None,
         )
         suite = await service.run(request)
+        # 在关闭存储前统计（关闭后内存驱动不再可读）
+        custom_count = await custom_cases.count() if custom_cases is not None else 0
     finally:
         await engine.aclose()
         if isinstance(llm, OpenAiCompatibleClient):
             await llm.aclose()
+        if custom_cases is not None:
+            await custom_cases.close()
+
+    if custom_cases is not None:
+        # 把「这次到底跑了几条自定义回归用例」写进门禁报告本身，而不是只在没有时才告警：
+        # 常驻告警会被无视，而报告里的一行数字每次都被读到——数字为 0 且驱动是 memory 时，
+        # 读者能立刻看出「事故沉淀的用例跨进程不可见，需切 Redis」。
+        suite.notes.append(
+            f"自定义回归用例：{custom_count} 条（驱动 {custom_cases.backend}）"
+            + (
+                "；进程内存驱动跨进程不可见，若已在服务端沉淀事故用例，"
+                "请将 EVALS_CUSTOM_CASE_STORE 与 REDIS_URL 配置为 redis"
+                if custom_count == 0
+                else ""
+            )
+        )
 
     if args.json:
         print(json.dumps(suite.model_dump(), ensure_ascii=False, indent=2))

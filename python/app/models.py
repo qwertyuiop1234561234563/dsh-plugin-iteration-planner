@@ -11,13 +11,20 @@ from typing import Annotated, Any
 from pydantic import AfterValidator, BaseModel, Field
 
 from .constants import (
+    CUSTOM_CASE_ORIGINS,
     MAX_PLAN_ASSIGNMENTS,
     MEMORY_IMPORTANCE,
     MEMORY_STATUSES,
     MEMORY_TYPES,
     PASSWORD_MAX_LEN,
     PASSWORD_MIN_LEN,
+    PROVENANCE_SOURCES,
+    PROVENANCE_STATUSES,
     ROLES,
+    TRACE_KINDS,
+    TRACE_RUN_STATUSES,
+    TRACE_STATUS_OK,
+    TRACE_STATUSES,
     USERNAME_MAX_LEN,
     USERNAME_MIN_LEN,
 )
@@ -153,8 +160,17 @@ class AgentRunResult(BaseModel):
     memories: list["MemoryItem"] = Field(default_factory=list)
     #: 自反思自愈轨迹（自我诊断 → 恢复动作，前端渲染「Agent 如何自救」的时间线）
     reflections: list[ReflectionEvent] = Field(default_factory=list)
+    #: 一致性护栏触发次数（谎报完成 / 无依据状态作答 / 写指令空转 / 结论被服务端改写）。
+    #: 既是可断言的评测指标（``maxGuards``），也是「本轮结论有多可信」的量化提示
+    guardCount: int = 0
     #: 持久化检查点 ID：本次运行登记了待确认写操作时下发，可凭它跨重启续跑
     checkpointId: str | None = None
+    #: 执行轨迹 ID：本次运行的完整 span 轨迹已落库时下发，前端可打开瀑布图并逐 step 回放
+    traceId: str | None = None
+    #: 输出溯源报告：逐条事实性声明的引用与「未核实」计数（未启用时为 ``None``）
+    provenance: "ProvenanceReport | None" = None
+    #: 上下文分区预算明细：本轮上下文如何被分配 / 压缩（未启用时为 ``None``）
+    budget: "BudgetReport | None" = None
 
 
 class AgentChatResponse(AgentRunResult):
@@ -583,8 +599,11 @@ class MemoryStats(BaseModel):
 
 # ``AgentRunResult`` 通过**前向引用**引用知识库 / 记忆模型（声明位置在文件后部），
 # 需在模块加载完成后显式重建，否则首次校验时才会解析，易在子类继承场景下遗漏。
-AgentRunResult.model_rebuild()
-AgentChatResponse.model_rebuild()
+# ``raise_errors=False``：本文件末尾还声明了溯源 / 预算模型（同样被 ``AgentRunResult``
+# 前向引用），此处只保证此刻可解析的部分先就绪，最终一致性由文件末尾的第二次重建兜底
+# —— 若此处直接抛错，导入 ``app.models`` 就会失败。
+AgentRunResult.model_rebuild(raise_errors=False)
+AgentChatResponse.model_rebuild(raise_errors=False)
 
 
 # ========================= What-if 沙盘（自然语言仿真，/api/agent/whatif） =========================
@@ -892,6 +911,8 @@ class EvalCaseResult(BaseModel):
     steps: int = 0
     pendingCount: int = 0
     planId: str | None = Field(default=None, description="本用例产出 / 使用的计划 ID（依赖链据此传递）")
+    #: 本用例运行的执行轨迹 ID：失败用例可据此「一键跳回放」定位当时到底发生了什么
+    traceId: str | None = None
     content: str = ""
     durationMs: int = 0
     error: str | None = None
@@ -935,3 +956,201 @@ class EvalRunRequest(BaseModel):
     kinds: list[str] | None = Field(default=None, max_length=10, description="按类型过滤（plan / chat / …）")
     judge: bool | None = Field(default=None, description="是否启用 LLM-as-judge；缺省取服务端配置")
     enqueue: bool = Field(default=False, description="是否改为异步作业执行（长耗时评测不阻塞连接）")
+
+
+# ================= Agent 执行追踪与回放（/api/agent/traces/**） =================
+#
+# 一次运行的完整轨迹：每一步模型调用的请求 / 响应摘要、每次工具调用的入参出参、
+# 每条自反思事件、每次一致性护栏动作，以及收敛时的终态。前端据此渲染调试器式瀑布图，
+# 并支持逐 step 回放（事故复盘不再依赖「翻日志」）。
+
+
+class TraceSpan(BaseModel):
+    """轨迹中的一个时间片（LLM 调用 / 工具调用 / 反思 / 护栏 / 收尾）。
+
+    ``input`` / ``output`` 为**摘要**而非全量载荷：完整计划可达数百 KB，逐 span 留存会让
+    轨迹体与存储双双失控；回溯需要的是「模型当时看到什么、工具当时返回什么关键字段」。
+    """
+
+    index: int = Field(description="时间片序号（从 1 开始，前端按序遍历渲染瀑布图）")
+    kind: str = Field(description=f"类型：{' | '.join(TRACE_KINDS)}")
+    title: str
+    at: float = Field(default=0.0, description="相对轨迹起点的时间偏移（秒）")
+    durationMs: int = 0
+    status: str = Field(default=TRACE_STATUS_OK, description=f"{' | '.join(TRACE_STATUSES)}")
+    code: str | None = Field(default=None, description="失败 / 降级时的稳定错误码")
+    step: int = Field(default=0, description="所属编排步号（0 表示步外，如收尾、检索）")
+    input: dict[str, Any] = Field(default_factory=dict, description="入参摘要")
+    output: dict[str, Any] = Field(default_factory=dict, description="出参摘要")
+    detail: str = ""
+
+
+class AgentTrace(BaseModel):
+    """一次 Agent 运行的完整轨迹（可回放、可据以推导回归用例）。"""
+
+    traceId: str
+    sessionId: str = ""
+    owner: str = Field(default="", description="归属主体（用户名 / 机器令牌 / evals）")
+    kind: str = Field(description="plan | chat")
+    status: str = Field(description=f"终态：{' | '.join(TRACE_RUN_STATUSES)}")
+    request: CheckpointRequest | None = Field(
+        default=None, description="原始请求：回放与「一键生成回归用例」都凭它原样重跑"
+    )
+    spans: list[TraceSpan] = Field(default_factory=list)
+    steps: int = 0
+    planId: str | None = None
+    pendingCount: int = 0
+    toolChain: list[str] = Field(default_factory=list)
+    failedTools: list[str] = Field(default_factory=list)
+    reflectionCount: int = 0
+    guardCount: int = Field(default=0, description="一致性护栏触发次数（谎报完成 / 无依据作答 / 空转被拦）")
+    contentPreview: str = ""
+    error: str | None = None
+    durationMs: int = 0
+    createdAt: float = 0.0
+    #: 是否含「事故信号」（失败工具 / 护栏拦截 / 降级收尾）：前端标红，并据此决定是否
+    #: 展示「沉淀为回归用例」入口。由服务端确定性计算，不依赖前端自行推断。
+    hasIncident: bool = False
+    #: 该轨迹是否已沉淀为回归用例（有则前端展示用例 ID，避免重复沉淀）
+    incidentCaseId: str | None = None
+
+
+class TraceSummary(BaseModel):
+    """轨迹列表项（不含 span 明细，避免列表响应过大）。"""
+
+    traceId: str
+    sessionId: str = ""
+    kind: str
+    status: str
+    steps: int = 0
+    planId: str | None = None
+    pendingCount: int = 0
+    spanCount: int = 0
+    toolChain: list[str] = Field(default_factory=list)
+    failedTools: list[str] = Field(default_factory=list)
+    reflectionCount: int = 0
+    guardCount: int = 0
+    durationMs: int = 0
+    createdAt: float = 0.0
+    hasIncident: bool = False
+    incidentCaseId: str | None = None
+    contentPreview: str = ""
+
+
+class TraceListResponse(BaseModel):
+    """轨迹列表与存储状态。"""
+
+    items: list[TraceSummary] = Field(default_factory=list)
+    total: int = 0
+    enabled: bool = True
+    backend: str = ""
+    kinds: list[str] = Field(default_factory=list)
+    statuses: list[str] = Field(default_factory=list)
+
+
+class IncidentCaseRequest(BaseModel):
+    """把某条失败轨迹沉淀为回归用例（可覆盖标题 / 备注）。"""
+
+    #: 只做**长度**约束、不做字符集 pattern：格式非法的 ID 应由路由统一返回 404
+    #: （与「真不存在」同码），若在此处 pattern 化，就会先被 Pydantic 折成 422，
+    #: 从而把「轨迹是否存在」这一信息泄漏出去。
+    traceId: str = Field(min_length=1, max_length=64, description="要沉淀的执行轨迹 ID（uuid4().hex）")
+    title: str | None = Field(default=None, max_length=200, description="缺省由轨迹自动生成")
+    note: str = Field(default="", max_length=500, description="沉淀原因 / 关联工单等备注")
+    cleanup: bool = Field(default=True, description="该用例创建的计划是否在评测后回收")
+
+
+# ================= 事故 → 回归用例闭环（自定义用例存储） =================
+
+
+class CustomEvalCase(BaseModel):
+    """黄金集之外的**持久化**评测用例（默认由失败轨迹确定性推导而来）。"""
+
+    case: EvalCaseSpec
+    origin: str = Field(description=f"{' | '.join(CUSTOM_CASE_ORIGINS)}")
+    originTraceId: str | None = None
+    note: str = ""
+    owner: str = ""
+    createdAt: float = 0.0
+    #: 断言推导依据（人类可读）：每条断言为什么被选出来，必须可复核
+    rationale: list[str] = Field(default_factory=list)
+    #: 是否由评测台自动纳入运行（恒为真；保留字段是为了显式表达「它已经进门禁」）
+    included: bool = True
+
+
+class CustomCaseListResponse(BaseModel):
+    """自定义用例列表与存储状态。"""
+
+    items: list[CustomEvalCase] = Field(default_factory=list)
+    total: int = 0
+    enabled: bool = True
+    backend: str = ""
+    origins: list[str] = Field(default_factory=list)
+    maxCases: int = 0
+
+
+# ================= 输出溯源与置信度标注 =================
+
+
+class ProvenanceCitation(BaseModel):
+    """一条证据引用（结论中的事实来自哪里的可点开凭据）。"""
+
+    source: str = Field(description=f"{' | '.join(PROVENANCE_SOURCES)}")
+    ref: str = Field(description="可定位的引用：工具名 + 字段路径 / 知识库 chunkId / 记忆 ID")
+    label: str = Field(description="人类可读来源说明")
+    value: str = Field(default="", description="该证据的取值（截断展示）")
+
+
+class ClaimCitation(BaseModel):
+    """结论中的一条**事实性声明**及其核实状态。"""
+
+    index: int = Field(description="声明序号（从 1 开始，前端据此在气泡内插引用角标）")
+    text: str
+    status: str = Field(description=f"{' | '.join(PROVENANCE_STATUSES)}")
+    numbers: list[str] = Field(default_factory=list, description="该声明中出现的数字字面量")
+    citations: list[ProvenanceCitation] = Field(default_factory=list)
+    detail: str = ""
+
+
+class ProvenanceReport(BaseModel):
+    """一次运行的溯源报告：逐条声明的引用与未核实计数。"""
+
+    totalClaims: int = 0
+    verified: int = 0
+    unverified: int = Field(default=0, description="未匹配到任何证据的数字声明数（诚实暴露不确定）")
+    confidence: float = Field(default=1.0, description="已核实声明占比；无声明时为 1.0")
+    evidenceCount: int = 0
+    sources: dict[str, int] = Field(default_factory=dict, description="各来源的证据原子数")
+    claims: list[ClaimCitation] = Field(default_factory=list)
+
+
+# ================= 动态上下文预算管理 =================
+
+
+class BudgetZoneUsage(BaseModel):
+    """单个上下文分区的用量明细。"""
+
+    zone: str
+    label: str = ""
+    chars: int = 0
+    messages: int = 0
+    #: 被裁掉的消息条数（该分区内）
+    trimmed: int = 0
+    #: 该分区是否被压缩（历史回合被折叠为一行摘要）
+    compressed: bool = False
+
+
+class BudgetReport(BaseModel):
+    """一次编排的分区预算明细（信封回传，前端渲染实时预算条）。"""
+
+    limit: int = 0
+    used: int = 0
+    utilization: float = Field(default=0.0, description="用量占预算比例（0~1）")
+    overBudget: bool = False
+    zones: list[BudgetZoneUsage] = Field(default_factory=list)
+    #: 本轮**内容被改写 / 截断**的摘要说明（让「上下文为什么被裁」可解释）
+    notes: list[str] = Field(default_factory=list)
+
+
+AgentRunResult.model_rebuild()
+AgentChatResponse.model_rebuild()

@@ -389,6 +389,14 @@ export interface AgentChatResult {
   reflections?: AgentReflection[]
   /** 本条运行台账 ID（有待确认动作或编排失败时才有；据此可在重启后继续） */
   checkpointId?: string | null
+  /** 本条执行轨迹 ID（每次运行都有；据此可打开瀑布图 / 逐 step 回放 / 沉淀回归用例） */
+  traceId?: string | null
+  /** 一致性护栏触发次数（谎报完成 / 无依据作答 / 写指令空转被拦）；>0 表示本轮被纠正过 */
+  guardCount?: number
+  /** 输出溯源报告：逐条事实性声明的引用与未核实计数（未启用为 null） */
+  provenance?: ProvenanceReport | null
+  /** 本轮上下文分区预算明细（未启用为 null） */
+  budget?: BudgetReport | null
   /** 本轮实际引用到的知识库片段（供用户核对结论依据） */
   references?: KbHit[]
   /** 本轮注入上下文的长期记忆（供用户纠偏） */
@@ -1316,6 +1324,8 @@ export interface EvalCaseResult {
   content: string
   durationMs: number
   error: string | null
+  /** 本例的执行轨迹 ID：评测只说「挂了」，要知「为什么挂」需据此跳回放 */
+  traceId?: string | null
 }
 
 /** 门禁结论（CI 以此判定放行） */
@@ -1352,11 +1362,18 @@ export interface EvalDescribeResult {
   enabled: boolean
   caseCount: number
   cases: EvalCaseSpec[]
+  /** 已沉淀的自定义（回归）用例数：它们会自动并入运行集与 CI 门禁 */
+  customCaseCount?: number
+  customCases?: EvalCaseSpec[]
   judgeEnabled: boolean
   gates: { passRate: number; minScore: number }
   model: string | null
   backend: string
   jobBackend: string
+  /** 执行轨迹存储后端（memory / redis） */
+  traceBackend?: string
+  /** 自定义用例存储后端（memory / redis） */
+  customCaseBackend?: string
 }
 
 /** 触发评测运行的请求 */
@@ -1374,4 +1391,224 @@ export interface EvalRunRequest {
    * 长耗时场景应置 true 并改用 `jobStream` 订阅进度。
    */
   enqueue?: boolean
+}
+
+/* ---------------- Agent 执行追踪与回放（/api/agent/traces/**） ---------------- */
+
+/** 轨迹时间片类型：模型调用 / 工具调用 / 反思 / 护栏 / 上下文 / 收尾 */
+export type TraceSpanKind = 'llm' | 'tool' | 'reflect' | 'guard' | 'context' | 'final'
+
+/** 时间片状态 */
+export type TraceSpanStatus = 'ok' | 'error' | 'deferred' | 'degraded'
+
+/** 一次运行的终态 */
+export type TraceRunStatus = 'ok' | 'pending' | 'degraded' | 'error'
+
+/** 轨迹时间片（input / output 为摘要，不是全量载荷） */
+export interface TraceSpan {
+  index: number
+  kind: TraceSpanKind | string
+  title: string
+  /** 相对轨迹起点的时间偏移（秒），用于瀑布图定位 */
+  at: number
+  durationMs: number
+  status: TraceSpanStatus | string
+  /** 失败 / 降级时的稳定错误码 */
+  code?: string | null
+  /** 所属编排步号（0 表示步外，如收尾） */
+  step: number
+  input: Record<string, unknown>
+  output: Record<string, unknown>
+  detail: string
+}
+
+/** 轨迹列表项（不含 span 明细） */
+export interface TraceSummary {
+  traceId: string
+  sessionId: string
+  kind: 'plan' | 'chat' | string
+  status: TraceRunStatus | string
+  steps: number
+  planId: string | null
+  pendingCount: number
+  spanCount: number
+  toolChain: string[]
+  failedTools: string[]
+  reflectionCount: number
+  /** 一致性护栏触发次数（谎言完成 / 无依据作答 / 空转被拦） */
+  guardCount: number
+  durationMs: number
+  /** Unix 秒 */
+  createdAt: number
+  /** 是否含事故信号（由服务端确定性计算，前端不自行推断） */
+  hasIncident: boolean
+  /** 已沉淀的回归用例 ID（非空则隐藏重复沉淀入口） */
+  incidentCaseId?: string | null
+  contentPreview: string
+}
+
+export interface TraceListResult {
+  items: TraceSummary[]
+  total: number
+  enabled: boolean
+  backend: string
+  kinds: string[]
+  statuses: string[]
+}
+
+/** 轨迹全量（span 时序 + 原始请求） */
+export interface TraceDetail {
+  traceId: string
+  sessionId: string
+  owner: string
+  kind: 'plan' | 'chat' | string
+  status: TraceRunStatus | string
+  /** 原始请求：回放与沉淀回归用例都凭它原样重跑 */
+  request: {
+    kind?: string
+    message: string
+    planId?: string | null
+    deferWrites?: boolean
+    iterationDeadline?: string | null
+    iterationStartDate?: string | null
+    devMemberCount?: number | null
+  } | null
+  spans: TraceSpan[]
+  steps: number
+  planId: string | null
+  pendingCount: number
+  toolChain: string[]
+  failedTools: string[]
+  reflectionCount: number
+  guardCount: number
+  contentPreview: string
+  error: string | null
+  durationMs: number
+  createdAt: number
+  hasIncident: boolean
+  incidentCaseId?: string | null
+}
+
+/** 回放参数（稳定契约：与 span 明细字段增减解耦） */
+export interface TraceReplay {
+  kind: 'plan' | 'chat' | string
+  /** 原始请求入参（agent/traces 只回放 chat 或 plan 的输入） */
+  input: Record<string, unknown>
+  traceId: string
+  status: TraceRunStatus | string
+  error?: string | null
+  runStatuses: string[]
+  hasIncident: boolean
+  incidentCaseId?: string | null
+}
+
+/* ------------------- 事故 → 回归用例闭环（/api/evals/cases） ------------------- */
+
+/** 自定义用例来源：由失败轨迹推导 / 人工登记 */
+export type CustomCaseOrigin = 'incident' | 'manual'
+
+/** 持久化的自定义（回归）用例 */
+export interface CustomEvalCase {
+  case: EvalCaseSpec
+  origin: CustomCaseOrigin | string
+  originTraceId?: string | null
+  note: string
+  owner: string
+  /** Unix 秒 */
+  createdAt: number
+  /** 断言推导依据（每条断言为什么被选中，必须可复核） */
+  rationale: string[]
+  /** 是否已自动纳入运行集与门禁 */
+  included: boolean
+}
+
+export interface CustomCaseListResult {
+  items: CustomEvalCase[]
+  total: number
+  enabled: boolean
+  backend: string
+  origins: string[]
+  maxCases: number
+}
+
+/** 生效用例集（黄金集 + 自定义），用于核对「门禁到底覆盖了哪些用例」 */
+export interface EffectiveCasesResult {
+  total: number
+  cases: EvalCaseSpec[]
+  customIds: string[]
+}
+
+/** 沉淀回归用例的返回（含该轨迹与沉淀后的生效用例总数） */
+export interface IncidentCaseResult extends CustomEvalCase {
+  traceId: string
+  effectiveCaseCount: number
+}
+
+/* -------------------- 输出溯源与置信度标注（P5 · 可点开引用） -------------------- */
+
+/** 证据来源：工具返回字段 / 知识库片段 / 长期记忆 */
+export type ProvenanceSource = 'tool' | 'kb' | 'memory'
+
+/** 声明状态：数值可回溯 / 找不到来源 */
+export type ProvenanceStatus = 'verified' | 'unverified'
+
+/** 一条证据引用 */
+export interface ProvenanceCitation {
+  source: ProvenanceSource | string
+  /** 可定位引用：工具名.字段路径 / 知识库 chunkId / 记忆 ID */
+  ref: string
+  label: string
+  value: string
+}
+
+/** 结论中的一条事实性声明及其核实状态 */
+export interface ClaimCitation {
+  index: number
+  text: string
+  status: ProvenanceStatus | string
+  /** 该声明中出现的数字字面量 */
+  numbers: string[]
+  citations: ProvenanceCitation[]
+  detail: string
+}
+
+/** 一次运行的溯源报告 */
+export interface ProvenanceReport {
+  totalClaims: number
+  verified: number
+  /** 未匹配到任何证据的数字声明数（诚实暴露不确定） */
+  unverified: number
+  /** 已核实声明占比（无声明时为 1.0） */
+  confidence: number
+  evidenceCount: number
+  sources: Record<string, number>
+  claims: ClaimCitation[]
+}
+
+/* --------------------- 动态上下文预算管理（P6 · 分区预算） --------------------- */
+
+/** 上下文分区：系统提示 / 必保工作区 / 本轮输入 / 检索增强 / 历史回合 */
+export type BudgetZone = 'system' | 'keep' | 'current' | 'recall' | 'history'
+
+export interface BudgetZoneUsage {
+  zone: BudgetZone | string
+  label: string
+  chars: number
+  messages: number
+  /** 该分区被裁掉的消息条数 */
+  trimmed: number
+  /** 该分区是否被压缩（历史回合折叠为一行摘要） */
+  compressed: boolean
+}
+
+/** 一次编排的分区预算明细 */
+export interface BudgetReport {
+  limit: number
+  used: number
+  /** 用量占预算比例（0~1） */
+  utilization: number
+  overBudget: boolean
+  zones: BudgetZoneUsage[]
+  /** 本轮上下文被改写 / 截断的说明（让「为什么被裁」可解释） */
+  notes: string[]
 }

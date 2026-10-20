@@ -22,8 +22,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
+from contextlib import suppress
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -37,22 +39,45 @@ from ..constants import (
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
 )
-from ..errors import ApiError, bad_request, job_store_unavailable
+from ..errors import ApiError, bad_request, job_store_unavailable, not_found
+from ..evals.golden import cases_for
+from ..evals.incidents import derive_case
 from ..jobs import JobRecord
+from ..kvstore import KvStoreError
 from ..metrics import METRICS
-from ..models import EvalRunRequest
+from ..models import EvalRunRequest, IncidentCaseRequest
 from ..state import AppContext
 
 logger = logging.getLogger("iteration_planner.evals.api")
 
+#: 自定义用例 ID 字符集（会拼进存储键，必须限制，否则路径参数可被用来构造任意键）
+_CASE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: 执行轨迹 ID 恒为 ``uuid4().hex``（32 位十六进制）
+_TRACE_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
 #: 评测台不可用（``EVALS_ENABLED=false``）
 _DISABLED = "评测台未启用（EVALS_ENABLED=false）"
+#: 自定义（回归）用例存储不可用（``EVALS_CUSTOM_CASES_ENABLED=false``）
+_CASES_DISABLED = "自定义评测用例未启用（EVALS_CUSTOM_CASES_ENABLED=false）"
 
 
 def _require_evals(ctx: AppContext):
     if ctx.evals is None:
         raise ApiError(503, "EVALS_DISABLED", _DISABLED)
     return ctx.evals
+
+
+def _require_cases(ctx: AppContext):
+    if ctx.custom_cases is None:
+        raise ApiError(503, "EVALS_CASES_DISABLED", _CASES_DISABLED)
+    return ctx.custom_cases
+
+
+def _kv_unavailable(exc: Exception) -> ApiError:
+    """自定义用例是**状态数据**：存储不可用时显式失败（映射 503），不静默当作「没有用例」——
+    静默会让「事故已经沉淀过用例」这件事看起来从未发生，从而重复沉淀。"""
+    logger.warning("自定义用例存储不可用：%s", exc)
+    return ApiError(503, "EVALS_CASE_STORE_UNAVAILABLE", "评测用例存储暂不可用，请稍后重试")
 
 
 def _owner_of(request: Request) -> str:
@@ -161,9 +186,11 @@ def build_evals_router(base: str) -> APIRouter:
     async def evals_describe(request: Request) -> dict:
         ctx: AppContext = request.app.state.ctx
         service = _require_evals(ctx)
-        data = service.describe()
+        data = await service.describe()
         data["enabled"] = True
         data["jobBackend"] = ctx.jobs.backend if ctx.jobs is not None else ""
+        data["traceBackend"] = ctx.traces.backend if ctx.traces is not None else ""
+        data["customCaseBackend"] = ctx.custom_cases.backend if ctx.custom_cases is not None else ""
         return {"data": data}
 
     @router.post("", summary="触发一次评测运行（同步返回结果；enqueue=true 则转为异步作业）")
@@ -178,6 +205,104 @@ def build_evals_router(base: str) -> APIRouter:
             return {"data": await _enqueue(ctx, request, payload)}
         suite = await service.run(payload)
         return {"data": suite.model_dump()}
+
+    # ------------------ 自定义（回归）用例：事故 → 用例 → 门禁 闭环 ------------------
+
+    @router.get("/cases", summary="自定义评测用例列表（由失败轨迹沉淀 / 人工登记，自动纳入门禁）")
+    async def cases_list(request: Request) -> dict:
+        ctx: AppContext = request.app.state.ctx
+        store = _require_cases(ctx)
+        try:
+            items = await store.list()
+        except KvStoreError as exc:
+            raise _kv_unavailable(exc) from exc
+        return {
+            "data": {
+                "items": [item.model_dump() for item in items],
+                "total": len(items),
+                "enabled": True,
+                "backend": store.backend,
+                **store.describe(),
+            }
+        }
+
+    @router.get("/cases/effective", summary="当前生效的用例集（黄金集 + 自定义），供核对门禁覆盖面")
+    async def cases_effective(request: Request) -> dict:
+        ctx: AppContext = request.app.state.ctx
+        custom = await ctx.evals.custom_cases() if ctx.evals is not None else ()
+        merged = cases_for(extra=custom)
+        golden_ids = {case.id for case in cases_for()}
+        return {
+            "data": {
+                "total": len(merged),
+                "cases": [case.model_dump() for case in merged],
+                "customIds": [case.id for case in merged if case.id not in golden_ids],
+            }
+        }
+
+    @router.post("/incidents", summary="把一条失败轨迹沉淀为回归用例（确定性推导断言，幂等覆盖）")
+    async def incident_create(payload: IncidentCaseRequest, request: Request) -> dict:
+        """事故 → 用例闭环的入口。
+
+        断言由 :func:`app.evals.incidents.derive_case` **确定性推导**（同一个工具失败 →
+        要求不再失败；护栏被触发 → 要求归零），不依赖人写断言，也不依赖模型判断——
+        沉淀下来的用例必须可复核、可解释，否则它只是又一段「看起来像测试」的文字。
+        """
+        ctx: AppContext = request.app.state.ctx
+        store = _require_cases(ctx)
+        if ctx.traces is None:
+            raise ApiError(503, "TRACE_STORE_UNAVAILABLE", "执行轨迹未启用，无法由轨迹沉淀用例")
+        if not _TRACE_ID_RE.match(payload.traceId):
+            raise not_found("执行轨迹不存在")
+        try:
+            trace = await ctx.traces.get(payload.traceId.lower())
+        except KvStoreError as exc:
+            raise ApiError(503, "TRACE_STORE_UNAVAILABLE", "执行轨迹存储暂不可用，请稍后重试") from exc
+        if trace is None or trace.owner != _owner_of(request):
+            raise not_found("执行轨迹不存在")
+
+        item = derive_case(
+            trace, title=payload.title, note=payload.note or "由失败轨迹自动沉淀", cleanup=payload.cleanup
+        )
+        try:
+            saved = await store.save(
+                case=item.case,
+                origin=item.origin,
+                origin_trace_id=item.originTraceId,
+                note=item.note,
+                owner=item.owner or _owner_of(request),
+                rationale=item.rationale,
+            )
+        except KvStoreError as exc:
+            raise _kv_unavailable(exc) from exc
+        # 回填「该轨迹已沉淀」：前端据此隐藏重复入口，避免同一事故被反复沉淀成多条用例
+        with suppress(Exception):
+            await ctx.traces.attach_incident_case(trace.traceId, saved.case.id)
+        METRICS.inc_counter("evals_incident_case_total")
+        custom = await ctx.evals.custom_cases() if ctx.evals is not None else await store.specs()
+        return {
+            "data": {
+                **saved.model_dump(),
+                "traceId": trace.traceId,
+                # 生效集 = 黄金集 + 自定义用例：沉淀必须**立刻**体现在门禁覆盖面上（否则等于没沉淀）
+                "effectiveCaseCount": len(cases_for(extra=custom)),
+            }
+        }
+
+    @router.delete("/cases/{case_id}", summary="删除一条自定义用例（不再纳入门禁）")
+    async def case_delete(case_id: str, request: Request) -> dict:
+        ctx: AppContext = request.app.state.ctx
+        store = _require_cases(ctx)
+        if not _CASE_ID_RE.match(case_id):
+            raise not_found("用例不存在")
+        try:
+            existing = await store.get(case_id)
+            if existing is None or (existing.owner and existing.owner != _owner_of(request)):
+                raise not_found("用例不存在")
+            await store.delete(case_id)
+        except KvStoreError as exc:
+            raise _kv_unavailable(exc) from exc
+        return {"data": {"caseId": case_id, "deleted": True}}
 
     return router
 

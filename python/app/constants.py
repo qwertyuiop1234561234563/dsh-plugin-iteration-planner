@@ -462,6 +462,127 @@ REFLECT_STRATEGIES: tuple[str, ...] = (
 )
 
 
+# ------------------------ Agent 执行追踪与回放（trace） ------------------------
+# 排障与评测的共同底座：把「一次运行到底发生了什么」落成**有结构、带耗时的 span**
+# （LLM 每一步的请求摘要 / 响应摘要、工具入参出参、反思事件、一致性护栏改写），
+# 前端可像调试器一样看瀑布图，并可逐 step 回放历史运行（事故复盘 / 评测失败归因）。
+
+TRACE_KIND_LLM = "llm"  #: 一次模型调用（请求 / 响应摘要 + 耗时）
+TRACE_KIND_TOOL = "tool"  #: 一次工具调用（入参 / 出参摘要 + 错误码）
+TRACE_KIND_REFLECT = "reflect"  #: 一次自反思事件（归因 + 恢复策略）
+TRACE_KIND_GUARD = "guard"  #: 一致性护栏动作（谎报完成 / 无依据状态作答 / 写指令空转 / 输出改写）
+TRACE_KIND_CONTEXT = "context"  #: 上下文预算动作（分区裁剪 / 旧轮次压缩）——是常态运维事件，不计入「事故信号」
+TRACE_KIND_FINAL = "final"  #: 收敛收尾（终态文本与产出）
+TRACE_KINDS: tuple[str, ...] = (
+    TRACE_KIND_LLM,
+    TRACE_KIND_TOOL,
+    TRACE_KIND_REFLECT,
+    TRACE_KIND_GUARD,
+    TRACE_KIND_CONTEXT,
+    TRACE_KIND_FINAL,
+)
+
+TRACE_STATUS_OK = "ok"
+TRACE_STATUS_ERROR = "error"  #: 该 span 失败（工具报错 / 编排异常）
+TRACE_STATUS_DEFERRED = "deferred"  #: 写工具仅登记为待确认，尚未落库
+TRACE_STATUS_DEGRADED = "degraded"  #: 降级 / 未解决（如纠正后仍未取得工具支撑）
+TRACE_STATUSES: tuple[str, ...] = (
+    TRACE_STATUS_OK,
+    TRACE_STATUS_ERROR,
+    TRACE_STATUS_DEFERRED,
+    TRACE_STATUS_DEGRADED,
+)
+
+#: 轨迹级终态（与 span 级状态区分：一条轨迹可以「收尾为降级」但内部没有失败 span）
+TRACE_RUN_OK = "ok"  #: 正常收敛
+TRACE_RUN_PENDING = "pending"  #: 收敛为「待用户确认」（登记了写操作，尚未落库）
+TRACE_RUN_DEGRADED = "degraded"  #: 收敛但存在未解决信号（护栏拦截 / 降级说明 / 反思熔断）
+TRACE_RUN_ERROR = "error"  #: 编排失败（异常终止）
+TRACE_RUN_STATUSES: tuple[str, ...] = (TRACE_RUN_OK, TRACE_RUN_PENDING, TRACE_RUN_DEGRADED, TRACE_RUN_ERROR)
+
+TRACE_PREFIX = "iteration_planner:trace:"
+#: 单个 trace 保留的 span 上限：长循环 + 多工具时收敛，避免轨迹体无界增长
+MAX_TRACE_SPANS = 200
+#: 单主体索引保留条数上限（索引本身不能无限增长）
+MAX_TRACE_INDEX = 100
+#: span 入参 / 出参摘要中单个字符串的最大长度（回溯看结论，不看全量载荷）
+MAX_TRACE_TEXT_CHARS = 600
+#: 评测运行产生的轨迹归属主体：评测失败用例要能「一键跳回放」，因此这部分轨迹对
+#: 具备 agent:chat 的读者共享（内容只是黄金集输入 + 操作者自己批准入库的回归输入）
+TRACE_OWNER_EVALS = "evals"
+
+# ------------------------ 事故 → 回归用例闭环（incident → case） ------------------------
+# 一次线上事故的**失败轨迹**应该自动变成一条回归用例，而不是靠人手工补：
+# 断言由轨迹**确定性推导**（哪个工具失败了 → 要求不再失败；哪条护栏被触发 → 要求不再
+# 触发），用例持久化后随即被评测台与 CI 门禁消费，形成「事故 → 用例 → 门禁」闭环。
+
+CUSTOM_CASE_PREFIX = "iteration_planner:evals:case:"
+CUSTOM_CASE_ORIGIN_INCIDENT = "incident"  #: 由失败轨迹确定性推导
+CUSTOM_CASE_ORIGIN_MANUAL = "manual"  #: 人工登记（用于补充轨迹无法覆盖的场景）
+CUSTOM_CASE_ORIGINS: tuple[str, ...] = (CUSTOM_CASE_ORIGIN_INCIDENT, CUSTOM_CASE_ORIGIN_MANUAL)
+#: 自定义用例全局索引键（黄金集之外的增量用例）
+CUSTOM_CASE_INDEX = "index:custom-evals"
+MAX_CUSTOM_CASES = 200
+#: 由轨迹推导出的用例 ID 前缀（便于与黄金集区分）
+INCIDENT_CASE_ID_PREFIX = "inc-"
+
+# ------------------------ 输出溯源与置信度标注（provenance） ------------------------
+# 模型会写「总工期 42 天」这类**事实性数字**，用户无从判断它来自引擎事实还是模型臆造。
+# 本能力把工具返回值、知识库片段、长期记忆摊平成**证据原子**，逐条把结论中的数字声明
+# 绑定到来源；未匹配到任何证据的数字声明标记为「未核实」并计数（诚实暴露不确定性）。
+
+PROVENANCE_STATUS_VERIFIED = "verified"
+PROVENANCE_STATUS_UNVERIFIED = "unverified"
+PROVENANCE_STATUSES: tuple[str, ...] = (PROVENANCE_STATUS_VERIFIED, PROVENANCE_STATUS_UNVERIFIED)
+PROVENANCE_SOURCE_TOOL = "tool"  #: 证据来自工具返回值（含 JSON 字段路径）
+PROVENANCE_SOURCE_KB = "kb"  #: 证据来自知识库片段
+PROVENANCE_SOURCE_MEMORY = "memory"  #: 证据来自长期记忆
+PROVENANCE_SOURCES: tuple[str, ...] = (
+    PROVENANCE_SOURCE_TOOL,
+    PROVENANCE_SOURCE_KB,
+    PROVENANCE_SOURCE_MEMORY,
+)
+#: 证据原子抽取上限（防止整份计划被摊平成上万条原子）
+MAX_EVIDENCE_ATOMS = 400
+#: 单条证据原子取值的文本上限
+MAX_EVIDENCE_VALUE_CHARS = 160
+#: 单条声明最多回填的引用数（前端气泡内联展示不宜过密）
+MAX_CLAIM_CITATIONS = 4
+#: 数字匹配容差：浮点工期经常以「40」对「40.0」出现，按相对误差比对
+PROVENANCE_NUMBER_TOLERANCE = 0.01
+
+# ------------------------ 动态上下文预算管理（budget） ------------------------
+# 朴素做法是「超预算就从最旧的用户回合开始删」——它会先把「待确认动作」「上一次失败」
+# 这类**决定本轮正确性**的内容删掉。本能力改为**分区预算**：先固定占位、再分配弹性区，
+# 并回传每个分区的用量明细，让「上下文为什么被裁掉」可解释、可在前端实时观测。
+
+SSE_BUDGET = "budget"  #: 分区预算明细（每步下发，前端渲染预算条）
+
+BUDGET_ZONE_SYSTEM = "system"  #: 系统提示词（固定，永不裁剪）
+BUDGET_ZONE_KEEP = "keep"  #: 必保内容：纠偏提示 / 待确认动作结果 / 最近一次失败
+BUDGET_ZONE_CURRENT = "current"  #: 本轮用户输入（固定，永不裁剪）
+BUDGET_ZONE_RECALL = "recall"  #: 检索增强区块（记忆 / 知识库）：按剩余额度截断
+BUDGET_ZONE_HISTORY = "history"  #: 历史用户回合：按衰减压缩
+BUDGET_ZONES: tuple[str, ...] = (
+    BUDGET_ZONE_SYSTEM,
+    BUDGET_ZONE_KEEP,
+    BUDGET_ZONE_CURRENT,
+    BUDGET_ZONE_RECALL,
+    BUDGET_ZONE_HISTORY,
+)
+BUDGET_ZONE_LABELS: dict[str, str] = {
+    BUDGET_ZONE_SYSTEM: "系统提示",
+    BUDGET_ZONE_KEEP: "必保上下文",
+    BUDGET_ZONE_CURRENT: "本轮输入",
+    BUDGET_ZONE_RECALL: "检索增强",
+    BUDGET_ZONE_HISTORY: "历史回合",
+}
+#: 历史回合保留完整内容的最近轮数（更旧的回合被压缩为一行摘要）
+BUDGET_KEEP_RECENT_TURNS = 3
+#: 压缩摘要单行长度上限
+BUDGET_SUMMARY_CHARS = 200
+
+
 def default_store_path() -> str:
     """默认工作区存储文件位置（可用环境变量 ``WORKSPACE_STORE_PATH`` 覆盖）。
 
@@ -644,6 +765,56 @@ __all__ = [
     "REFLECT_STRATEGY_DEGRADE",
     "REFLECT_STRATEGY_ASK",
     "REFLECT_STRATEGIES",
+    "TRACE_KIND_LLM",
+    "TRACE_KIND_TOOL",
+    "TRACE_KIND_REFLECT",
+    "TRACE_KIND_GUARD",
+    "TRACE_KIND_CONTEXT",
+    "TRACE_KIND_FINAL",
+    "TRACE_KINDS",
+    "TRACE_STATUS_OK",
+    "TRACE_STATUS_ERROR",
+    "TRACE_STATUS_DEFERRED",
+    "TRACE_STATUS_DEGRADED",
+    "TRACE_STATUSES",
+    "TRACE_RUN_OK",
+    "TRACE_RUN_PENDING",
+    "TRACE_RUN_DEGRADED",
+    "TRACE_RUN_ERROR",
+    "TRACE_RUN_STATUSES",
+    "TRACE_PREFIX",
+    "MAX_TRACE_SPANS",
+    "MAX_TRACE_INDEX",
+    "MAX_TRACE_TEXT_CHARS",
+    "TRACE_OWNER_EVALS",
+    "CUSTOM_CASE_PREFIX",
+    "CUSTOM_CASE_ORIGIN_INCIDENT",
+    "CUSTOM_CASE_ORIGIN_MANUAL",
+    "CUSTOM_CASE_ORIGINS",
+    "CUSTOM_CASE_INDEX",
+    "MAX_CUSTOM_CASES",
+    "INCIDENT_CASE_ID_PREFIX",
+    "PROVENANCE_STATUS_VERIFIED",
+    "PROVENANCE_STATUS_UNVERIFIED",
+    "PROVENANCE_STATUSES",
+    "PROVENANCE_SOURCE_TOOL",
+    "PROVENANCE_SOURCE_KB",
+    "PROVENANCE_SOURCE_MEMORY",
+    "PROVENANCE_SOURCES",
+    "MAX_EVIDENCE_ATOMS",
+    "MAX_EVIDENCE_VALUE_CHARS",
+    "MAX_CLAIM_CITATIONS",
+    "PROVENANCE_NUMBER_TOLERANCE",
+    "SSE_BUDGET",
+    "BUDGET_ZONE_SYSTEM",
+    "BUDGET_ZONE_KEEP",
+    "BUDGET_ZONE_CURRENT",
+    "BUDGET_ZONE_RECALL",
+    "BUDGET_ZONE_HISTORY",
+    "BUDGET_ZONES",
+    "BUDGET_ZONE_LABELS",
+    "BUDGET_KEEP_RECENT_TURNS",
+    "BUDGET_SUMMARY_CHARS",
     "default_store_path",
     "default_auth_store_path",
 ]

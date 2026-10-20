@@ -158,6 +158,10 @@ def required_permission(method: str, path: str, base: str) -> str | None:
         # 列表 / 快照只是读台账，与对话同级（agent:chat）
         if rel.startswith("/agent/checkpoints"):
             return PERM_AGENT_CHAT if verb == "GET" else PERM_AGENT_WRITE
+        # 执行轨迹含用户原始需求与工具返回数据，与对话同级（agent:chat）——能对话的人
+        # 本来就看得见这些内容；轨迹端点本身**只读**，因此不分读写权限
+        if rel.startswith("/agent/traces"):
+            return PERM_AGENT_CHAT
         # 写确认属于「真正落库」的动作，单独用 agent:write 区分于只读对话
         if rel.startswith("/agent/confirm"):
             return PERM_AGENT_WRITE

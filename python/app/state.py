@@ -29,8 +29,10 @@ from .ws import EngineEventBridge, WsBroadcaster
 if TYPE_CHECKING:
     from .agent.tools import ToolDispatcher
     from .checkpoints import CheckpointStore
+    from .evals.custom import CustomCaseStore
     from .evals.service import EvalService
     from .mcp.server import McpServer
+    from .traces import TraceStore
 
 
 @dataclass
@@ -69,6 +71,10 @@ class AppContext:
     idempotency: "IdempotencyGuard | None" = None
     #: 持久化检查点台账（两阶段写确认的耐用化 + 断点续跑）；``None`` 表示未启用
     checkpoints: "CheckpointStore | None" = None
+    #: Agent 执行轨迹（每次运行的 span 时序落库：排障 / 回放 / 事故沉淀用例的底座）
+    traces: "TraceStore | None" = None
+    #: 自定义（回归）评测用例存储：由失败轨迹确定性推导并自动纳入 CI 门禁
+    custom_cases: "CustomCaseStore | None" = None
     #: Agent 评测台（golden 集 + 双轨打分 + CI 门禁）
     evals: "EvalService | None" = None
     #: MCP 服务端（把内部能力暴露为标准 MCP 工具：stdio + Streamable HTTP）

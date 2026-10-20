@@ -49,6 +49,7 @@ from .constants import KB_COLLECTION, MEMORY_COLLECTION, default_chroma_dir, def
 from .engine_client import EngineClient
 from .errors import ApiError, bad_request, forbidden, internal, not_found, rate_limited, unauthorized
 from .evals import build_eval_service
+from .evals.custom import build_custom_case_store
 from .idempotency import build_idempotency_guard
 from .jobs import build_job_store
 from .kb import CachedEmbedder, ChromaVectorStore, Embedder, OpenAiEmbedder, build_knowledge_base
@@ -68,6 +69,7 @@ from .routes.memory import build_memory_router
 from .routes.proxy import register_proxy_and_static
 from .routes.scenario import build_scenario_router
 from .routes.system import register_system_routes
+from .routes.traces import build_traces_router
 from .routes.workspace import build_workspace_router
 from .security import (
     SECURITY_HEADERS,
@@ -80,6 +82,7 @@ from .security import (
 )
 from .sessions import build_session_store
 from .state import AppContext
+from .traces import build_trace_store
 from .workstore import WorkspaceStore
 from .ws import EngineEventBridge, WsBroadcaster
 
@@ -330,6 +333,31 @@ def create_app(
         max_entries=settings.checkpoint_max_entries,
         ttl_seconds=settings.checkpoint_ttl_seconds,
     )
+    #: 执行轨迹存储（每次运行的 span 时序）：Agent 编排的观测设施。关闭时端点返回
+    #: 「未启用」，Agent 行为不变（轨迹只写不读，不影响对话结果）。
+    traces = (
+        build_trace_store(
+            driver=settings.agent_trace_store,
+            redis_url=settings.redis_url,
+            max_entries=settings.agent_trace_max_entries,
+            ttl_seconds=settings.agent_trace_ttl_seconds,
+        )
+        if settings.agent_trace_enabled
+        else None
+    )
+    #: 自定义（回归）评测用例存储：由失败轨迹确定性推导并**自动纳入 CI 门禁**。
+    #: 它是状态数据（用例丢一条就等于少一道防线），因此驱动为 redis 时缺依赖即启动失败。
+    custom_cases = (
+        build_custom_case_store(
+            driver=settings.evals_custom_case_store,
+            redis_url=settings.redis_url,
+            max_entries=settings.evals_max_custom_cases * 2,
+            ttl_seconds=settings.evals_custom_case_ttl_seconds,
+            max_cases=settings.evals_max_custom_cases,
+        )
+        if settings.evals_enabled and settings.evals_custom_cases_enabled
+        else None
+    )
     runner = AgentRunner(
         resolved_llm,
         dispatcher,
@@ -345,6 +373,10 @@ def create_app(
         reflect_enabled=settings.agent_reflect_enabled,
         reflect_max_retries=settings.agent_reflect_max_retries,
         checkpoints=checkpoints,
+        traces=traces,
+        provenance_enabled=settings.agent_provenance_enabled,
+        budget_enabled=settings.agent_budget_enabled,
+        budget_keep_recent_turns=settings.agent_budget_keep_recent_turns,
     )
     broadcaster = WsBroadcaster(
         replay_size=settings.ws_replay_size,
@@ -391,7 +423,7 @@ def create_app(
     )
     #: Agent 评测台（黄金集 + 双轨打分 + CI 门禁）；``EVALS_ENABLED=false`` 时为 ``None``
     evals = (
-        build_eval_service(settings, runner=runner, dispatcher=dispatcher)
+        build_eval_service(settings, runner=runner, dispatcher=dispatcher, custom_cases=custom_cases)
         if settings.evals_enabled
         else None
     )
@@ -457,6 +489,10 @@ def create_app(
             await job_store.close()
             await idempotency.close()
             await checkpoints.close()
+            if custom_cases is not None:
+                await custom_cases.close()
+            if traces is not None:
+                await traces.close()
             await resolved_engine.aclose()
             if isinstance(resolved_llm, OpenAiCompatibleClient):
                 await resolved_llm.aclose()
@@ -495,6 +531,8 @@ def create_app(
         jobs=job_store,
         idempotency=idempotency,
         checkpoints=checkpoints,
+        traces=traces,
+        custom_cases=custom_cases,
         evals=evals,
         mcp=mcp,
     )
@@ -519,6 +557,7 @@ def create_app(
     app.include_router(build_jobs_router(settings.api_base_path))
     # 检查点台账（断点续跑）与评测台：都带写语义，同样必须先于 catch-all 注册
     app.include_router(build_checkpoints_router(settings.api_base_path))
+    app.include_router(build_traces_router(settings.api_base_path))
     app.include_router(build_evals_router(settings.api_base_path))
     # MCP Streamable HTTP 传输端点（``POST/DELETE /api/mcp``）：自带 Bearer 令牌，见 permissions.PUBLIC_ENDPOINTS
     app.include_router(build_mcp_router(settings.api_base_path))

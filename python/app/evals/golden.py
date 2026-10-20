@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+from typing import Iterable
+
 from ..models import EvalCaseSpec
 
 #: 黄金集
@@ -100,13 +102,20 @@ def cases_for(
     kinds: list[str] | None = None,
     *,
     limit: int | None = None,
+    extra: tuple[EvalCaseSpec, ...] | Iterable[EvalCaseSpec] = (),
 ) -> list[EvalCaseSpec]:
     """按 ID / 类型筛选用例（缺省返回全集），并按 ``limit`` 截断。
 
     筛选后按 :data:`GOLDEN_CASES` 的**原顺序**返回：``dependsOn`` 依赖「前置用例先执行」，
     顺序必须稳定，不能因为调用方传参顺序不同而改变。
+
+    ``extra`` 是**自定义（回归）用例**（见 :mod:`app.evals.custom`）——由失败轨迹沉淀而来，
+    排在黄金集之后。把它们合并进运行集，事故才真正变成 CI 门禁的一部分：
+    「沉淀了一条用例但它永远不会被执行」等于没沉淀。ID 与黄金集冲突时以黄金集为准
+    （黄金集是基线，不允许被动态用例覆盖）。
     """
-    selected = list(GOLDEN_CASES)
+    golden_ids = {case.id for case in GOLDEN_CASES}
+    selected = list(GOLDEN_CASES) + [case for case in extra if case.id not in golden_ids]
     if case_ids:
         wanted = set(case_ids)
         selected = [case for case in selected if case.id in wanted]

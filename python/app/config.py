@@ -214,6 +214,37 @@ class Settings(BaseSettings):
     #: 同一「工具 + 归因类别」签名的反思重试次数上限（超过即熔断降级）
     agent_reflect_max_retries: int = 2
 
+    # ------------------------ Agent 执行追踪与回放（trace） ------------------------
+    #: 是否落库执行轨迹（``/api/agent/traces/**``）：关闭后端点返回空列表，Agent 行为不变
+    agent_trace_enabled: bool = True
+    #: 轨迹存储后端：auto（有 REDIS_URL 且依赖可用则 Redis，否则进程内存）| memory | redis。
+    #: 多副本 / API_WORKERS>1 必须用 redis，否则「在 A 副本跑的轨迹到 B 副本打不开」。
+    agent_trace_store: str = "auto"
+    #: 轨迹保留时长（秒）：需覆盖「事故复盘 / 评测失败归因」的窗口（默认 3 天）
+    agent_trace_ttl_seconds: float = 3 * 86400.0
+    #: 进程内存轨迹存储的 LRU 上限（条）
+    agent_trace_max_entries: int = 1024
+
+    # ------------------------ 事故 → 回归用例闭环 ------------------------
+    #: 是否启用自定义（回归）用例存储与「由失败轨迹沉淀用例」端点
+    evals_custom_cases_enabled: bool = True
+    #: 自定义用例存储后端：auto | memory | redis（与检查点同源语义）
+    evals_custom_case_store: str = "auto"
+    #: 自定义用例保留时长（秒）：回归用例要长期生效（默认 180 天）
+    evals_custom_case_ttl_seconds: float = 180 * 86400.0
+    #: 自定义用例数量上限（防止黄金集被无限追加，评测时长失控）
+    evals_max_custom_cases: int = 200
+
+    # ------------------------ 输出溯源与置信度标注 ------------------------
+    #: 是否输出溯源报告（逐条数字声明绑定证据 + 未核实计数）
+    agent_provenance_enabled: bool = True
+
+    # ------------------------ 动态上下文预算管理 ------------------------
+    #: 是否启用分区预算管理（关闭则退回「从最旧回合开始裁剪」的朴素策略）
+    agent_budget_enabled: bool = True
+    #: 历史回合保留完整内容的最近轮数（更旧的轮次折叠为一行摘要）
+    agent_budget_keep_recent_turns: int = 3
+
     # ------------------------------ 缓存（可选加速） ------------------------------
     #: 缓存后端：auto（配置了 REDIS_URL 且依赖可用则用 Redis，否则进程内存）| memory | redis
     cache_backend: str = "auto"

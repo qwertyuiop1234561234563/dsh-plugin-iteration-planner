@@ -92,6 +92,7 @@ const activeMenu = computed(() => {
   if (routeName.value === 'knowledge') return 'knowledge'
   if (routeName.value === 'memory') return 'memory'
   if (routeName.value === 'checkpoints') return 'checkpoints'
+  if (routeName.value === 'traces') return 'traces'
   if (routeName.value === 'evals') return 'evals'
   if (routeName.value === 'audit') return 'audit'
   if (routeName.value === 'admin-users') return 'admin-users'
@@ -183,6 +184,7 @@ function go(name: string): void {
     knowledge: '/knowledge',
     memory: '/memory',
     checkpoints: '/agent/checkpoints',
+    traces: '/agent/traces',
     evals: '/evals',
     audit: '/audit',
     'admin-users': '/admin/users',
@@ -488,6 +490,8 @@ onBeforeUnmount(() => {
           </template>
           <!-- 运行台账：写操作确认前后的持久化轨迹，可在重启 / 换副本后继续跑 -->
           <el-menu-item index="checkpoints">运行台账（断点续跑）</el-menu-item>
+          <!-- 执行轨迹：调用链瀑布图 + 逐 step 回放 + 事故一键沉淀为回归用例 -->
+          <el-menu-item index="traces">执行轨迹（回放）</el-menu-item>
           <!-- 评测台：黄金集 + 双轨打分 + CI 门禁，回答「改了之后是变好还是变坏」 -->
           <el-menu-item index="evals">评测台（Evals）</el-menu-item>
         </el-sub-menu>

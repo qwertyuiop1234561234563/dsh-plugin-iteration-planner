@@ -25,8 +25,11 @@ import type {
   AgentPendingAction,
   AgentReflection,
   AgentToolCallRecord,
+  BudgetReport,
+  BudgetZoneUsage,
   KbHit,
   MemoryItem,
+  ProvenanceReport,
 } from '@/api/types'
 import AgentWorkbench, { type WorkbenchMode } from '@/components/AgentWorkbench.vue'
 import ReflectionTrace from '@/components/ReflectionTrace.vue'
@@ -34,7 +37,14 @@ import { useAuthStore } from '@/stores/auth'
 import { useNotifyStore } from '@/stores/notify'
 import { usePlanStore } from '@/stores/plan'
 import { FAQ_FALLBACK, faqPrompts, matchFaq } from '@/utils/agentFaq'
-import { agentToolLabel, truncate } from '@/utils/format'
+import {
+  BUDGET_ZONE_COLOR,
+  agentToolLabel,
+  budgetZoneLabel,
+  provenanceSourceLabel,
+  provenanceStatusLabel,
+  truncate,
+} from '@/utils/format'
 
 const props = defineProps<{
   /** 当前正在查看的计划 ID（随对话上报，供模型解析指代） */
@@ -97,6 +107,14 @@ interface ChatMessage {
   references?: KbHit[]
   /** 本轮注入上下文的长期记忆（供用户纠偏） */
   memories?: MemoryItem[]
+  /** 本轮执行轨迹 ID：可打开瀑布图逐 step 回放，或沉淀为回归用例 */
+  traceId?: string
+  /** 一致性护栏触发次数（谎报完成 / 无依据作答 / 空转被拦）：>0 表示本轮被纠正过 */
+  guardCount?: number
+  /** 输出溯源：逐条事实性声明的引用与未核实计数 */
+  provenance?: ProvenanceReport | null
+  /** 上下文分区预算明细（流式期间随 budget 事件到达，终态以 final 为准） */
+  budget?: BudgetReport | null
   /** 是否仍在流式生成中（用于展示光标与「停止生成」） */
   streaming?: boolean
 }
@@ -252,6 +270,10 @@ async function send(raw?: string): Promise<void> {
         onPending: (actions) => {
           if (actions.length > 0) assistant.pending = actions
         },
+        onBudget: (report) => {
+          // 预算明细与逐字输出同帧到达：用户读答案时就能看到「这次上下文裁了什么、为什么」
+          assistant.budget = report
+        },
         onFinal: (result) => {
           sessionId.value = result.sessionId
           // final 是**权威结果**：服务端已在终态做过事实校验（剔除并不存在的 planId、把虚假的
@@ -266,6 +288,11 @@ async function send(raw?: string): Promise<void> {
           assistant.planId = result.planId ?? undefined
           if (result.references && result.references.length > 0) assistant.references = result.references
           if (result.memories && result.memories.length > 0) assistant.memories = result.memories
+          // 观测三元组：轨迹（可回放）· 溯源（可点开引用）· 预算（可解释裁剪）
+          assistant.traceId = result.traceId ?? undefined
+          assistant.guardCount = result.guardCount ?? 0
+          assistant.provenance = result.provenance ?? null
+          assistant.budget = result.budget ?? assistant.budget
         },
       },
       controller.signal,
@@ -425,6 +452,23 @@ function openCheckpoints(): void {
   visible.value = false
 }
 
+/** 打开执行轨迹页（调试器式瀑布图，自动定位到第一条失败时间片） */
+function openTrace(traceId: string): void {
+  void router.push({ name: 'traces', query: { traceId } })
+  visible.value = false
+}
+
+/** 某一个分区在预算条上的宽度占比（按字符数；总额为 0 时全部为 0，避免除零） */
+function budgetSegmentStyle(zone: BudgetZoneUsage, report: BudgetReport): Record<string, string> {
+  const total = report.zones.reduce((sum, item) => sum + item.chars, 0)
+  const ratio = total > 0 ? zone.chars / total : 0
+  return { width: `${(ratio * 100).toFixed(2)}%`, background: budgetZoneColor(zone.zone) }
+}
+
+function budgetZoneColor(zone: string): string {
+  return BUDGET_ZONE_COLOR[zone] ?? 'var(--ip-text-muted)'
+}
+
 onMounted(() => {
   void loadHealth()
 })
@@ -568,11 +612,92 @@ watch(visible, (open) => {
                 :title="`reflect-${message.id}`"
               />
 
+              <!--
+                输出溯源：把结论里每条带数字的声明绑回证据（工具字段 / 知识库块 / 记忆）。
+                无据的声明**诚实标「未核实」**并计数 —— 与其让用户相信一句不知从哪来的数字，
+                不如明确告诉他「这条我没找到来源」。
+              -->
+              <div v-if="message.provenance" class="ip-agent__prov">
+                <div class="ip-agent__prov-head">
+                  <el-icon><Aim /></el-icon>
+                  <span>结论溯源</span>
+                  <el-tag size="small" effect="plain" type="success">有据 {{ message.provenance.verified }}</el-tag>
+                  <el-tag v-if="message.provenance.unverified > 0" size="small" effect="plain" type="warning">
+                    未核实 {{ message.provenance.unverified }}
+                  </el-tag>
+                  <span class="ip-agent__prov-conf ip-mono">
+                    置信度 {{ Math.round(message.provenance.confidence * 100) }}%
+                  </span>
+                </div>
+                <div v-for="claim in message.provenance.claims" :key="claim.index" class="ip-agent__prov-claim">
+                  <el-tag size="small" effect="plain" :type="claim.status === 'verified' ? 'success' : 'warning'">
+                    {{ provenanceStatusLabel(claim.status) }}
+                  </el-tag>
+                  <span class="ip-agent__prov-text">{{ truncate(claim.text, 120) }}</span>
+                  <div v-if="claim.citations.length > 0" class="ip-agent__prov-cites">
+                    <el-tag
+                      v-for="cite in claim.citations"
+                      :key="`${cite.source}:${cite.ref}`"
+                      size="small"
+                      effect="plain"
+                      type="info"
+                      class="ip-agent__prov-cite"
+                    >
+                      {{ provenanceSourceLabel(cite.source) }} · {{ cite.ref }}
+                    </el-tag>
+                  </div>
+                  <div v-else class="ip-agent__prov-detail">{{ claim.detail }}</div>
+                </div>
+              </div>
+
               <!-- 本轮已登记运行台账：可在「运行台账」页断点续跑（重启 / 换副本后依然在） -->
               <div v-if="message.checkpointId" class="ip-agent__ledger">
                 <el-icon><Files /></el-icon>
                 <span>本次运行已登记台账</span>
                 <el-button size="small" text type="primary" @click="openCheckpoints">去续跑</el-button>
+              </div>
+
+              <!-- 执行轨迹入口：调试器式瀑布图 + 逐 step 回放；含事故信号时可一键沉淀为回归用例 -->
+              <div v-if="message.traceId" class="ip-agent__ledger">
+                <el-icon><Connection /></el-icon>
+                <span>本次运行已记录执行轨迹</span>
+                <el-tag v-if="message.guardCount && message.guardCount > 0" size="small" effect="plain" type="warning">
+                  护栏纠正 {{ message.guardCount }} 次
+                </el-tag>
+                <el-button size="small" text type="primary" @click="openTrace(message.traceId)">看调用链</el-button>
+              </div>
+
+              <!-- 上下文分区预算：谁占了多少、裁了什么、为什么裁（可解释，不靠猜） -->
+              <div v-if="message.budget" class="ip-agent__budget">
+                <div class="ip-agent__budget-head">
+                  <span>上下文预算</span>
+                  <span class="ip-muted ip-mono">
+                    {{ message.budget.used }} / {{ message.budget.limit }} 字符 ·
+                    占用 {{ Math.round(message.budget.utilization * 100) }}%
+                  </span>
+                  <el-tag v-if="message.budget.overBudget" size="small" effect="plain" type="danger">超预算</el-tag>
+                </div>
+                <div class="ip-agent__budget-bar">
+                  <span
+                    v-for="zone in message.budget.zones"
+                    :key="zone.zone"
+                    class="ip-agent__budget-seg"
+                    :style="budgetSegmentStyle(zone, message.budget)"
+                    :title="`${budgetZoneLabel(zone.zone, zone.label)}：${zone.chars} 字符 / ${zone.messages} 条`"
+                  />
+                </div>
+                <div class="ip-agent__budget-legend">
+                  <span v-for="zone in message.budget.zones" :key="zone.zone" class="ip-agent__budget-item">
+                    <span class="ip-agent__budget-dot" :style="{ background: budgetZoneColor(zone.zone) }" />
+                    <span>{{ budgetZoneLabel(zone.zone, zone.label) }}</span>
+                    <span class="ip-mono">{{ zone.chars }}</span>
+                    <span v-if="zone.trimmed > 0" class="ip-agent__budget-trim ip-mono">-{{ zone.trimmed }} 条</span>
+                    <span v-if="zone.compressed" class="ip-agent__budget-trim">已压缩</span>
+                  </span>
+                </div>
+                <div v-if="message.budget.notes.length > 0" class="ip-agent__budget-notes">
+                  <div v-for="note in message.budget.notes" :key="note" class="ip-agent__budget-note">{{ note }}</div>
+                </div>
               </div>
             </div>
             <div class="ip-agent__role">{{ message.role === 'user' ? '我' : 'AI 助手' }}</div>
@@ -879,6 +1004,137 @@ watch(visible, (open) => {
   background: var(--ip-surface-sunk);
   font-size: 12px;
   color: var(--ip-text-muted);
+}
+
+/* 输出溯源：声明级引用（未核实必须显眼但不刺眼——它是诚实标注，不是错误） */
+.ip-agent__prov {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--ip-border);
+  border-radius: var(--ip-radius);
+  background: var(--ip-surface-sunk);
+}
+
+.ip-agent__prov-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--ip-text-secondary);
+}
+
+.ip-agent__prov-conf {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--ip-text-muted);
+}
+
+.ip-agent__prov-claim {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+.ip-agent__prov-text {
+  color: var(--ip-text-secondary);
+  word-break: break-word;
+}
+
+.ip-agent__prov-cites {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.ip-agent__prov-cite {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ip-agent__prov-detail {
+  width: 100%;
+  color: var(--ip-warning);
+  word-break: break-word;
+}
+
+/* 上下文预算条：分区占比 + 被裁原因（「上下文为什么被裁」必须可解释） */
+.ip-agent__budget {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--ip-border);
+  border-radius: var(--ip-radius);
+  background: var(--ip-surface-sunk);
+}
+
+.ip-agent__budget-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--ip-text-secondary);
+}
+
+.ip-agent__budget-bar {
+  display: flex;
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--ip-text) 8%, transparent);
+}
+
+.ip-agent__budget-seg {
+  height: 8px;
+  min-width: 0;
+}
+
+.ip-agent__budget-legend {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--ip-text-muted);
+}
+
+.ip-agent__budget-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ip-agent__budget-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.ip-agent__budget-trim {
+  color: var(--ip-warning);
+}
+
+.ip-agent__budget-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.ip-agent__budget-note {
+  color: var(--ip-warning);
+  word-break: break-word;
 }
 
 .ip-agent__typing {

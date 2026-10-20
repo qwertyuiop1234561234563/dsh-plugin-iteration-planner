@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from contextlib import suppress
 from typing import Any, AsyncIterator
@@ -35,6 +36,7 @@ from ..constants import (
     CHECKPOINT_KIND_PLAN,
     CHECKPOINT_STATUS_AWAITING,
     CHECKPOINT_STATUS_FAILED,
+    SSE_BUDGET,
     SSE_DELTA,
     SSE_FINAL,
     SSE_META,
@@ -43,6 +45,20 @@ from ..constants import (
     SSE_RESULT,
     SSE_TOOL_RESULT,
     SSE_TOOL_START,
+    TRACE_KIND_CONTEXT,
+    TRACE_KIND_FINAL,
+    TRACE_KIND_GUARD,
+    TRACE_KIND_LLM,
+    TRACE_KIND_REFLECT,
+    TRACE_KIND_TOOL,
+    TRACE_RUN_DEGRADED,
+    TRACE_RUN_ERROR,
+    TRACE_RUN_OK,
+    TRACE_RUN_PENDING,
+    TRACE_STATUS_DEFERRED,
+    TRACE_STATUS_DEGRADED,
+    TRACE_STATUS_ERROR,
+    TRACE_STATUS_OK,
 )
 from ..errors import ApiError, bad_request, llm_unavailable, not_found
 from ..kb.pipeline import KnowledgeBaseService
@@ -50,6 +66,7 @@ from ..metrics import METRICS
 from ..models import (
     AgentChatResponse,
     AgentRunResult,
+    BudgetReport,
     CheckpointRequest,
     KbHit,
     MemoryItem,
@@ -57,9 +74,12 @@ from ..models import (
     ToolCallRecord,
 )
 from ..sessions import InMemorySessionStore, SessionStore
+from ..traces import TraceRecorder, TraceStore
+from .budget import allocate_context, estimate_chars
 from .llm import LlmClient, strip_protocol_leak
 from .memory import MemoryService
 from .prompts import ITERATION_PLANNER_SYSTEM_PROMPT, build_chat_instruction, build_plan_instruction
+from .provenance import analyze_provenance, collect_evidence
 from .reflect import ReflectionTracker
 from .sanitize import unwrap_arguments
 from .schemas import TOOL_RESULT_PENDING_CONFIRMATION, TOOL_SPECS, WRITE_TOOLS, describe_action
@@ -284,6 +304,20 @@ _WRITE_INTENT_HINT = (
 #: 语料判据时必须只看边界内的正文——否则脚手架里的「新增 / 修改 / 删除任务」字样会把
 #: 「关键路径怎么算？」这种纯提问误判成写指令，进而触发无意义的纠偏重试。
 _UNTRUSTED_BODY_RE = re.compile(r"<<<\s*USER_INPUT\s*(.*?)\s*USER_INPUT\s*>>>", re.DOTALL)
+
+
+#: 送进模型的「注入提示」前缀：上下文预算里属**必保区**（见 :mod:`app.agent.budget`）。
+#:
+#: 这些消息是纠偏指令与反思回填，删掉它们等于让模型退回未纠偏状态 —— 预算裁剪绝不能
+#: 「先删本轮为什么重试」。因此分区识别按这些前缀做确定性判定，而不是猜语义。
+#: （声明位置必须在各 ``*_HINT`` 之后：它引用这些常量。）
+CONTEXT_KEEP_SENTINELS: tuple[str, ...] = (
+    "自我诊断：",  # 反思回填（app.agent.reflect 的提示）
+    _TOOL_RETRY_HINT,
+    _FALSE_COMPLETION_HINT,
+    _STATE_GROUNDING_HINT,
+    _WRITE_INTENT_HINT,
+)
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -539,6 +573,71 @@ def _estimate_chars(messages: list[dict[str, Any]]) -> int:
     return total
 
 
+def _error_text(exc: BaseException) -> str:
+    """异常 → 可落库的错误文本。
+
+    非 :class:`ApiError` 一律折成通用文案，不外泄内部细节：检查点台账的 ``error`` 会经由
+    ``GET /api/agent/checkpoints`` 回给用户，而「内部错误」的具体形态（栈、上游地址）不应
+    出现在任何用户可见的输出里（与全局 5xx 处理同一口径）。
+    """
+    if isinstance(exc, ApiError):
+        return f"{exc.code}：{exc.message}"
+    return "INTERNAL_ERROR：服务端内部错误（详情见服务端日志）"
+
+
+def _run_status(result: AgentRunResult) -> str:
+    """由终态结果判定轨迹状态（确定性口径，供事故判定与前端标记复用）。"""
+    if result.pendingActions:
+        return TRACE_RUN_PENDING
+    if result.guardCount > 0 or any(event.strategy == "degrade" for event in result.reflections):
+        return TRACE_RUN_DEGRADED
+    return TRACE_RUN_OK
+
+
+def _guard(
+    recorder: TraceRecorder | None,
+    title: str,
+    detail: str,
+    *,
+    status: str = TRACE_STATUS_OK,
+    code: str | None = None,
+) -> None:
+    """记一次一致性护栏动作（谎报完成 / 无依据作答 / 写指令空转 / 结论改写）。
+
+    这些动作是「Agent 说了不该说的话、被服务端拦下」，既是轨迹里最值得复盘的时刻，
+    也是回归用例 ``maxGuards`` 断言的量化口径（归档见 :mod:`app.evals.incidents`）。
+    """
+    if recorder is None:
+        return
+    recorder.span(TRACE_KIND_GUARD, title, status=status, code=code, detail=detail)
+
+
+def _guard_count(recorder: TraceRecorder | None) -> int:
+    """一致性护栏触发次数（只数 ``guard`` span；上下文裁剪属于常态事件，不计入）。"""
+    if recorder is None:
+        return 0
+    return sum(1 for span in recorder.spans if span.kind == TRACE_KIND_GUARD)
+
+
+def _sync_reflection_spans(recorder: TraceRecorder, result: AgentRunResult) -> None:
+    """把轨迹里的反思 span 状态与**最终**反思事件对齐。
+
+    反思事件的 ``recovered`` 是**事后回填**的：记录 span 的那一刻还不知道后续是否恢复成功。
+    若不回填，一次「先报错、后被模型自纠成功」的运行会在轨迹里被误标成降级——
+    轨迹要用来做事故复盘，状态必须与事实一致。
+    """
+    events = iter(result.reflections)
+    for span in recorder.spans:
+        if span.kind != TRACE_KIND_REFLECT:
+            continue
+        event = next(events, None)
+        if event is None:
+            break
+        span.output["recovered"] = event.recovered
+        span.output["strategy"] = event.strategy
+        span.status = TRACE_STATUS_OK if event.recovered else TRACE_STATUS_DEGRADED
+
+
 class AgentRunner:
     """无状态编排器：由 HTTP 层注入 LLM 客户端、工具调度器与会话存储。"""
 
@@ -559,6 +658,10 @@ class AgentRunner:
         reflect_enabled: bool = True,
         reflect_max_retries: int = 2,
         checkpoints: CheckpointStore | None = None,
+        traces: TraceStore | None = None,
+        provenance_enabled: bool = True,
+        budget_enabled: bool = True,
+        budget_keep_recent_turns: int = 3,
     ) -> None:
         self._llm = llm
         self._dispatcher = dispatcher
@@ -576,6 +679,15 @@ class AgentRunner:
         self._reflect_max_retries = max(0, reflect_max_retries)
         #: 持久化检查点台账：把「待确认写操作」从会话内存升级为可跨重启续跑的运行台账
         self._checkpoints = checkpoints
+        #: 执行轨迹存储：每次运行的 span 时序落库（排障 / 回放 / 事故沉淀用例的底座）
+        self._traces = traces
+        #: 输出溯源：把结论中的数字声明绑定到工具 / 知识库 / 记忆证据，并标注未核实项
+        self._provenance_enabled = provenance_enabled
+        #: 动态上下文预算：分区分配（固定区永不裁剪，弹性区按额度截断 / 压缩）
+        self._budget_enabled = budget_enabled
+        self._budget_keep_recent_turns = max(0, budget_keep_recent_turns)
+        #: 最近一次预算分配明细（每次运行开始时重置，随结果信封回传，前端渲染预算条）
+        self._last_budget: BudgetReport | None = None
         # 仅暴露「当前真正可用」的工具：检索类工具在对应服务缺失时会被移除
         available = {"knowledge": knowledge, "memory": memory}
         self._tool_specs = [
@@ -643,15 +755,20 @@ class AgentRunner:
             iterationStartDate=iteration_start_date,
             devMemberCount=dev_member_count,
         )
+        recorder = self._new_recorder(kind=CHECKPOINT_KIND_PLAN, request=request, session_id="", owner=owner)
         try:
-            result = await self._loop(messages)
-        except ApiError as exc:
+            result = await self._loop(messages, recorder=recorder)
+        except Exception as exc:  # noqa: BLE001 - 失败也要留痕（事故复盘靠的就是这份轨迹）
             if record:
-                await self._record_failure(request, session_id="", owner=owner, error=f"{exc.code}：{exc.message}")
+                with suppress(Exception):
+                    await self._record_failure(
+                        request, session_id="", owner=owner, error=_error_text(exc)
+                    )
+            await self._finalize_trace(recorder, status=TRACE_RUN_ERROR, error=_error_text(exc))
             raise
         result.references = [KbHit(**hit) for hit in references]
-        if record:
-            await self._record_pending(result, request, session_id="", owner=owner)
+        self._attach_provenance(result)
+        await self._finalize_run(result, recorder, request=request, session_id="", owner=owner, record=record)
         return result
 
     async def run_chat(
@@ -684,16 +801,22 @@ class AgentRunner:
             messages = (
                 self._base_messages(memory_context, kb_context) + history + [{"role": "user", "content": instruction}]
             )
+            recorder = self._new_recorder(
+                kind=CHECKPOINT_KIND_CHAT, request=request, session_id=session_id, owner=owner
+            )
             try:
-                result = await self._loop(messages, defer_writes=defer_writes)
-            except ApiError as exc:
+                result = await self._loop(messages, defer_writes=defer_writes, recorder=recorder)
+            except Exception as exc:  # noqa: BLE001 - 失败也要留痕（见 run_plan 的同一取舍）
                 if record:
-                    await self._record_failure(
-                        request, session_id=session_id, owner=owner, error=f"{exc.code}：{exc.message}"
-                    )
+                    with suppress(Exception):
+                        await self._record_failure(
+                            request, session_id=session_id, owner=owner, error=_error_text(exc)
+                        )
+                await self._finalize_trace(recorder, status=TRACE_RUN_ERROR, error=_error_text(exc))
                 raise
             result.references = [KbHit(**hit) for hit in references]
             result.memories = [MemoryItem(**item) for item in memories]
+            self._attach_provenance(result)
 
             # 仅保留「用户 / 最终助手」两条，工具中间态不入历史，控制上下文体积
             # 历史存原始（已消毒）文本，边界标记仅用于本回合送入模型的即时输入
@@ -704,8 +827,9 @@ class AgentRunner:
             await self._store.set(session_id, updated)
             if defer_writes:
                 await self._store.set_pending(session_id, [item.model_dump() for item in result.pendingActions])
-            if record:
-                await self._record_pending(result, request, session_id=session_id, owner=owner)
+            await self._finalize_run(
+                result, recorder, request=request, session_id=session_id, owner=owner, record=record
+            )
             # 后台提取长期记忆：LLM 调用有延迟，不占用本轮响应时间
             if self._memory is not None:
                 self._memory.schedule_extract(session_id, message, result.content)
@@ -738,24 +862,32 @@ class AgentRunner:
             messages = (
                 self._base_messages(memory_context, kb_context) + history + [{"role": "user", "content": instruction}]
             )
+            recorder = self._new_recorder(
+                kind=CHECKPOINT_KIND_CHAT, request=request, session_id=session_id, owner=owner
+            )
             # 首帧即携带检索增强上下文：前端可提前渲染「参考依据 / 召回记忆」卡片
             yield {"event": SSE_META, "data": {"sessionId": session_id, "references": references, "memories": memories}}
 
             result: AgentRunResult | None = None
             try:
-                async for event in self._loop_stream(messages, defer_writes=defer_writes):
+                async for event in self._loop_stream(messages, defer_writes=defer_writes, recorder=recorder):
                     if event["event"] == SSE_RESULT:
                         result = event["data"]
                         continue
                     yield event
-            except ApiError as exc:
-                await self._record_failure(request, session_id=session_id, owner=owner, error=f"{exc.code}：{exc.message}")
+            except Exception as exc:  # noqa: BLE001 - 失败也要留痕（见 run_plan 的同一取舍）
+                with suppress(Exception):
+                    await self._record_failure(
+                        request, session_id=session_id, owner=owner, error=_error_text(exc)
+                    )
+                await self._finalize_trace(recorder, status=TRACE_RUN_ERROR, error=_error_text(exc))
                 raise
             if result is None:  # pragma: no cover - 编排必然产出结果或抛出异常
                 raise ApiError(500, "INTERNAL_ERROR", "Agent 编排未产出结果")
 
             result.references = [KbHit(**hit) for hit in references]
             result.memories = [MemoryItem(**item) for item in memories]
+            self._attach_provenance(result)
 
             # 仅保留「用户 / 最终助手」两条，工具中间态不入历史，控制上下文体积
             updated = history + [
@@ -765,11 +897,89 @@ class AgentRunner:
             await self._store.set(session_id, updated)
             if defer_writes:
                 await self._store.set_pending(session_id, [item.model_dump() for item in result.pendingActions])
-            await self._record_pending(result, request, session_id=session_id, owner=owner)
+            await self._finalize_run(
+                result, recorder, request=request, session_id=session_id, owner=owner, record=True
+            )
             if self._memory is not None:
                 self._memory.schedule_extract(session_id, message, result.content)
             response = AgentChatResponse(sessionId=session_id, **result.model_dump())
             yield {"event": SSE_FINAL, "data": response.model_dump()}
+
+    # ------------------------------- 执行轨迹（trace） -------------------------------
+
+    def _new_recorder(
+        self, *, kind: str, request: CheckpointRequest, session_id: str, owner: str
+    ) -> TraceRecorder:
+        """开一条执行轨迹（轨迹存储未启用时返回的收集器同样可用：只是不落库）。"""
+        return TraceRecorder(kind=kind, session_id=session_id, owner=owner, request=request)
+
+    async def _finalize_run(
+        self,
+        result: AgentRunResult,
+        recorder: TraceRecorder,
+        *,
+        request: CheckpointRequest,
+        session_id: str,
+        owner: str,
+        record: bool,
+    ) -> None:
+        """收尾：落检查点台账（可选）→ 落执行轨迹 → 把 traceId 回填到结果。
+
+        ``record=False``（评测运行）时**仍会落轨迹**：评测失败用例要能一键跳回放，
+        「这次评测为什么失败」正是最需要轨迹的场景。两者语义不同，因此分开开关。
+        """
+        if record:
+            await self._record_pending(result, request, session_id=session_id, owner=owner)
+        await self._finalize_trace(recorder, status=_run_status(result), result=result)
+
+    async def _finalize_trace(
+        self,
+        recorder: TraceRecorder,
+        *,
+        status: str,
+        result: AgentRunResult | None = None,
+        error: str | None = None,
+    ) -> None:
+        """把轨迹整体落库一次（存储故障**不打断主链路**：轨迹缺失可接受，响应不可丢）。"""
+        if self._traces is None:
+            return
+        if result is not None:
+            _sync_reflection_spans(recorder, result)
+            recorder.span(
+                TRACE_KIND_FINAL,
+                "收敛收尾",
+                status=TRACE_STATUS_DEGRADED if status == TRACE_RUN_DEGRADED else TRACE_STATUS_OK,
+                input={"planId": result.planId, "pending": len(result.pendingActions)},
+                output={"content": result.content},
+            )
+        trace = recorder.build(
+            status=status,
+            steps=result.steps if result is not None else 0,
+            plan_id=result.planId if result is not None else None,
+            pending_count=len(result.pendingActions) if result is not None else 0,
+            tool_chain=[record.name for record in result.toolCalls] if result is not None else [],
+            content=result.content if result is not None else "",
+            error=error,
+        )
+        try:
+            await self._traces.save(trace)
+        except Exception:  # noqa: BLE001 - 轨迹是观测设施，故障不得影响用户请求
+            logger.warning("执行轨迹落库失败（traceId=%s），已忽略", trace.traceId, exc_info=True)
+            METRICS.inc_counter("agent_trace_save_failed_total")
+            return
+        if result is not None:
+            result.traceId = trace.traceId
+
+    def _attach_provenance(self, result: AgentRunResult) -> None:
+        """按「证据 → 声明」匹配生成溯源报告（失败只记日志，不影响结论返回）。"""
+        if not self._provenance_enabled or not result.content:
+            return
+        try:
+            evidence = collect_evidence(result.toolCalls, result.references, result.memories)
+            result.provenance = analyze_provenance(result.content, evidence)
+        except Exception:  # noqa: BLE001 - 溯源是增强能力，异常不得打断编排
+            logger.warning("输出溯源生成失败，已跳过", exc_info=True)
+            METRICS.inc_counter("agent_provenance_failed_total")
 
     # ------------------------------- 检查点台账 -------------------------------
 
@@ -946,18 +1156,28 @@ class AgentRunner:
             return None, []
         return await self._memory.context_and_memories(query, top_k=self._memory_top_k)
 
-    async def _loop(self, messages: list[dict[str, Any]], *, defer_writes: bool = False) -> AgentRunResult:
+    async def _loop(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        defer_writes: bool = False,
+        recorder: TraceRecorder | None = None,
+    ) -> AgentRunResult:
         """非流式编排：消费 :meth:`_loop_stream` 并取回终态结果。
 
         保持「单一实现」：流式与非流式共用同一套循环，避免两条链路语义漂移。
         """
-        async for event in self._loop_stream(messages, defer_writes=defer_writes):
+        async for event in self._loop_stream(messages, defer_writes=defer_writes, recorder=recorder):
             if event["event"] == SSE_RESULT:
                 return event["data"]
         raise ApiError(500, "INTERNAL_ERROR", "Agent 编排未产出结果")  # pragma: no cover
 
     async def _loop_stream(
-        self, messages: list[dict[str, Any]], *, defer_writes: bool = False
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        defer_writes: bool = False,
+        recorder: TraceRecorder | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """编排循环的**流式实现**：边调用模型/工具边产出事件。
 
@@ -983,9 +1203,19 @@ class AgentRunner:
         state_grounding_fixes = 0
         write_intent_fixes = 0
         tracker = ReflectionTracker(max_retries=self._reflect_max_retries, enabled=self._reflect_enabled)
+        # 预算明细每次运行独立（runner 会被跨请求复用），且只在**真正发生裁剪**时下发一次：
+        # 未裁剪时把「满额度」推给前端没有信息增量，只是白噪声
+        self._last_budget = None
+        budget_announced = False
 
         for step in range(1, self._max_steps + 1):
-            self._enforce_budget(messages)
+            self._apply_budget(messages, recorder)
+            if not budget_announced and self._last_budget is not None and self._last_budget.notes:
+                budget_announced = True
+                yield {"event": SSE_BUDGET, "data": self._last_budget.model_dump()}
+            if recorder is not None:
+                recorder.set_step(step)
+            llm_started = time.monotonic()
             message: dict[str, Any] | None = None
             if streamer is None:
                 # 模型未实现流式能力：一次性调用，并把全文作为单帧下发（功能不变，仅少了逐字效果）
@@ -1003,6 +1233,27 @@ class AgentRunner:
                         message = chunk.get("message")
                 if message is None:
                     raise ApiError(422, "LLM_FORMAT_ERROR", "LLM 流式响应未返回完整消息")
+
+            if recorder is not None:
+                # 只记「请求规模 + 响应摘要」：完整消息序列可能上百 KB，轨迹的作用是回看时序与决策
+                recorder.span(
+                    TRACE_KIND_LLM,
+                    f"模型调用（第 {step} 步）",
+                    duration_ms=(time.monotonic() - llm_started) * 1000,
+                    input={
+                        "messages": len(messages),
+                        "chars": estimate_chars(messages),
+                        "tools": len(self._tool_specs),
+                    },
+                    output={
+                        "content": _content_to_text(message.get("content") or ""),
+                        "toolCalls": [
+                            (call.get("function") or {}).get("name")
+                            for call in (message.get("tool_calls") or [])
+                            if isinstance(call, dict)
+                        ],
+                    },
+                )
 
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
@@ -1031,6 +1282,7 @@ class AgentRunner:
                     logger.warning(
                         "模型把对 %s 的调用写成不可解析的正文，回填纠偏提示后重试（第 %d 步）", attempt, step
                     )
+                    _guard(recorder, "格式纠偏", f"对 {attempt} 的工具调用被写成不可解析的正文", code="LLM_FORMAT_ERROR")
                     messages.append({"role": "user", "content": _TOOL_RETRY_HINT.format(tool=attempt)})
                     continue
                 METRICS.observe("agent_steps", step, buckets=(1, 2, 3, 4, 5, 6, 8), help="Agent 收敛步数")
@@ -1042,10 +1294,18 @@ class AgentRunner:
                         if false_claim_fixes == 1 and step < self._max_steps:
                             METRICS.inc_counter("agent_false_completion_total", {"action": "retry"})
                             logger.warning("模型在无写操作的情况下宣称已完成变更，回填纠偏提示后重试（第 %d 步）", step)
+                            _guard(recorder, "谎报完成拦截", "本轮无任何写操作，模型却宣称变更已完成，已纠偏重试")
                             messages.append({"role": "user", "content": _FALSE_COMPLETION_HINT})
                             continue
                         METRICS.inc_counter("agent_false_completion_total", {"action": "notice"})
                         logger.warning("模型重复谎报写入完成，已用确定性提示替换本轮结论")
+                        _guard(
+                            recorder,
+                            "谎报完成拦截",
+                            "重复谎报写入完成，本轮结论已被服务端确定性提示覆盖",
+                            status=TRACE_STATUS_DEGRADED,
+                            code="FALSE_COMPLETION",
+                        )
                         final_text = _FALSE_COMPLETION_NOTICE
                 if not records and not state_grounding_fixes:
                     # 一致性校验（二）：用户问的是**当前计划状态**，模型却一次工具都没调用就给出数字
@@ -1055,10 +1315,18 @@ class AgentRunner:
                         if step < self._max_steps:
                             METRICS.inc_counter("agent_ungrounded_state_answer_total", {"action": "retry"})
                             logger.warning("模型未调用工具即回答当前计划状态，回填纠偏提示后重试（第 %d 步）", step)
+                            _guard(recorder, "无依据状态作答", "未调用任何工具即给出当前计划状态数字，已纠偏重试")
                             messages.append({"role": "user", "content": _STATE_GROUNDING_HINT})
                             continue
                         METRICS.inc_counter("agent_ungrounded_state_answer_total", {"action": "unresolved"})
                         logger.warning("模型重复在无工具调用下回答状态问题，本轮结论未获得工具支撑")
+                        _guard(
+                            recorder,
+                            "无依据状态作答",
+                            "重复在无工具调用下回答状态问题，本轮结论未获得工具支撑",
+                            status=TRACE_STATUS_DEGRADED,
+                            code="UNGROUNDED_STATE",
+                        )
                 if (
                     not pending
                     # 只看「是否**尝试过**写工具」而不看成败：写工具报错时模型已通过 tool 消息得知失败，
@@ -1076,19 +1344,31 @@ class AgentRunner:
                     if write_intent_fixes == 1 and step < self._max_steps:
                         METRICS.inc_counter("agent_write_intent_noop_total", {"action": "retry"})
                         logger.warning("用户要求改动但本轮无任何写动作且未澄清，回填纠偏提示后重试（第 %d 步）", step)
+                        _guard(recorder, "写指令空转拦截", "用户要求改动但本轮无任何写动作、也未反问澄清，已纠偏重试")
                         messages.append({"role": "user", "content": _WRITE_INTENT_HINT})
                         continue
                     METRICS.inc_counter("agent_write_intent_noop_total", {"action": "unresolved"})
                     logger.warning("模型重复忽略用户的写指令，本轮未登记任何待确认写动作")
+                    _guard(
+                        recorder,
+                        "写指令空转拦截",
+                        "重复忽略用户的写指令，本轮未登记任何待确认写动作",
+                        status=TRACE_STATUS_DEGRADED,
+                        code="WRITE_INTENT_NOOP",
+                    )
                     final_text = _FALSE_COMPLETION_NOTICE
 
                 # 输出护栏：模型答复的最终事实以**服务端校验结果**为准（对齐 OpenAI Agents SDK 的
                 # ``outputGuardrails`` 与 CRITIC 的「结论须有外部凭据」）。此处必须在 ``pending``
                 # 分支**之外**执行——早期实现只在「无任何写操作」的分支里校验，于是「登记为待确认后
                 # 照样宣称已完成、并给出并不存在的 planId」这更常见、更危险的谎报被整条漏过。
-                final_text = _enforce_authoritative_reply(
+                guarded = _enforce_authoritative_reply(
                     final_text, records=records, plan_id=plan_id, pending=pending
                 )
+                if guarded != final_text:
+                    # 结论被服务端改写：模型给出的事实与权威数据不符（谎报已完成 / 编造 planId 等）
+                    _guard(recorder, "结论权威性改写", "模型结论与服务端权威数据不符，已被确定性改写")
+                    final_text = guarded
 
                 if pending:
                     # 本回合登记过写操作：以服务端确定性摘要收尾，保证展示清单与真实登记项一致。
@@ -1117,6 +1397,8 @@ class AgentRunner:
                         steps=step,
                         pendingActions=pending,
                         reflections=tracker.events,
+                        guardCount=_guard_count(recorder),
+                        budget=self._last_budget,
                     ),
                 }
                 return
@@ -1128,10 +1410,11 @@ class AgentRunner:
 
             # 同一条消息内的多个工具调用并行执行，结果按原序回填（OpenAI 协议要求顺序一致）
             outcomes = await asyncio.gather(
-                *(self._run_tool_call(index, call, defer_writes) for index, call in enumerate(tool_calls))
+                *(self._timed_tool_call(index, call, defer_writes) for index, call in enumerate(tool_calls))
             )
             step_records: list[ToolCallRecord] = []
-            for record, tool_message, produced_plan_id, pending_action in outcomes:
+            for outcome, elapsed_ms in outcomes:
+                record, tool_message, produced_plan_id, pending_action = outcome
                 records.append(record)
                 step_records.append(record)
                 plan_id = produced_plan_id or plan_id
@@ -1139,6 +1422,20 @@ class AgentRunner:
                     messages.append(tool_message)
                 if pending_action is not None:
                     pending.append(pending_action)
+                if recorder is not None:
+                    # 工具 span：入参 + 出参摘要 + 稳定错误码。这是回放时最常被追问的一段
+                    # （「它当时到底查了什么、引擎返回了什么」），因此尽量留全关键字段。
+                    recorder.span(
+                        TRACE_KIND_TOOL,
+                        f"工具调用 · {record.name}",
+                        status=TRACE_STATUS_DEFERRED
+                        if _is_deferred_write(record)
+                        else (TRACE_STATUS_OK if record.ok else TRACE_STATUS_ERROR),
+                        code=record.code,
+                        duration_ms=elapsed_ms,
+                        input={"tool": record.name, "arguments": record.arguments},
+                        output={"ok": record.ok, "result": record.result, "error": record.error},
+                    )
                 # result 可能很大（整份计划），此处只下发轻量字段，完整明细由 final 事件补齐
                 yield {
                     "event": SSE_TOOL_RESULT,
@@ -1155,6 +1452,16 @@ class AgentRunner:
             # 提示以 user 消息回填（与其它纠偏提示同构），模型据此换参 / 换工具 / 如实收尾。
             hints, reflections = tracker.observe_step(step, step_records)
             for reflection in reflections:
+                if recorder is not None:
+                    recorder.span(
+                        TRACE_KIND_REFLECT,
+                        f"自反思 · {reflection.category}",
+                        status=TRACE_STATUS_OK if reflection.recovered else TRACE_STATUS_DEGRADED,
+                        code=reflection.category,
+                        input={"tool": reflection.tool, "category": reflection.category, "attempt": reflection.attempt},
+                        output={"strategy": reflection.strategy, "recovered": reflection.recovered},
+                        detail=reflection.detail or reflection.title,
+                    )
                 yield {"event": SSE_REFLECT, "data": reflection.model_dump()}
             for hint in hints:
                 messages.append({"role": "user", "content": hint})
@@ -1179,6 +1486,8 @@ class AgentRunner:
                     steps=self._max_steps,
                     pendingActions=pending,
                     reflections=tracker.events,
+                    guardCount=_guard_count(recorder),
+                    budget=self._last_budget,
                 ),
             }
             return
@@ -1189,8 +1498,40 @@ class AgentRunner:
             f"Agent 在 {self._max_steps} 步内未收敛，请细化需求描述或减少需变更的任务数量",
         )
 
+    def _apply_budget(self, messages: list[dict[str, Any]], recorder: TraceRecorder | None = None) -> None:
+        """按分区预算裁剪 / 压缩上下文，并把分区用量记入轨迹（每步一次，前端可看实时占用）。
+
+        开启预算管理时走 :func:`app.agent.budget.allocate_context`（固定区永不裁剪、
+        检索增强区按额度截断、历史回合按衰减压缩）；关闭时退回本仓库早期的朴素策略
+        （从最旧的用户回合开始删），保证配置可回退。
+        """
+        if self._max_context_chars <= 0:
+            return
+        if not self._budget_enabled:
+            self._enforce_budget(messages)
+            return
+        report = allocate_context(
+            messages,
+            limit=self._max_context_chars,
+            keep_sentinels=CONTEXT_KEEP_SENTINELS,
+            keep_recent_turns=self._budget_keep_recent_turns,
+        )
+        self._last_budget = report
+        if recorder is not None and report.notes:
+            recorder.span(
+                TRACE_KIND_CONTEXT,
+                "上下文预算裁剪",
+                status=TRACE_STATUS_OK,
+                input={"limit": report.limit, "used": report.used},
+                output={"notes": report.notes},
+            )
+
     def _enforce_budget(self, messages: list[dict[str, Any]]) -> None:
-        """上下文超预算时，从最旧的「用户回合」开始裁剪（system 与当前输入始终保留）。"""
+        """上下文超预算时，从最旧的「用户回合」开始裁剪（system 与当前输入始终保留）。
+
+        保留此实现供 ``AGENT_BUDGET_ENABLED=false`` 回退使用：它的缺陷是**先删本轮工作区**
+        （待确认动作回填、反思纠偏提示），见 :mod:`app.agent.budget` 的模块说明。
+        """
         if self._max_context_chars <= 0:
             return
         trimmed = False
@@ -1212,6 +1553,14 @@ class AgentRunner:
         if tool_calls:
             canonical["tool_calls"] = tool_calls
         return canonical
+
+    async def _timed_tool_call(
+        self, index: int, call: Any, defer_writes: bool
+    ) -> tuple[tuple[ToolCallRecord, dict[str, Any] | None, str | None, PendingAction | None], float]:
+        """包一层计时，供轨迹 span 记录**单次工具调用的真实耗时**（并行调用下不可用总时长近似）。"""
+        started = time.monotonic()
+        outcome = await self._run_tool_call(index, call, defer_writes)
+        return outcome, (time.monotonic() - started) * 1000
 
     async def _run_tool_call(
         self, index: int, call: Any, defer_writes: bool = False

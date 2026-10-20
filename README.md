@@ -500,6 +500,14 @@ docker compose up -d --build
 | `EVALS_MAX_CASES` | `100` | 单次评测最多执行的用例数（防止一次请求打爆引擎 / 模型配额） |
 | `EVALS_GATE_PASS_RATE` / `EVALS_GATE_MIN_SCORE` | `0.8` / `0.7` | CI 门禁阈值：通过率下限 / 综合平均分下限（`python -m app.evals.gate` 据此返回退出码 `0`/`1`） |
 | `AGENT_REFLECT_ENABLED` / `AGENT_REFLECT_MAX_RETRIES` | `true` / `2` | 自反思自愈循环开关 / 同一「工具 + 归因类别」签名的重试上限（超过即熔断降级） |
+| `AGENT_TRACE_ENABLED` | `true` | 执行轨迹（调试器式调用链）开关；关闭后 `/api/agent/traces/**` 返回 `503 TRACE_STORE_UNAVAILABLE`（**不静默返回空列表**） |
+| `AGENT_TRACE_STORE` | `auto` | 轨迹后端：`auto`（有 `REDIS_URL` 且依赖可用则 Redis）\| `memory` \| `redis`。轨迹是**观测设施**：写入故障只降级为「本次未记录」（WARNING + 指标），不打断主链路；多副本必须 `redis`，否则「A 副本的运行」在 B 副本控制台查不到 |
+| `AGENT_TRACE_TTL_SECONDS` / `AGENT_TRACE_MAX_ENTRIES` | `259200` / `1024` | 轨迹保留时长（秒，需覆盖「事故发生 → 有人来复盘」窗口）/ 进程内存轨迹 LRU 上限（条） |
+| `EVALS_CUSTOM_CASES_ENABLED` | `true` | 自定义（回归）用例开关；关闭后 `/api/evals/cases**` 返回 `503 EVALS_CASES_DISABLED`，黄金集评测不受影响 |
+| `EVALS_CUSTOM_CASE_STORE` | `auto` | 自定义用例后端：`auto` \| `memory` \| `redis`。用例是**状态数据**（故障返 `503 EVALS_CASE_STORE_UNAVAILABLE`，不 fail-open）；**门禁进程需读到服务端沉淀的用例**，`memory` 驱动下两进程互不可见（门禁报告会显式写明条数），要让 CI 真跑到必须 `redis` |
+| `EVALS_CUSTOM_CASE_TTL_SECONDS` / `EVALS_MAX_CUSTOM_CASES` | `15552000` / `200` | 自定义用例保留时长（秒，回归防线以「月」计）/ 总数上限（超出即拒绝新增，而非静默丢弃最旧一条） |
+| `AGENT_PROVENANCE_ENABLED` | `true` | 输出溯源与置信度标注开关：结论里带数字的声明绑定证据（工具字段路径 / 知识库 `chunkId` / 记忆 ID），匹配不到即标「未核实」并计数 |
+| `AGENT_BUDGET_ENABLED` / `AGENT_BUDGET_KEEP_RECENT_TURNS` | `true` / `3` | 动态上下文预算管理开关 / 历史回合中保留完整内容的最近轮次数（更早的轮次才参与折叠压缩） |
 
 ### 9.6 开放 API 一览
 
@@ -526,13 +534,19 @@ docker compose up -d --build
 | `GET` / `DELETE` | `/api/agent/checkpoints/:checkpointId` | 台账快照（请求 / 待确认动作 / 执行结果 / 反思轨迹）/ 作废并移除（**只丢弃，不执行**任何写入） |
 | `POST` | `/api/agent/checkpoints/:checkpointId/resume` | 断点续跑：`confirm` 确认落库（可只确认选中项）/ `reject` 驳回 / `retry` 按**台账保存的原始请求**重跑 / `auto` 自动分流。确认**幂等**（重复确认回放上次结果并标记 `replayed`） |
 | `GET` / `POST` | `/api/evals` | 评测台自述（黄金集清单 / 门禁阈值 / 评委开关）/ 触发评测运行（同步返回，或 `enqueue=true` 转为异步作业） |
+| `GET` / `POST` / `DELETE` | `/api/evals/cases`、`/api/evals/cases/effective`、`/api/evals/cases/:caseId` | 自定义（回归）用例：列表 / 当前生效用例集（黄金集 + 自定义，供核对门禁覆盖面）/ 删除（删除后立即移出门禁）；**属主隔离，非属主一律 404** |
+| `POST` | `/api/evals/incidents` | **事故 → 回归用例闭环**：把一条失败轨迹确定性推导为断言并沉淀为用例，立即并入运行集与 CI 门禁（同轨迹重复沉淀**幂等覆盖**同一条用例） |
+| `GET` | `/api/agent/traces` | 执行轨迹列表（本主体最近运行，仅摘要，`limit` ≤ 100，可按 `kind` 过滤） |
+| `GET` | `/api/agent/traces/:traceId` | 轨迹全量（span 时序 + 终态），前端渲染调试器式瀑布图并逐 step 回放；**属主隔离，非属主一律 404** |
+| `GET` | `/api/agent/traces/:traceId/replay` | 回放参数（**原始请求** + 终态），供前端一键重跑对照 |
 | `WS` | `/ws` | 计划创建/更新/删除事件推送（含 30s 心跳）。**握手需鉴权**：浏览器自动携带会话 Cookie（同源）；机器 / CI 用 `?token=<API_TOKEN>`（`WebSocket` 构造函数无法自定义请求头）。未通过即在握手阶段被拒（close code `1008`，HTTP 403），不下发任何事件。**访客（guest）只收到被指派计划的事件**，其余事件在扇出前即被过滤 |
 
 成功响应统一为 `{ "data": ... }`；错误统一为 `{ "code", "message", "details" }`，并映射到稳定错误码：
 `CYCLE_DEPENDENCY`(409)、`VALIDATION_ERROR`(400)、`LLM_FORMAT_ERROR`(422)、`STORAGE_UNAVAILABLE`(503)、`UNAUTHORIZED`(401)、`FORBIDDEN`(403)、
 `ENGINE_TIMEOUT`(504，可达但超时，带 `Proxy-Status: iteration_planner; error="http_response_timeout"`)、`ENGINE_UNAVAILABLE`(502，连不上)、
 `JOB_NOT_FOUND`(404)、`JOB_CONFLICT`(409)、`JOB_STORE_UNAVAILABLE`(503)、`CHECKPOINT_NOT_FOUND`(404，含非属主访问，不区分「格式错」与「不存在」)、
-`CHECKPOINT_NOT_RESUMABLE`(409，终态 / 超出重跑上限)、`CHECKPOINT_STORE_UNAVAILABLE`(503)、`EVALS_DISABLED`(503)、`IDEMPOTENCY_IN_PROGRESS`(409，带 `Retry-After`)、`IDEMPOTENCY_KEY_REUSE`(422)、`PAYLOAD_TOO_LARGE`(413)。
+`CHECKPOINT_NOT_RESUMABLE`(409，终态 / 超出重跑上限)、`CHECKPOINT_STORE_UNAVAILABLE`(503)、`EVALS_DISABLED`(503)、`IDEMPOTENCY_IN_PROGRESS`(409，带 `Retry-After`)、`IDEMPOTENCY_KEY_REUSE`(422)、`PAYLOAD_TOO_LARGE`(413)、
+`TRACE_NOT_FOUND`(404，含非属主访问与格式非法，不区分)、`TRACE_STORE_UNAVAILABLE`(503)、`EVALS_CASES_DISABLED`(503)、`EVALS_CASE_STORE_UNAVAILABLE`(503)。
 
 ### 9.7 控制台页面功能
 
@@ -547,7 +561,8 @@ docker compose up -d --build
 | 长期记忆 | 记忆清单（类型 / 重要度 / 状态 / 来源 / 最近使用）、按状态与类型过滤、关键词搜索、启用停用、删除与清空、手工新增（写入前自动去重）；语义召回试跑展示相似度排序 |
 | AI 助手 | 全局悬浮球 + 会话抽屉（SSE 逐字流式、工具调用明细、知识库引用与召回记忆卡片、写操作两阶段确认）；顶部可在**对话 / 多角色协作 / What-if 沙盘 / 迭代复盘 / 主动巡检**之间切换，后四者见 §10.3.1 |
 | Agent 运行台账 | 持久化检查点的治理视图：台账列表（状态 / 待确认数 / 尝试次数 / 关联计划）、详情（请求原文 / 待确认动作勾选 / 已执行调用 / 结论 / **反思轨迹**）、**确认落库 / 驳回选中 / 按原请求重跑 / 作废移除**（见 §10.13） |
-| Agent 评测台 | 黄金集清单（用例类型 / 依赖 / 确定性断言 / 评委维度）+ 运行评测（按类型或指定用例的快速回归、评委开关、**异步作业 + 实时进度流**）+ 结果表（结论 / 确定性分 / 评委分 / 加权得分 / 步数 / 工具链 / 产出计划 / 耗时，展开看断言明细与 Agent 结论）+ **门禁通过 / 未通过横幅与原因**（见 §10.13） |
+| Agent 评测台 | 黄金集清单（用例类型 / 依赖 / 确定性断言 / 评委维度）+ 运行评测（按类型或指定用例的快速回归、评委开关、**异步作业 + 实时进度流**）+ 结果表（结论 / 确定性分 / 评委分 / 加权得分 / 步数 / 工具链 / 产出计划 / 耗时，展开看断言明细与 Agent 结论）+ **门禁通过 / 未通过横幅与原因** + **自定义回归用例面板（来源 / 断言与依据 / 来源轨迹 / 移出门禁）**，失败用例行可直接「看轨迹 / 沉淀用例」（见 §10.13、§10.14） |
+| Agent 执行轨迹 | 调试器式**瀑布图**（模型调用 / 工具调用 / 自我诊断 / 护栏 / 上下文组装 / 收尾按耗时定位黑洞与失败步号）+ 点击任一 span 看该步完整入参出参 + **按原请求一键重跑对照** + 一键沉淀为回归用例；支持 `?traceId=` 直达与 `?replay=1` / `?sink=1` 自动动作（见 §10.14） |
 | 审计日志 | 按计划过滤、条数上限、成功/失败与耗时统计、展开查看入参与返回值完整 JSON |
 | 账号与权限 | **仅管理员可见**：账号清单（角色 / 状态 / 最近登录）、新建账号、变更角色与状态、重置口令、删除；为访客（guest）指派可见计划白名单 |
 | 登录页 | 账号口令登录；登录态为服务端会话 Cookie，成功后跳回被守卫拦下的目标页 |
@@ -1121,6 +1136,113 @@ HTTP 侧另有 `GET /api/evals`（自述）与 `POST /api/evals`；长耗时评�
 `agent_reflect_total{category,outcome}` 与 `agent_reflect_tripped_total{signature}`
 （反思恢复与熔断降级分开计数，熔断增长说明某条纠偏路径已失效）；SSE 的 `reflect` 事件与
 评测结果中的 `reflections` 断言共同构成「自愈是否真的发生」的证据链。
+
+### 10.14 Agent 可观测与自进化四件套（执行轨迹 / 事故闭环 / 输出溯源 / 预算管理）
+
+> 上一节的四件套回答「能不能交给别人用、能不能证明它没变坏」；本节四件套回答的是
+> 「**它出错时我能不能查清、查清之后能不能让它永远不再犯**」。四项同样全部落在 `python/**` 与 `web/**`，
+> **零改动** TS 算法引擎 —— 算法仍是唯一事实来源，这里新增的全是**观测与元能力**。
+
+#### ① 执行轨迹与回放（调试器式调用链）
+
+一次 Agent 运行结束后光有结论，回答不了「它当时到底做了什么」。因此每次运行都把
+**模型调用 / 工具调用 / 自我诊断 / 一致性护栏 / 上下文组装 / 收尾** 落成带耗时的**时间片（span）**：
+
+```
+llm     一次模型调用的请求与响应摘要 + 耗时
+tool    一次工具调用的入参与出参摘要 + 错误码（ok / error / deferred / degraded）
+reflect 一次自反思事件（归因类别 + 恢复策略 + 第几次 + 是否已恢复）
+guard   一致性护栏动作（谎报完成 / 无依据状态作答 / 写指令空转 / 输出改写）
+context 上下文预算动作（分区裁剪 / 旧轮次压缩）——**常态运维事件，不计入事故信号**
+final   收敛收尾（终态文本与产出，含产出计划 ID）
+```
+
+控制台以**瀑布图**呈现（按 `at` 与 `durationMs` 相对全时长定位），先回答第一个问题
+「**时间花在哪、从哪一步开始坏**」——打开轨迹会自动选中**第一条失败 / 降级时间片**；点任一片
+即展开该步完整入参出参与明细，等价于逐 step 回放。再回答第二个问题「**按原样重跑还会坏吗**」：
+`GET .../replay` 返回**原始请求**，前端一键重跑对照，新轨迹与原轨迹并排看。
+
+- **可见性**：轨迹按属主隔离，非属主一律 `404 TRACE_NOT_FOUND`（与台账、作业、计划同口径），
+  且**格式非法与真不存在不区分** —— 轨迹内含用户原始需求与工具返回数据，不能靠状态码差异被探测；
+- **存储语义（关键的取舍）**：轨迹是**观测设施**，不是业务状态。写入失败只降级为「本次未记录」
+  （WARNING + `agent_trace_save_failed_total`），**不打断主链路**；但读取端点在显式关闭时返回
+  `503 TRACE_STORE_UNAVAILABLE`，**绝不静默返回空列表** —— 空列表会被误读成「这次运行没留下轨迹」，
+  反而让人放弃排障。多副本必须 `AGENT_TRACE_STORE=redis`；
+- **载荷收敛**：span 的入参 / 出参只存**摘要**（单串上限 `MAX_TRACE_TEXT_CHARS`），
+  回溯看结论而非全量载荷，避免轨迹库被大 JSON 撑爆。
+
+#### ② 事故 → 回归用例闭环（失败轨迹确定性推导断言）
+
+事故的价值在于「它不能再发生第二次」，而这条链路最常断在「事后没人有动力补用例」。
+本能力**去掉人工环节**：读一份失败轨迹，按**确定性规则**推导断言（不依赖任何模型判断），
+沉淀为自定义用例并**立即并入评测运行集与 CI 门禁**：
+
+| 轨迹中的客观事实 | 推导出的回归断言 |
+|---|---|
+| 存在失败的工具调用 | `noFailedTools: True`（同一需求重跑不得再出现工具失败） |
+| 触发过一致性护栏 | `maxGuards: 0`（谎报完成 / 无依据作答 / 写指令空转必须绝迹） |
+| 某工具失败且已归因 | `reflectionCategories: [该类]` + `reflectionRecovered: True` |
+| 产出过待确认动作 | `requiresPending: True`（修复不得绕过两阶段确认直接落库） |
+| 产出过计划 | `hasPlan: True` + `minTasks: 1` |
+| （恒定） | `noFalseCompletion: True`（结论不得谎报已完成） |
+
+三个刻意的设计取舍：
+
+- **断言宁松勿误**：只推导「事故当时**确实被违反**」的那几条不变量。若写死「必须调用 `schedule_calc`」
+  这类过细要求，一次无关实现调整就会让门禁变红，团队很快学会忽略门禁；
+- **幂等沉淀**：用例 ID 取 `inc-<轨迹前 8 位>`，同一轨迹重复沉淀即**覆盖同一条**用例，
+  不会在集合里堆出重复项；沉淀后回填 `incidentCaseId` 到轨迹，前端据此隐藏重复入口；
+- **门禁覆盖面必须立刻变化**：合并逻辑放在 `golden.cases_for(extra=...)` 而非 service 内部，
+  因此 HTTP 侧与 **CI 门禁 CLI** 读到的是同一份生效集（`GET /api/evals/cases/effective` 可核对）。
+
+```bash
+# 门禁报告会显式写出读到了几条自定义用例，避免「以为闭环了其实没读到」
+python -m app.evals.gate --kind reflection --no-judge
+```
+
+> **必须说清的边界**：`memory` 驱动下服务端与门禁 CLI 是两个进程，**互不可见**（报告里会写明
+> 「自定义回归用例：0 条」并给出改 `redis` 的指引）。要让 CI 真正跑到沉淀用例，`EVALS_CUSTOM_CASE_STORE`
+> 与 `REDIS_URL` 需同时配置为 redis —— 这一点在文档与报告里都明确披露，而不是让用户对着红灯猜。
+
+#### ③ 输出溯源与置信度标注（声明级引用）
+
+模型会写「总工期 42 天」这类**事实性数字**，用户无从判断它来自引擎事实还是模型臆造。
+本能力把工具返回值、知识库片段、长期记忆摊平成**证据原子**，再逐条把结论中的数字声明绑回来源：
+
+| 状态 | 含义 | 前端呈现 |
+|---|---|---|
+| `verified` | 该数值可在证据中**回溯**（工具 JSON 字段路径 / 知识库 `chunkId` / 记忆 ID） | 内联引用标签，悬浮可见来源与字段路径 |
+| `unverified` | 未匹配到任何证据 → **标为「未核实」并计数**，而不是假装有依据 | 提示色标签 + 「未核实 N 条」计数 |
+
+- **诚实计数优于虚假置信**：抽屉底部给出「有据 N / 未核实 N」与置信度，让「这段结论有多可信」
+  变成**可算出来的数字**；
+- **两个必须说清的语义边界**：`verified` 只表示「**数值可回溯**」，**不表示事实为真**
+  （证据本身可能已过期）；同时只有**带数字的断言性声明**进分母 —— 纯抒情句（「这个方案很稳妥」）
+  不进分母，否则未核实数会被话术稀释。
+
+#### ④ 动态上下文预算管理（分区预算 + 衰减压缩）
+
+朴素做法是「超预算就从最旧的回合开始删」，它**先删掉最该保留的东西**：删掉「写操作已登记、
+尚未落库」的回填，模型下一轮就不知道自己登记过什么；删掉反思纠偏提示，模型立刻退回未纠偏状态、
+把同一个错误再犯一遍。本能力改为**五分区预算**：
+
+| 分区 | 策略 |
+|---|---|
+| `system` | 系统提示词（行为契约）：固定，**永不裁剪** |
+| `keep` | 必保区：纠偏提示 / 反思回填 / 工具回填（含**待确认**与**失败**）—— 本轮的「工作区」，删它等于让模型丢掉「本轮为什么重试」，**永不裁剪** |
+| `current` | 本轮用户输入：固定，**永不裁剪** |
+| `recall` | 检索增强区块（记忆 / 知识库）：按剩余额度**先截断** |
+| `history` | 历史会话回合：**先折叠为一行摘要**，仍超才逐轮丢弃最旧的 |
+
+- 分区边界由**确定性规则**（`classify_zones`，借助哨兵前缀识别）划定，不依赖模型；
+- 逐分区用量明细经**信封与 SSE 的 `budget` 事件**一并下发，抽屉实时渲染预算条与图例
+  （含「`-N 条`」「已压缩」标记）—— 「上下文为什么被裁掉」是**可解释、可观测**的，否则调大预算只能靠猜；
+- `AGENT_BUDGET_KEEP_RECENT_TURNS` 控制「保留完整内容」的最近轮次数，更早的轮次才参与压缩。
+
+**可观测**：`agent_trace_save_failed_total`（轨迹写入降级，增长说明轨迹存储不稳，但主链路仍存活）、
+`agent_provenance_failed_total`（溯源计算降级）、`agent_context_trimmed_total`（上下文裁剪次数，
+由预算分配与旧路径共用）、`evals_custom_case_total{operation,origin}`（自定义用例沉淀 / 删除分布，
+`origin=incident` 增长说明事故正在被自动固化）、`evals_incident_case_total`（事故沉淀次数）。
 
 ---
 

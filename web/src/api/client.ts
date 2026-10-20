@@ -33,6 +33,7 @@ import type {
   BaselineDetail,
   BaselineDiff,
   BaselineSummary,
+  BudgetReport,
   BurndownAnalysis,
   BurndownItem,
   CheckpointAction,
@@ -41,8 +42,10 @@ import type {
   CheckpointResumeResult,
   CreatePlanPayload,
   CriticalPathResult,
+  CustomCaseListResult,
   DagCheckResult,
   DeleteTaskResult,
+  EffectiveCasesResult,
   EnumMeta,
   EvalDescribeResult,
   EvalRunRequest,
@@ -51,6 +54,7 @@ import type {
   HealthResult,
   ImportPayload,
   ImportResult,
+  IncidentCaseResult,
   JobHandle,
   JobProgressItem,
   JobSnapshot,
@@ -91,6 +95,9 @@ import type {
   TaskHistoryResult,
   TaskMutationResult,
   TaskUpdatePayload,
+  TraceDetail,
+  TraceListResult,
+  TraceReplay,
   WhatIfRequest,
   WhatIfResult,
   WorkloadResult,
@@ -358,6 +365,24 @@ export const api = {
   deleteCheckpoint: (checkpointId: string) =>
     http.delete(`/agent/checkpoints/${encodeURIComponent(checkpointId)}`).then(() => undefined),
 
+  /* ------------------- Agent 执行轨迹与回放（/api/agent/traces） ------------------- */
+
+  /**
+   * 执行轨迹列表（本主体最近的运行）。
+   *
+   * 轨迹是每次运行都会留下的**观测设施**：终态结论之外还能回答「它当时到底做了什么」。
+   * 列表只给摘要（不含 span 明细），避免响应体随运行数增长而失控。
+   */
+  traces: (params: { limit?: number; kind?: string } = {}) =>
+    unwrap<TraceListResult>(http.get('/agent/traces', { params })),
+
+  /** 轨迹全量（span 时序 + 原始请求）：前端据此渲染调试器式瀑布图 */
+  trace: (traceId: string) => unwrap<TraceDetail>(http.get(`/agent/traces/${encodeURIComponent(traceId)}`)),
+
+  /** 回放参数（原始请求 + 终态）：事故复盘不必让人重新手写需求 */
+  traceReplay: (traceId: string) =>
+    unwrap<TraceReplay>(http.get(`/agent/traces/${encodeURIComponent(traceId)}/replay`)),
+
   /* ---------------------- Agent 评测台（/api/evals） ---------------------- */
 
   /** 评测台自述：黄金集清单 / 门禁阈值 / 评委开关 / 当前模型 */
@@ -373,6 +398,27 @@ export const api = {
     unwrap<EvalSuiteResult | JobHandle>(
       http.post('/evals', payload, { timeout: payload.enqueue ? 30_000 : 600_000, signal }),
     ),
+
+  /* ------------------- 自定义（回归）用例：事故 → 门禁闭环 ------------------- */
+
+  /** 自定义用例列表（由失败轨迹沉淀 / 人工登记，自动纳入运行集与 CI 门禁） */
+  customCases: () => unwrap<CustomCaseListResult>(http.get('/evals/cases')),
+
+  /** 当前生效的用例集（黄金集 + 自定义），用于核对门禁覆盖面 */
+  effectiveCases: () => unwrap<EffectiveCasesResult>(http.get('/evals/cases/effective')),
+
+  /**
+   * 把一条失败轨迹沉淀为回归用例。
+   *
+   * 断言由服务端**确定性推导**（同一工具失败 → 要求不再失败；护栏被触发 → 要求归零），
+   * 不靠人写断言 —— 沉淀下来的用例必须可复核、可解释。
+   */
+  createIncidentCase: (payload: { traceId: string; title?: string; note?: string }) =>
+    unwrap<IncidentCaseResult>(http.post('/evals/incidents', payload)),
+
+  /** 删除一条自定义用例（不再纳入门禁） */
+  deleteCustomCase: (caseId: string) =>
+    http.delete(`/evals/cases/${encodeURIComponent(caseId)}`).then(() => undefined),
 
   /* --------------------- Agent 高级能力：协作 / 沙盘 / 复盘 / 巡检 --------------------- */
 
@@ -578,6 +624,12 @@ export interface AgentStreamHandlers {
   onReflect?: (reflection: AgentReflection) => void
   /** 待用户确认的写操作（确认前不会修改任何数据） */
   onPending?: (actions: AgentPendingAction[]) => void
+  /**
+   * 本轮上下文分区预算明细：分区用量 / 是否超限 / 被裁被压的原因。
+   *
+   * 与 `onDelta` 解耦下发，因此「上下文为什么被裁」在模型开始吐字之前就可见。
+   */
+  onBudget?: (report: BudgetReport) => void
   /** 终态：完整结果（工具明细 / 计划 / 引用 / 记忆 / 反思轨迹） */
   onFinal?: (result: AgentChatResult) => void
 }
@@ -637,6 +689,10 @@ function dispatchSseFrame(frame: string, handlers: AgentStreamHandlers, status: 
       break
     case 'pending':
       handlers.onPending?.((data as { actions?: AgentPendingAction[] }).actions ?? [])
+      break
+    case 'budget':
+      // 上下文分区预算明细：与 delta 解耦，让前端在「模型已经开始吐字」时就能展示预算条
+      handlers.onBudget?.(data as BudgetReport)
       break
     case 'final':
       handlers.onFinal?.(data as AgentChatResult)
