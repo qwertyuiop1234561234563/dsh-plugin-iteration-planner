@@ -85,6 +85,16 @@ class ToolDispatcher:
     async def _tool_list_plans(self, _args: dict[str, Any]) -> Any:
         return await self._engine.request("GET", "/plans")
 
+    async def delete_plan(self, plan_id: str) -> None:
+        """删除计划（**不作为 Agent 工具暴露**，仅供给评测台回收自建夹具）。
+
+        刻意不登记进 ``TOOL_SPECS``：让模型具备「删计划」能力等于给 Agent 一把随时可能
+        对准真实数据的刀，而本项目的删除语义应当由人在 UI 上显式触发。评测台需要它，
+        是因为评测必须**自建自清理**夹具（见 :mod:`app.evals.golden`），而不是留一堆
+        测试计划污染用户数据集。
+        """
+        await self._engine.request("DELETE", f"/plans/{plan_id}")
+
     # ------------------------------ 任务级 ------------------------------
 
     async def _tool_task_add(self, args: dict[str, Any]) -> Any:

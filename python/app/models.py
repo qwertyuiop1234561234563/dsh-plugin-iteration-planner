@@ -100,6 +100,9 @@ class ToolCallRecord(BaseModel):
     ok: bool
     result: Any | None = None
     error: str | None = None
+    #: 失败时的**稳定错误码**（如 ``VALIDATION_ERROR`` / ``NOT_FOUND``）。错误文案会被改写、
+    #: 会被本地化，错误码不会——自反思归因与前端分流都只应依赖它，而不是解析文案。
+    code: str | None = None
 
 
 class PendingAction(BaseModel):
@@ -116,6 +119,26 @@ class PendingAction(BaseModel):
     planId: str | None = None
 
 
+class ReflectionEvent(BaseModel):
+    """一次自反思事件（自反思自愈循环的可观测轨迹）。
+
+    ``category`` / ``strategy`` 由服务端**确定性规则**产出（见 ``app/agent/reflect.py``），
+    模型无权自定义：反思结论必须可复算、可断言，否则「自反思」就退化成又一段模型自述。
+    """
+
+    index: int = Field(description="事件序号（从 1 开始，前端据此渲染有序时间线）")
+    step: int = Field(description="触发反思时的编排步号")
+    tool: str = ""
+    category: str = Field(description="归因类别（invalid_arguments / not_found / …）")
+    strategy: str = Field(description="恢复策略（retry_with_args / switch_tool / degrade / ask_user）")
+    attempt: int = Field(default=1, description="同一签名的第几次尝试")
+    signature: str = ""
+    title: str = ""
+    detail: str = ""
+    recovered: bool = Field(default=False, description="该反思之后是否成功恢复（回填后置位）")
+    at: float = 0.0
+
+
 class AgentRunResult(BaseModel):
     """Agent 一次运行的结构化输出。"""
 
@@ -128,6 +151,10 @@ class AgentRunResult(BaseModel):
     references: list["KbHit"] = Field(default_factory=list)
     #: 本轮注入上下文的长期记忆（供前端展示「模型记得什么」，便于用户纠偏）
     memories: list["MemoryItem"] = Field(default_factory=list)
+    #: 自反思自愈轨迹（自我诊断 → 恢复动作，前端渲染「Agent 如何自救」的时间线）
+    reflections: list[ReflectionEvent] = Field(default_factory=list)
+    #: 持久化检查点 ID：本次运行登记了待确认写操作时下发，可凭它跨重启续跑
+    checkpointId: str | None = None
 
 
 class AgentChatResponse(AgentRunResult):
@@ -724,3 +751,187 @@ class RetroResponse(BaseModel):
     memories: list[str] = Field(default_factory=list)
     memoryWritten: int = Field(default=0, description="实际写回长期记忆的条数（去重后可能少于 memories）")
     memoryEnabled: bool = False
+
+
+# ================= 持久化检查点 + 断点续跑（/api/agent/checkpoints/**） =================
+
+
+class CheckpointRequest(BaseModel):
+    """一次编排的原始请求（续跑时原样重放，不依赖调用方重新描述）。"""
+
+    kind: str = Field(description="plan（端到端规划）| chat（会话式对话）")
+    message: str = Field(default="", description="用户消息（chat）或需求原文（plan）")
+    planId: str | None = None
+    deferWrites: bool = True
+    iterationDeadline: str | None = None
+    iterationStartDate: str | None = None
+    devMemberCount: int | None = None
+
+
+class AgentCheckpoint(BaseModel):
+    """持久化检查点：一次 Agent 运行的完整台账（请求 → 待确认 → 终态）。
+
+    ``pendingActions`` 是「两阶段写确认」的第一阶段产物；把它持久化后，即使进程重启
+    （会话内存丢失），用户仍可凭 ``checkpointId`` 继续确认落库——这才是真正的断点续跑。
+    """
+
+    checkpointId: str
+    sessionId: str
+    owner: str = Field(default="", description="归属主体（用户名 / 机器令牌），用于可见范围过滤")
+    kind: str
+    status: str
+    attempt: int = Field(default=1, description="已执行的运行次数（续跑每次 +1，超过上限即拒绝）")
+    request: CheckpointRequest
+    pendingActions: list[PendingAction] = Field(default_factory=list)
+    executed: list[ToolCallRecord] = Field(default_factory=list)
+    content: str = ""
+    planId: str | None = None
+    steps: int = 0
+    toolCalls: list[ToolCallRecord] = Field(default_factory=list)
+    reflections: list[ReflectionEvent] = Field(default_factory=list)
+    error: str | None = None
+    createdAt: float = 0.0
+    updatedAt: float = 0.0
+    #: 该检查点是否仍可续跑（由服务端按状态计算，便于前端一键决定是否展示「继续」按钮）
+    resumable: bool = False
+
+
+class CheckpointSummary(BaseModel):
+    """检查点列表项（不含完整内容，避免列表响应过大）。"""
+
+    checkpointId: str
+    sessionId: str
+    kind: str
+    status: str
+    attempt: int
+    planId: str | None = None
+    pendingCount: int = 0
+    updatedAt: float = 0.0
+    resumable: bool = False
+
+
+class CheckpointListResponse(BaseModel):
+    """检查点列表与存储状态。"""
+
+    items: list[CheckpointSummary] = Field(default_factory=list)
+    total: int = 0
+    enabled: bool = True
+    backend: str = ""
+    statuses: list[str] = Field(default_factory=list)
+
+
+class CheckpointResumeRequest(BaseModel):
+    """续跑 / 作废检查点。
+
+    ``action`` 语义：``auto`` 按状态自动选择（待确认 → 确认落库；运行中 / 失败 → 重跑）；
+    ``confirm`` 只做「确认落库」；``retry`` 只做「按原请求重跑」；``abort`` 作废。
+    """
+
+    action: str = Field(default="auto", pattern="^(auto|confirm|retry|abort)$")
+    actionIds: list[str] | None = Field(default=None, max_length=50, description="仅确认部分动作；缺省确认全部")
+    reject: bool = Field(default=False, description="驳回模式：作废待确认动作但不重跑")
+
+
+class CheckpointActionResult(BaseModel):
+    """续跑结果（含终态检查点快照，前端可据此刷新台账）。"""
+
+    checkpoint: AgentCheckpoint
+    executed: list[ToolCallRecord] = Field(default_factory=list)
+    remainingActions: list[PendingAction] = Field(default_factory=list)
+    planId: str | None = None
+    content: str = ""
+    #: 本次续跑是否被幂等守卫判定为「重放」（重复提交同一动作时返回上次结果，不再执行）
+    replayed: bool = False
+
+
+# ================= Agent Evals 评测台（/api/evals/**） =================
+
+
+class EvalCaseSpec(BaseModel):
+    """评测用例定义（黄金集条目；对前端只暴露输入与期望，便于人工核对）。"""
+
+    id: str
+    title: str
+    kind: str = Field(description="plan | chat | reflection")
+    input: dict[str, Any] = Field(default_factory=dict, description="用例输入（需求 / 消息 / planId 等）")
+    expect: dict[str, Any] = Field(default_factory=dict, description="确定性断言（工具链 / 计划 / 待确认 / 文本）")
+    rubric: str = Field(default="", description="LLM-as-judge 的自然语言评分标准")
+    #: 依赖的前置用例（如「先建计划、再针对它提问」）：执行时用前置用例产出的 planId 替换
+    #: ``input`` 中的 ``$dep`` 占位符，让评测集**自建夹具**，不依赖生产环境里恰好存在的计划。
+    dependsOn: str = ""
+    #: 用例结束后是否回收其创建的计划（默认回收）：评测绝不能在真实数据集里留下垃圾计划
+    cleanup: bool = True
+    #: ``kind=reflection`` 使用的确定性演练剧本名（见 :mod:`app.evals.drill`）
+    drill: str = ""
+
+
+class EvalAssertionResult(BaseModel):
+    """单条确定性断言的执行结果。"""
+
+    name: str
+    ok: bool
+    expected: Any = None
+    actual: Any = None
+    detail: str = ""
+
+
+class EvalCaseResult(BaseModel):
+    """单个用例的评测结果（确定性轨 + 可选 judge 轨）。"""
+
+    caseId: str
+    title: str
+    kind: str
+    outcome: str = Field(description="pass | fail | error")
+    score: float = Field(default=0.0, description="综合分（确定性 0.6 + judge 0.4，judge 关闭时取确定性分）")
+    deterministicScore: float = 0.0
+    judgeScore: float | None = None
+    judgeLevel: str | None = None
+    judgeRationale: str = ""
+    assertions: list[EvalAssertionResult] = Field(default_factory=list)
+    toolChain: list[str] = Field(default_factory=list, description="实际调用的工具序列")
+    steps: int = 0
+    pendingCount: int = 0
+    planId: str | None = Field(default=None, description="本用例产出 / 使用的计划 ID（依赖链据此传递）")
+    content: str = ""
+    durationMs: int = 0
+    error: str | None = None
+
+
+class EvalGateResult(BaseModel):
+    """CI 门禁判定（可直接作为流水线退出码依据）。"""
+
+    passed: bool
+    passRate: float
+    minPassRate: float
+    avgScore: float
+    minScore: float
+    reasons: list[str] = Field(default_factory=list)
+
+
+class EvalSuiteResult(BaseModel):
+    """一次评测运行的整体结果。"""
+
+    runId: str
+    startedAt: float = 0.0
+    durationMs: int = 0
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    errored: int = 0
+    passRate: float = 0.0
+    avgScore: float = 0.0
+    judgeEnabled: bool = False
+    model: str | None = None
+    backend: str = Field(default="", description="评测所连引擎 / 运行后端说明")
+    gate: EvalGateResult | None = None
+    cases: list[EvalCaseResult] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class EvalRunRequest(BaseModel):
+    """触发一次评测运行。"""
+
+    caseIds: list[str] | None = Field(default=None, max_length=200, description="只跑指定用例；缺省跑全部")
+    kinds: list[str] | None = Field(default=None, max_length=10, description="按类型过滤（plan / chat / …）")
+    judge: bool | None = Field(default=None, description="是否启用 LLM-as-judge；缺省取服务端配置")
+    enqueue: bool = Field(default=False, description="是否改为异步作业执行（长耗时评测不阻塞连接）")

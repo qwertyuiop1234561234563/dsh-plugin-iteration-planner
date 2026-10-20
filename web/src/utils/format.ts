@@ -291,3 +291,103 @@ export const MEMORY_STATUS_LABEL: Record<MemoryStatus, string> = {
   active: '启用中',
   disabled: '已停用',
 }
+
+/* ------------------------- Agent 自反思 / 运行台账 / 评测 ------------------------- */
+
+/**
+ * 反思归因类别中文名。
+ *
+ * 类别由**服务端规则**确定产出（错误码 → 类别），前端只做展示映射；
+ * 未知取值原样展示（经 `reflectCategoryLabel`），避免后端新增类别时界面显示空白。
+ */
+export const REFLECT_CATEGORY_LABEL: Record<string, string> = {
+  invalid_arguments: '参数不合法',
+  not_found: '目标不存在',
+  dependency_cycle: '依赖成环',
+  engine_unavailable: '引擎不可用',
+  format_error: '输出格式异常',
+  empty_result: '检索结果为空',
+  unknown: '未知原因',
+}
+
+/** 归因类别标签样式（越红越需要人工介入） */
+export const REFLECT_CATEGORY_TAG: Record<string, TagType> = {
+  invalid_arguments: 'warning',
+  not_found: 'warning',
+  dependency_cycle: 'danger',
+  engine_unavailable: 'danger',
+  format_error: 'warning',
+  empty_result: 'info',
+  unknown: 'info',
+}
+
+/**
+ * 恢复策略中文名。
+ *
+ * - `retry_with_args`：换一组参数重试（最常见，例如把猜测的 ID 换成真实 ID）
+ * - `reroute_tool`：改走另一个工具（例如按 ID 取不到就改用列表检索）
+ * - `degrade`：已熔断，降级为「如实说明未取得结果」，不再重试
+ * - `ask_user`：归因不明，交回用户补充信息（不猜）
+ */
+export const REFLECT_STRATEGY_LABEL: Record<string, string> = {
+  retry_with_args: '换参重试',
+  reroute_tool: '改换工具',
+  degrade: '熔断降级',
+  ask_user: '请求补充信息',
+}
+
+/** 运行台账状态中文名 */
+export const CHECKPOINT_STATUS_LABEL: Record<string, string> = {
+  running: '编排进行中',
+  awaiting_approval: '待确认落库',
+  executed: '已落库',
+  completed: '已完成',
+  rejected: '已驳回',
+  aborted: '已作废',
+  failed: '编排失败',
+}
+
+/** 运行台账状态标签样式 */
+export const CHECKPOINT_STATUS_TAG: Record<string, TagType> = {
+  running: 'primary',
+  awaiting_approval: 'warning',
+  executed: 'success',
+  completed: 'success',
+  rejected: 'info',
+  aborted: 'info',
+  failed: 'danger',
+}
+
+/** 反思类别名（未知取值原样展示） */
+export function reflectCategoryLabel(category: string): string {
+  return REFLECT_CATEGORY_LABEL[category] ?? category
+}
+
+/** 恢复策略名（未知取值原样展示） */
+export function reflectStrategyLabel(strategy: string): string {
+  return REFLECT_STRATEGY_LABEL[strategy] ?? strategy
+}
+
+/** 台账状态名（未知取值原样展示） */
+export function checkpointStatusLabel(status: string): string {
+  return CHECKPOINT_STATUS_LABEL[status] ?? status
+}
+
+/** 台账状态标签样式（未知取值回落到 info） */
+export function checkpointStatusTag(status: string): TagType {
+  return CHECKPOINT_STATUS_TAG[status] ?? 'info'
+}
+
+/** 评测用例结论中文名 */
+export const EVAL_OUTCOME_LABEL: Record<string, string> = {
+  pass: '通过',
+  fail: '失败',
+  error: '环境异常',
+}
+
+/** 评测用例结论标签样式 */
+export const EVAL_OUTCOME_TAG: Record<string, TagType> = {
+  pass: 'success',
+  fail: 'danger',
+  error: 'info',
+}

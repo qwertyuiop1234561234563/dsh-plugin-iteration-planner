@@ -18,6 +18,7 @@ import type {
   AgentConfirmResult,
   AgentHealth,
   AgentPendingAction,
+  AgentReflection,
   AgentStreamMeta,
   AgentStreamToolResult,
   ApiEnvelope,
@@ -34,11 +35,18 @@ import type {
   BaselineSummary,
   BurndownAnalysis,
   BurndownItem,
+  CheckpointAction,
+  CheckpointDetail,
+  CheckpointListResult,
+  CheckpointResumeResult,
   CreatePlanPayload,
   CriticalPathResult,
   DagCheckResult,
   DeleteTaskResult,
   EnumMeta,
+  EvalDescribeResult,
+  EvalRunRequest,
+  EvalSuiteResult,
   GraphPayload,
   HealthResult,
   ImportPayload,
@@ -313,6 +321,59 @@ export const api = {
   agentResetSession: (sessionId: string) =>
     http.delete(`/agent/sessions/${encodeURIComponent(sessionId)}`).then(() => undefined),
 
+  /* -------------------- Agent 运行台账：断点续跑（/api/agent/checkpoints） -------------------- */
+
+  /**
+   * 运行台账列表（本主体最近的待确认 / 可续跑运行）。
+   *
+   * 台账是**持久化**的：服务重启、副本切换、用户关掉浏览器再来，这批「已登记但未落库的改动」都还在。
+   */
+  checkpoints: (limit?: number) =>
+    unwrap<CheckpointListResult>(
+      http.get('/agent/checkpoints', { params: limit ? { limit } : {} }),
+    ),
+
+  /** 台账快照（请求原文 / 待确认动作 / 执行结果 / 反思轨迹） */
+  checkpoint: (checkpointId: string) =>
+    unwrap<CheckpointDetail>(http.get(`/agent/checkpoints/${encodeURIComponent(checkpointId)}`)),
+
+  /**
+   * 续跑台账：`confirm` 确认落库、`retry` 用**台账里保存的原始请求**重跑、`abort` 作废。
+   *
+   * `auto` 按当前状态自动分流。确认是幂等的：已终态台账重复确认会返回上次结果并标记 `replayed`。
+   */
+  resumeCheckpoint: (
+    checkpointId: string,
+    payload: { action?: CheckpointAction; actionIds?: string[]; reject?: boolean } = {},
+  ) =>
+    unwrap<CheckpointResumeResult>(
+      http.post(
+        `/agent/checkpoints/${encodeURIComponent(checkpointId)}/resume`,
+        { action: payload.action ?? 'auto', ...payload },
+        { timeout: 180_000 },
+      ),
+    ),
+
+  /** 作废台账：丢弃待确认动作并移除记录（**不会**顺带执行它们） */
+  deleteCheckpoint: (checkpointId: string) =>
+    http.delete(`/agent/checkpoints/${encodeURIComponent(checkpointId)}`).then(() => undefined),
+
+  /* ---------------------- Agent 评测台（/api/evals） ---------------------- */
+
+  /** 评测台自述：黄金集清单 / 门禁阈值 / 评委开关 / 当前模型 */
+  evalsDescribe: () => unwrap<EvalDescribeResult>(http.get('/evals')),
+
+  /**
+   * 触发一次评测运行。
+   *
+   * 同步模式返回完整 `EvalSuiteResult`；`enqueue=true` 时返回 `JobHandle`（长耗时评测应走异步，
+   * 避免在中间层超时后出现「客户端看到失败、评测其实已跑完」的假失败）。
+   */
+  evalsRun: (payload: EvalRunRequest = {}, signal?: AbortSignal) =>
+    unwrap<EvalSuiteResult | JobHandle>(
+      http.post('/evals', payload, { timeout: payload.enqueue ? 30_000 : 600_000, signal }),
+    ),
+
   /* --------------------- Agent 高级能力：协作 / 沙盘 / 复盘 / 巡检 --------------------- */
 
   /** 多角色协作的角色与步骤说明（时间线图例） */
@@ -509,9 +570,15 @@ export interface AgentStreamHandlers {
   onToolStart?: (name: string) => void
   /** 工具调用结果（轻量字段，完整明细由 onFinal 补齐） */
   onToolResult?: (record: AgentStreamToolResult) => void
+  /**
+   * 自我诊断事件：工具失败 / 检索空结果时，服务端**确定性归因**后给出的纠偏动作。
+   *
+   * 前端据此把「Agent 自己发现走错了路并在改」显式呈现出来（而不是只看到一次莫名重试）。
+   */
+  onReflect?: (reflection: AgentReflection) => void
   /** 待用户确认的写操作（确认前不会修改任何数据） */
   onPending?: (actions: AgentPendingAction[]) => void
-  /** 终态：完整结果（工具明细 / 计划 / 引用 / 记忆） */
+  /** 终态：完整结果（工具明细 / 计划 / 引用 / 记忆 / 反思轨迹） */
   onFinal?: (result: AgentChatResult) => void
 }
 
@@ -563,6 +630,10 @@ function dispatchSseFrame(frame: string, handlers: AgentStreamHandlers, status: 
       break
     case 'tool_result':
       handlers.onToolResult?.(data as AgentStreamToolResult)
+      break
+    case 'reflect':
+      // 自我诊断事件：与「工具成功」区分开，前端据此展示 Agent 的纠偏过程
+      handlers.onReflect?.(data as AgentReflection)
       break
     case 'pending':
       handlers.onPending?.((data as { actions?: AgentPendingAction[] }).actions ?? [])

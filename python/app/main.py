@@ -43,21 +43,27 @@ from .auth import (
     required_permission,
 )
 from .cache import build_cache
+from .checkpoints import build_checkpoint_store
 from .config import Settings, get_settings
 from .constants import KB_COLLECTION, MEMORY_COLLECTION, default_chroma_dir, default_store_path
 from .engine_client import EngineClient
 from .errors import ApiError, bad_request, forbidden, internal, not_found, rate_limited, unauthorized
+from .evals import build_eval_service
 from .idempotency import build_idempotency_guard
 from .jobs import build_job_store
 from .kb import CachedEmbedder, ChromaVectorStore, Embedder, OpenAiEmbedder, build_knowledge_base
 from .logging_config import configure_logging, request_id_var
+from .mcp import build_mcp_server
 from .metrics import METRICS
 from .patrol import PatrolService
 from .resilience import CircuitBreaker, RetryPolicy
 from .routes.agent import build_agent_router
 from .routes.auth import build_auth_router
+from .routes.checkpoints import build_checkpoints_router
+from .routes.evals import build_evals_router
 from .routes.jobs import build_jobs_router
 from .routes.kb import build_kb_router
+from .routes.mcp import build_mcp_router
 from .routes.memory import build_memory_router
 from .routes.proxy import register_proxy_and_static
 from .routes.scenario import build_scenario_router
@@ -315,6 +321,15 @@ def create_app(
         lock_wait_seconds=settings.agent_session_lock_wait_seconds,
     )
     dispatcher = ToolDispatcher(resolved_engine, knowledge=knowledge, memory=memory)
+    #: 持久化检查点台账（两阶段写确认的耐用化 + 断点续跑）：默认与作业存储同一驱动语义，
+    #: 多副本部署切 Redis 后「在 A 副本登记、到 B 副本确认」才成立。它是**状态数据**，
+    #: 因此驱动为 redis 而缺 REDIS_URL / redis 依赖时**启动即失败**（不静默降级为进程内存）。
+    checkpoints = build_checkpoint_store(
+        driver=settings.checkpoint_store,
+        redis_url=settings.redis_url,
+        max_entries=settings.checkpoint_max_entries,
+        ttl_seconds=settings.checkpoint_ttl_seconds,
+    )
     runner = AgentRunner(
         resolved_llm,
         dispatcher,
@@ -327,6 +342,9 @@ def create_app(
         kb_auto_inject=settings.kb_auto_inject,
         kb_inject_top_k=settings.kb_inject_top_k,
         memory_top_k=settings.memory_top_k,
+        reflect_enabled=settings.agent_reflect_enabled,
+        reflect_max_retries=settings.agent_reflect_max_retries,
+        checkpoints=checkpoints,
     )
     broadcaster = WsBroadcaster(
         replay_size=settings.ws_replay_size,
@@ -370,6 +388,24 @@ def create_app(
         redis_url=settings.redis_url,
         max_entries=settings.job_max_entries * 4,
         ttl_seconds=settings.idempotency_ttl_seconds,
+    )
+    #: Agent 评测台（黄金集 + 双轨打分 + CI 门禁）；``EVALS_ENABLED=false`` 时为 ``None``
+    evals = (
+        build_eval_service(settings, runner=runner, dispatcher=dispatcher)
+        if settings.evals_enabled
+        else None
+    )
+    #: MCP 服务端（Streamable HTTP 传输挂在本应用上；stdio 传输由 ``python -m app.mcp.stdio`` 独立运行）。
+    #: 工具清单按「当前真正可用」收敛（未启用向量化时不含 kb_* / memory_*），与 Agent 同一口径。
+    mcp = (
+        build_mcp_server(
+            dispatcher=dispatcher,
+            store=store,
+            settings=settings,
+            available_tools=frozenset(runner.tool_names),
+        )
+        if settings.mcp_enabled
+        else None
     )
     #: 账号 / 会话存储；``AUTH_ENABLED=false`` 时整套访问控制关闭（仅保留机器令牌语义）
     auth_store = (
@@ -420,6 +456,7 @@ def create_app(
             await cache.close()
             await job_store.close()
             await idempotency.close()
+            await checkpoints.close()
             await resolved_engine.aclose()
             if isinstance(resolved_llm, OpenAiCompatibleClient):
                 await resolved_llm.aclose()
@@ -457,6 +494,9 @@ def create_app(
         auth=auth_store,
         jobs=job_store,
         idempotency=idempotency,
+        checkpoints=checkpoints,
+        evals=evals,
+        mcp=mcp,
     )
 
     # 注册顺序：先注册的在内层，后注册的在外层（Starlette 语义），CORS 需最外层。
@@ -477,6 +517,11 @@ def create_app(
     app.include_router(build_agent_router(settings.api_base_path))
     # 异步作业端点必须先于 catch-all 静态/代理路由注册（否则会被 ``/api/**`` 透传吞掉）
     app.include_router(build_jobs_router(settings.api_base_path))
+    # 检查点台账（断点续跑）与评测台：都带写语义，同样必须先于 catch-all 注册
+    app.include_router(build_checkpoints_router(settings.api_base_path))
+    app.include_router(build_evals_router(settings.api_base_path))
+    # MCP Streamable HTTP 传输端点（``POST/DELETE /api/mcp``）：自带 Bearer 令牌，见 permissions.PUBLIC_ENDPOINTS
+    app.include_router(build_mcp_router(settings.api_base_path))
     # 情景对比必须先于 catch-all 静态/代理路由注册（Starlette 先注册先匹配）
     app.include_router(build_scenario_router(settings.api_base_path))
     # 治理能力（导入 / 基线 / 登记册 / 负荷 / 燃尽分析 / 变更历史 / 质量 / 配置备份）

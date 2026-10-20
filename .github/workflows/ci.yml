@@ -69,6 +69,11 @@ jobs:
         env:
           REDIS_URL: redis://127.0.0.1:6379/15
         run: python -m pytest
+      # 评测门禁：只跑确定性自愈演练（脚本化模型 + 桩调度器，不需要真实引擎 / LLM），
+      # 因此离线环境也能稳定给出结论。退出码即门禁结论，失败直接红灯。
+      - name: Agent 评测门禁（自愈演练）
+        working-directory: python
+        run: python -m app.evals.gate --kind reflection --no-judge
 
   # ---------------------------- 控制台（Vue3） ----------------------------
   web:

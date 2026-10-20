@@ -145,6 +145,27 @@ services:
       JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
       JOB_MAX_ENTRIES: ${JOB_MAX_ENTRIES:-1024}
       IDEMPOTENCY_TTL_SECONDS: ${IDEMPOTENCY_TTL_SECONDS:-86400}
+      # MCP Server：把 Agent 既有工具原样注册为 MCP 工具（stdio 由独立进程启动，不受本开关影响）
+      MCP_ENABLED: ${MCP_ENABLED:-true}
+      MCP_SERVER_NAME: ${MCP_SERVER_NAME:-iteration-planner}
+      MCP_TOKEN: ${MCP_TOKEN:-}
+      MCP_MAX_RESULT_CHARS: ${MCP_MAX_RESULT_CHARS:-200000}
+      MCP_MAX_BODY_BYTES: ${MCP_MAX_BODY_BYTES:-2097152}
+      # 运行台账（持久化检查点）：两阶段写确认的待确认动作落盘，重启/换副本后可继续确认；
+      # 台账是**状态**而非缓存，故障返 503 不静默降级 —— 多副本/多 worker 必须 CHECKPOINT_STORE=redis
+      CHECKPOINT_STORE: ${CHECKPOINT_STORE:-auto}
+      CHECKPOINT_TTL_SECONDS: ${CHECKPOINT_TTL_SECONDS:-604800}
+      CHECKPOINT_MAX_ENTRIES: ${CHECKPOINT_MAX_ENTRIES:-2048}
+      CHECKPOINT_MAX_ATTEMPTS: ${CHECKPOINT_MAX_ATTEMPTS:-3}
+      # 评测台：黄金集 + 确定性断言（硬门槛）+ LLM 评委（补充权重），CI 门禁据阈值返回退出码
+      EVALS_ENABLED: ${EVALS_ENABLED:-true}
+      EVALS_JUDGE_ENABLED: ${EVALS_JUDGE_ENABLED:-true}
+      EVALS_MAX_CASES: ${EVALS_MAX_CASES:-100}
+      EVALS_GATE_PASS_RATE: ${EVALS_GATE_PASS_RATE:-0.8}
+      EVALS_GATE_MIN_SCORE: ${EVALS_GATE_MIN_SCORE:-0.7}
+      # 自反思自愈：稳定错误码 → 确定性归因 → 换参/换工具重试，超限熔断降级（非模型自述，可复算）
+      AGENT_REFLECT_ENABLED: ${AGENT_REFLECT_ENABLED:-true}
+      AGENT_REFLECT_MAX_RETRIES: ${AGENT_REFLECT_MAX_RETRIES:-2}
       # 知识库（RAG）与长期记忆：默认硅基流动 BAAI/bge-m3（长期免费，固定 1024 维）；
       # 两行 EMBEDDING_BASE_URL / EMBEDDING_API_KEY 均留空时才回落 LLM_*（智谱同一端点兼做 embeddings）
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}

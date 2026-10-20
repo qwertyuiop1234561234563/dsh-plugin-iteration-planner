@@ -33,11 +33,15 @@ _PLAN_SCOPED = re.compile(r"^/(?:plans|workspace/plans)/(?P<planId>[^/]+)(?:/|$)
 #: 机器令牌主体（``API_TOKEN``）：视为内部服务账号，拥有全部权限但无用户身份
 MACHINE_USER_ID = "machine"
 
-#: 免鉴权端点（``(方法, 相对路径)``）：**仅登录与登出**。
-#: 二者不接收业务载荷——登录以口令校验自身作为访问控制，登出对未登录请求幂等，
+#: 免鉴权端点（``(方法, 相对路径)``）：登录 / 登出 / MCP 传输端点。
+#: 前两者不接收业务载荷——登录以口令校验自身作为访问控制，登出对未登录请求幂等，
 #: 若在此处强制鉴权会导致「未登录就永远无法登录」的死锁。
+#: MCP 端点则是**自带令牌**的机器通道：它按 MCP 规范使用 ``Authorization: Bearer``
+#: 携带 ``MCP_TOKEN``（或复用 ``API_TOKEN``，见 :func:`app.mcp.server.verify_token`），
+#: 与本中间件的「Cookie 会话 / API_TOKEN」两套身份模型不兼容，因此在此放行、由该路由自行
+#: 用**常量时间比较**校验令牌；没有令牌时该路由直接 401，不会出现「无凭据即可建计划」。
 PUBLIC_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
-    {("POST", "/auth/login"), ("POST", "/auth/logout")}
+    {("POST", "/auth/login"), ("POST", "/auth/logout"), ("POST", "/mcp"), ("DELETE", "/mcp")}
 )
 
 
@@ -150,6 +154,10 @@ def required_permission(method: str, path: str, base: str) -> str | None:
     if rel == "/audit" or rel.startswith("/audit/"):
         return PERM_AUDIT_READ
     if rel.startswith("/agent/"):
+        # 检查点续跑会**真正落库**（确认待确认动作或按原请求重跑），按写权限收紧；
+        # 列表 / 快照只是读台账，与对话同级（agent:chat）
+        if rel.startswith("/agent/checkpoints"):
+            return PERM_AGENT_CHAT if verb == "GET" else PERM_AGENT_WRITE
         # 写确认属于「真正落库」的动作，单独用 agent:write 区分于只读对话
         if rel.startswith("/agent/confirm"):
             return PERM_AGENT_WRITE
@@ -161,6 +169,14 @@ def required_permission(method: str, path: str, base: str) -> str | None:
             return PERM_PLAN_READ
         # What-if 沙盘 / 复盘都是「读计划 + 派生结论」：沙盘的临时计划用完即回收，
         # 与既有 /scenario/compare 同一性质，因此与对话同级（agent:chat）
+        return PERM_AGENT_CHAT
+    if rel == "/mcp" or rel.startswith("/mcp/"):
+        # 免鉴权端点（见 PUBLIC_ENDPOINTS），由路由自行校验 MCP 令牌；此分支仅在
+        # 「MCP 端点被改成非公开」时才生效，按写权限收紧（它会登记 / 确认写操作）
+        return PERM_AGENT_WRITE
+    if rel == "/evals" or rel.startswith("/evals/"):
+        # 评测台会真实驱动 Agent 跑一遍（读计划 + 调模型 + 派生结论），与对话同一性质；
+        # 它**不写计划**（用例都是只读或登记待确认），因此不按写权限收紧
         return PERM_AGENT_CHAT
     if rel == "/jobs" or rel.startswith("/jobs/"):
         # 作业查询 / 订阅进度是只读；取消作业等价于「放弃这次写」，按写权限收紧

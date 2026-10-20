@@ -335,6 +335,35 @@ export interface AgentToolCallRecord {
   ok: boolean
   result?: unknown
   error?: string | null
+  /** 稳定错误码（供前端分流与自反思归因；失败调用才有） */
+  code?: string | null
+}
+
+/**
+ * 自反思事件（plan→act→observe→reflect 闭环的一次「自我诊断」）。
+ *
+ * 类别与策略由**服务端规则**确定性产出（错误码 → 类别），不依赖模型自述，
+ * 因此可以在评测里作为断言对象、在界面上直接展示。
+ */
+export interface AgentReflection {
+  /** 本次运行为第几条反思（从 1 开始） */
+  index: number
+  /** 触发该反思的编排步号 */
+  step: number
+  /** 出问题的工具名 */
+  tool: string
+  /** 归因类别：invalid_arguments / not_found / dependency_cycle / engine_unavailable / format_error / empty_result / unknown */
+  category: string
+  /** 采取的恢复策略：retry_with_args / reroute_tool / degrade / ask_user */
+  strategy: string
+  /** 同一（工具 + 类别）签名的第几次尝试；超过上限即熔断降级 */
+  attempt: number
+  signature: string
+  title: string
+  detail: string
+  /** 是否已恢复（后续同工具调用成功即回填为 true） */
+  recovered: boolean
+  at: string
 }
 
 /** 待确认的写操作（两阶段写操作的第一阶段产物） */
@@ -356,6 +385,10 @@ export interface AgentChatResult {
   toolCalls: AgentToolCallRecord[]
   steps: number
   pendingActions: AgentPendingAction[]
+  /** 本轮自反思轨迹（未启用反思时为空数组） */
+  reflections?: AgentReflection[]
+  /** 本条运行台账 ID（有待确认动作或编排失败时才有；据此可在重启后继续） */
+  checkpointId?: string | null
   /** 本轮实际引用到的知识库片段（供用户核对结论依据） */
   references?: KbHit[]
   /** 本轮注入上下文的长期记忆（供用户纠偏） */
@@ -1088,7 +1121,7 @@ export interface AuthAccountUpdatePayload {
 /* --------------------------- 异步写作业（/api/jobs/**） --------------------------- */
 
 /** 作业类型（与后端 `app/constants.py` JOB_KINDS 一致） */
-export type JobKind = 'plan.create' | 'plan.replan'
+export type JobKind = 'plan.create' | 'plan.replan' | 'evals'
 
 /** 作业状态（terminal 取值：succeeded / failed / cancelled） */
 export type JobStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
@@ -1132,4 +1165,213 @@ export interface JobSnapshot {
   result: unknown
   /** 失败时的稳定错误码与通用文案（绝不含内部栈信息） */
   error: { code: string; message: string } | null
+}
+
+/* ------------------ 持久化检查点台账（断点续跑 · /api/agent/checkpoints） ------------------ */
+
+/**
+ * 运行台账状态机：
+ *
+ * - `running`            编排进行中（进程重启后可据此重跑）
+ * - `awaiting_approval`  已产出待确认动作，等待用户批复（**可确认落库**）
+ * - `executed`           待确认动作已全部执行落库
+ * - `completed`          重跑完成且无待确认动作（无 LLM 环境下的「跑完即结论」）
+ * - `rejected`           用户驳回，待确认动作已被丢弃
+ * - `aborted`            主动作废，未执行任何写入
+ * - `failed`             编排失败（错误信息保留在 error 字段，可重跑）
+ */
+export type CheckpointStatus =
+  | 'running'
+  | 'awaiting_approval'
+  | 'executed'
+  | 'completed'
+  | 'rejected'
+  | 'aborted'
+  | 'failed'
+
+/** 台账类型：端到端建计划（无会话）或会话式对话 */
+export type CheckpointKind = 'plan' | 'chat'
+
+/** 续跑动作：auto = 按当前状态自动分流（待确认 → 确认；运行中 / 失败 → 重跑） */
+export type CheckpointAction = 'auto' | 'confirm' | 'retry' | 'abort'
+
+/** 台账列表项（仅摘要，不含请求正文与执行明细） */
+export interface CheckpointSummary {
+  checkpointId: string
+  sessionId: string
+  kind: CheckpointKind | string
+  status: CheckpointStatus | string
+  attempt: number
+  planId: string | null
+  pendingCount: number
+  /** Unix 秒 */
+  updatedAt: number
+  /** 是否还能续跑（终态台账为 false） */
+  resumable: boolean
+}
+
+/** 台账列表响应（含后端开关与状态枚举口径，供界面图例对齐） */
+export interface CheckpointListResult {
+  items: CheckpointSummary[]
+  total: number
+  enabled: boolean
+  /** 存储后端：memory（单副本）/ redis（多副本共享） */
+  backend: string
+  statuses: string[]
+}
+
+/** 台账快照（含请求原文、待确认动作、执行结果与反思轨迹） */
+export interface CheckpointDetail {
+  checkpointId: string
+  sessionId: string
+  owner: string
+  kind: CheckpointKind | string
+  status: CheckpointStatus | string
+  attempt: number
+  /** 保存的**原始请求**：重跑时据它重建整轮编排，用户无需重新描述需求 */
+  request: {
+    kind?: string
+    message: string
+    planId?: string | null
+    deferWrites?: boolean
+    iterationDeadline?: string | null
+    iterationStartDate?: string | null
+    devMemberCount?: number | null
+  }
+  pendingActions: AgentPendingAction[]
+  executed: AgentToolCallRecord[]
+  content: string
+  planId: string | null
+  reflections: AgentReflection[]
+  error: string | null
+  /** Unix 秒 */
+  createdAt: number
+  /** Unix 秒 */
+  updatedAt: number
+  resumable: boolean
+}
+
+/** 续跑结果 */
+export interface CheckpointResumeResult {
+  checkpointId: string
+  replayed: boolean
+  executed: AgentToolCallRecord[]
+  remainingActions: AgentPendingAction[]
+  checkpoint: CheckpointDetail
+  rejected: boolean
+}
+
+/* --------------------- Agent 评测台（黄金集 + 双轨打分 + CI 门禁） --------------------- */
+
+/** 用例类型：plan（端到端建计划）/ chat（会话任务）/ reflection（确定性自愈演练，无需 LLM） */
+export type EvalCaseKind = 'plan' | 'chat' | 'reflection'
+
+/** 单例产出 */
+export type EvalOutcome = 'pass' | 'fail' | 'error'
+
+/** 黄金集用例声明（界面据此说明「到底在评什么」） */
+export interface EvalCaseSpec {
+  id: string
+  kind: EvalCaseKind | string
+  title: string
+  /** 该用例依赖的前置用例（其产出的计划 ID 会注入本用例） */
+  dependsOn?: string | null
+  /** 是否需要回收自建的临时计划 */
+  cleanup?: boolean
+  /** 确定性演练剧本名 */
+  drill?: string | null
+  input: Record<string, unknown>
+  /** 期望断言（键为断言名，值为期望条件） */
+  expect: Record<string, unknown>
+  rubric?: string | null
+}
+
+/** 单条断言的执行结果 */
+export interface EvalAssertionResult {
+  name: string
+  ok: boolean
+  detail: string
+  /** 该断言是否为硬门槛（不过即判例失败） */
+  hard: boolean
+}
+
+/** 单例评测结果 */
+export interface EvalCaseResult {
+  caseId: string
+  kind: EvalCaseKind | string
+  title: string
+  outcome: EvalOutcome | string
+  assertions: EvalAssertionResult[]
+  /** 确定性断言得分（0~1，只算硬门槛） */
+  deterministicScore: number
+  /** LLM 评委得分；评委缺席（未配置 / 输出不可解析）为 null，而不是 0 */
+  judgeScore: number | null
+  judgeLevel: string | null
+  judgeRationale: string | null
+  score: number
+  toolChain: string[]
+  steps: number
+  pendingCount: number
+  planId: string | null
+  content: string
+  durationMs: number
+  error: string | null
+}
+
+/** 门禁结论（CI 以此判定放行） */
+export interface EvalGateResult {
+  passed: boolean
+  /** 未通过原因（人类可读，逐条列出） */
+  reasons: string[]
+  passRate: number
+  avgScore: number
+  thresholds: { passRate: number; minScore: number }
+}
+
+/** 一次评测运行的完整结果 */
+export interface EvalSuiteResult {
+  runId: string
+  startedAt: string
+  durationMs: number
+  total: number
+  passed: number
+  failed: number
+  errored: number
+  passRate: number
+  avgScore: number
+  cases: EvalCaseResult[]
+  gate: EvalGateResult | null
+  /** 运行说明（依赖被过滤、LLM 未配置、临时计划回收失败等） */
+  notes: string[]
+  model: string | null
+  backend: string
+}
+
+/** 评测台自述（黄金集清单 / 门禁阈值 / 评委开关 / 当前模型） */
+export interface EvalDescribeResult {
+  enabled: boolean
+  caseCount: number
+  cases: EvalCaseSpec[]
+  judgeEnabled: boolean
+  gates: { passRate: number; minScore: number }
+  model: string | null
+  backend: string
+  jobBackend: string
+}
+
+/** 触发评测运行的请求 */
+export interface EvalRunRequest {
+  /** 只跑指定用例 id */
+  caseIds?: string[]
+  /** 按类型过滤：plan / chat / reflection */
+  kinds?: EvalCaseKind[]
+  /** 是否启用 LLM 评委（缺省按服务端配置） */
+  judge?: boolean
+  /**
+   * 是否转成异步作业（返回 JobHandle）。
+   *
+   * 评测会真实驱动 Agent 跑多轮 LLM + 引擎调用，很容易超过中间层超时；
+   * 长耗时场景应置 true 并改用 `jobStream` 订阅进度。
+   */
+  enqueue?: boolean
 }

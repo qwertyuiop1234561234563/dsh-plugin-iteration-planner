@@ -212,3 +212,26 @@ def session_busy(message: str = "同一会话仍有请求在处理中，请稍�
 
 def internal(message: str = "服务内部错误") -> ApiError:
     return ApiError(500, "INTERNAL_ERROR", message)
+
+
+def checkpoint_not_found(message: str = "检查点不存在或已过期") -> ApiError:
+    """检查点台账不存在。
+
+    与 :func:`not_found` 分开：前端需要据此区分「计划不存在」与「台账过期」，
+    两者给用户的下一步指引完全不同（前者去查计划，后者需重新发起编排）。
+    """
+    return ApiError(404, "CHECKPOINT_NOT_FOUND", message)
+
+
+def checkpoint_store_unavailable(message: str = "检查点存储暂不可用，请稍后重试") -> ApiError:
+    """检查点存储（Redis / 内存）不可用：必须显式失败。
+
+    台账是**状态数据**，静默降级会让「登记了待确认动作」变成假象——用户之后点确认
+    只会得到 404，且无法判断是过期还是根本没存上。
+    """
+    return ApiError(503, "CHECKPOINT_STORE_UNAVAILABLE", message)
+
+
+def checkpoint_not_resumable(message: str = "该检查点已终态，无法续跑") -> ApiError:
+    """对已终态（已执行 / 已驳回 / 已作废）的台账再次续跑 —— 属于语义冲突。"""
+    return ApiError(409, "CHECKPOINT_NOT_RESUMABLE", message)

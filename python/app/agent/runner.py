@@ -26,13 +26,20 @@ import json
 import logging
 import re
 import uuid
+from contextlib import suppress
 from typing import Any, AsyncIterator
 
+from ..checkpoints import CheckpointStore
 from ..constants import (
+    CHECKPOINT_KIND_CHAT,
+    CHECKPOINT_KIND_PLAN,
+    CHECKPOINT_STATUS_AWAITING,
+    CHECKPOINT_STATUS_FAILED,
     SSE_DELTA,
     SSE_FINAL,
     SSE_META,
     SSE_PENDING,
+    SSE_REFLECT,
     SSE_RESULT,
     SSE_TOOL_RESULT,
     SSE_TOOL_START,
@@ -40,11 +47,20 @@ from ..constants import (
 from ..errors import ApiError, bad_request, llm_unavailable, not_found
 from ..kb.pipeline import KnowledgeBaseService
 from ..metrics import METRICS
-from ..models import AgentChatResponse, AgentRunResult, KbHit, MemoryItem, PendingAction, ToolCallRecord
+from ..models import (
+    AgentChatResponse,
+    AgentRunResult,
+    CheckpointRequest,
+    KbHit,
+    MemoryItem,
+    PendingAction,
+    ToolCallRecord,
+)
 from ..sessions import InMemorySessionStore, SessionStore
 from .llm import LlmClient, strip_protocol_leak
 from .memory import MemoryService
 from .prompts import ITERATION_PLANNER_SYSTEM_PROMPT, build_chat_instruction, build_plan_instruction
+from .reflect import ReflectionTracker
 from .sanitize import unwrap_arguments
 from .schemas import TOOL_RESULT_PENDING_CONFIRMATION, TOOL_SPECS, WRITE_TOOLS, describe_action
 from .tools import ToolDispatcher
@@ -138,21 +154,21 @@ _PLAN_ID_ABSENT_NOTICE = (
 )
 
 
-def _has_landed_write(records: list[ToolCallRecord]) -> bool:
-    """本轮是否存在**真正落库**的写操作。
+def _is_deferred_write(record: ToolCallRecord) -> bool:
+    """该调用是否**只是登记为待确认**、数据尚未落库。
 
     不能只看 ``ok``：登记为待确认动作的写工具同样返回 ``ok=True``（调用确实被成功受理），
-    但数据**尚未写入**。因此以 :data:`TOOL_RESULT_PENDING_CONFIRMATION` 把「仅登记」剔除，
-    剩下的才算落库。
+    但数据**尚未写入**。因此以 :data:`TOOL_RESULT_PENDING_CONFIRMATION` 把「仅登记」剔除。
     """
-    for record in records:
-        if not (record.ok and record.name in WRITE_TOOLS):
-            continue
-        result = record.result if isinstance(record.result, dict) else {}
-        if result.get("status") == TOOL_RESULT_PENDING_CONFIRMATION:
-            continue
-        return True
-    return False
+    if not (record.ok and record.name in WRITE_TOOLS):
+        return False
+    result = record.result if isinstance(record.result, dict) else {}
+    return result.get("status") == TOOL_RESULT_PENDING_CONFIRMATION
+
+
+def _has_landed_write(records: list[ToolCallRecord]) -> bool:
+    """本轮是否存在**真正落库**的写操作（见 :func:`_is_deferred_write`）。"""
+    return any(record.ok and record.name in WRITE_TOOLS and not _is_deferred_write(record) for record in records)
 
 
 def _enforce_authoritative_reply(
@@ -540,6 +556,9 @@ class AgentRunner:
         kb_auto_inject: bool = True,
         kb_inject_top_k: int = 3,
         memory_top_k: int = 4,
+        reflect_enabled: bool = True,
+        reflect_max_retries: int = 2,
+        checkpoints: CheckpointStore | None = None,
     ) -> None:
         self._llm = llm
         self._dispatcher = dispatcher
@@ -552,6 +571,11 @@ class AgentRunner:
         self._kb_auto_inject = kb_auto_inject
         self._kb_inject_top_k = kb_inject_top_k
         self._memory_top_k = memory_top_k
+        #: 自反思自愈：把「失败 / 空结果」确定性归因后有界重试，超限即熔断降级
+        self._reflect_enabled = reflect_enabled
+        self._reflect_max_retries = max(0, reflect_max_retries)
+        #: 持久化检查点台账：把「待确认写操作」从会话内存升级为可跨重启续跑的运行台账
+        self._checkpoints = checkpoints
         # 仅暴露「当前真正可用」的工具：检索类工具在对应服务缺失时会被移除
         available = {"knowledge": knowledge, "memory": memory}
         self._tool_specs = [
@@ -575,6 +599,15 @@ class AgentRunner:
         """LLM 是否已配置（未配置时 Agent 端点给出明确错误提示）。"""
         return self._llm is not None
 
+    @property
+    def model_name(self) -> str | None:
+        """当前模型标识（客户端自报的名字，如 ``openai-compatible:deepseek-chat``）。
+
+        用于评测报告与日志标注「这批结果出自哪个模型」——换模型后评测分数变化要能归因，
+        否则「今天通过率掉了」会被误读成代码回归。
+        """
+        return getattr(self._llm, "name", None) if self._llm is not None else None
+
     # ------------------------------- 对外入口 -------------------------------
 
     async def run_plan(
@@ -584,11 +617,16 @@ class AgentRunner:
         iteration_deadline: str | None = None,
         iteration_start_date: str | None = None,
         dev_member_count: int | None = None,
+        owner: str = "",
+        record: bool = True,
     ) -> AgentRunResult:
         """自然语言需求 → 完整计划（端到端一次编排）。
 
         同时按需求文本召回知识库片段（若启用）注入上下文：历史迭代文档 / 规范 / 约束
         往往直接决定拆解粒度与依赖关系，比让模型凭空推断更可靠。
+
+        ``record`` 为假时**不落检查点台账**：断点续跑的重跑路径自己持有台账，
+        由它统一更新，否则每重跑一次就多出一条重复台账。
         """
         instruction = build_plan_instruction(
             requirement,
@@ -598,8 +636,22 @@ class AgentRunner:
         )
         kb_context, references = await self._retrieve_knowledge(requirement)
         messages = self._base_messages(kb_context) + [{"role": "user", "content": instruction}]
-        result = await self._loop(messages)
+        request = CheckpointRequest(
+            kind=CHECKPOINT_KIND_PLAN,
+            message=requirement,
+            iterationDeadline=iteration_deadline,
+            iterationStartDate=iteration_start_date,
+            devMemberCount=dev_member_count,
+        )
+        try:
+            result = await self._loop(messages)
+        except ApiError as exc:
+            if record:
+                await self._record_failure(request, session_id="", owner=owner, error=f"{exc.code}：{exc.message}")
+            raise
         result.references = [KbHit(**hit) for hit in references]
+        if record:
+            await self._record_pending(result, request, session_id="", owner=owner)
         return result
 
     async def run_chat(
@@ -609,6 +661,8 @@ class AgentRunner:
         *,
         defer_writes: bool = True,
         plan_id: str | None = None,
+        owner: str = "",
+        record: bool = True,
     ) -> AgentRunResult:
         """会话式对话：携带历史上下文继续编排（同会话串行化）。
 
@@ -621,6 +675,7 @@ class AgentRunner:
         每轮还会按当前输入召回**长期记忆**与**知识库片段**并注入独立 system 区块，
         对话结束后在后台提取本轮记忆（不阻塞响应）。
         """
+        request = CheckpointRequest(kind=CHECKPOINT_KIND_CHAT, message=message, planId=plan_id, deferWrites=defer_writes)
         async with self._store.lock(session_id):
             history = await self._store.get(session_id) or []
             instruction = build_chat_instruction(message, plan_id)
@@ -629,7 +684,14 @@ class AgentRunner:
             messages = (
                 self._base_messages(memory_context, kb_context) + history + [{"role": "user", "content": instruction}]
             )
-            result = await self._loop(messages, defer_writes=defer_writes)
+            try:
+                result = await self._loop(messages, defer_writes=defer_writes)
+            except ApiError as exc:
+                if record:
+                    await self._record_failure(
+                        request, session_id=session_id, owner=owner, error=f"{exc.code}：{exc.message}"
+                    )
+                raise
             result.references = [KbHit(**hit) for hit in references]
             result.memories = [MemoryItem(**item) for item in memories]
 
@@ -642,6 +704,8 @@ class AgentRunner:
             await self._store.set(session_id, updated)
             if defer_writes:
                 await self._store.set_pending(session_id, [item.model_dump() for item in result.pendingActions])
+            if record:
+                await self._record_pending(result, request, session_id=session_id, owner=owner)
             # 后台提取长期记忆：LLM 调用有延迟，不占用本轮响应时间
             if self._memory is not None:
                 self._memory.schedule_extract(session_id, message, result.content)
@@ -654,6 +718,7 @@ class AgentRunner:
         *,
         defer_writes: bool = True,
         plan_id: str | None = None,
+        owner: str = "",
     ) -> AsyncIterator[dict[str, Any]]:
         """流式版 :meth:`run_chat`：以 SSE 事件序列逐步产出（打字机式输出）。
 
@@ -664,6 +729,7 @@ class AgentRunner:
         与 :meth:`run_chat` **完全共享**同一套编排、会话持久化与后台记忆提取逻辑，
         仅把「一次性返回」改为「边编排边下发」，因此两条链路的业务语义严格一致。
         """
+        request = CheckpointRequest(kind=CHECKPOINT_KIND_CHAT, message=message, planId=plan_id, deferWrites=defer_writes)
         async with self._store.lock(session_id):
             history = await self._store.get(session_id) or []
             instruction = build_chat_instruction(message, plan_id)
@@ -676,11 +742,15 @@ class AgentRunner:
             yield {"event": SSE_META, "data": {"sessionId": session_id, "references": references, "memories": memories}}
 
             result: AgentRunResult | None = None
-            async for event in self._loop_stream(messages, defer_writes=defer_writes):
-                if event["event"] == SSE_RESULT:
-                    result = event["data"]
-                    continue
-                yield event
+            try:
+                async for event in self._loop_stream(messages, defer_writes=defer_writes):
+                    if event["event"] == SSE_RESULT:
+                        result = event["data"]
+                        continue
+                    yield event
+            except ApiError as exc:
+                await self._record_failure(request, session_id=session_id, owner=owner, error=f"{exc.code}：{exc.message}")
+                raise
             if result is None:  # pragma: no cover - 编排必然产出结果或抛出异常
                 raise ApiError(500, "INTERNAL_ERROR", "Agent 编排未产出结果")
 
@@ -695,10 +765,68 @@ class AgentRunner:
             await self._store.set(session_id, updated)
             if defer_writes:
                 await self._store.set_pending(session_id, [item.model_dump() for item in result.pendingActions])
+            await self._record_pending(result, request, session_id=session_id, owner=owner)
             if self._memory is not None:
                 self._memory.schedule_extract(session_id, message, result.content)
             response = AgentChatResponse(sessionId=session_id, **result.model_dump())
             yield {"event": SSE_FINAL, "data": response.model_dump()}
+
+    # ------------------------------- 检查点台账 -------------------------------
+
+    async def _record_pending(
+        self,
+        result: AgentRunResult,
+        request: CheckpointRequest,
+        *,
+        session_id: str,
+        owner: str,
+    ) -> None:
+        """编排成功且**产出了待确认动作**时落一个 ``awaiting_approval`` 台账。
+
+        没有待确认动作的轮次不建台账：只读问答既没有需要续跑的半成品，也没有等待批复的
+        改动，为它落盘只会给每轮对话白加一次存储写入。这条取舍是刻意的，见
+        :mod:`app.checkpoints` 的模块文档。
+        """
+        if self._checkpoints is None or not result.pendingActions:
+            return
+        checkpoint = await self._checkpoints.create(
+            session_id=session_id,
+            owner=owner,
+            kind=request.kind,
+            request=request,
+            status=CHECKPOINT_STATUS_AWAITING,
+            pending_actions=[item.model_dump() for item in result.pendingActions],
+            # 只把**真正执行过**的调用计入 executed：本轮的写工具调用此刻仅被登记为待确认，
+            # 数据尚未落库；若把它算作已执行，确认之后同一动作会在台账里出现两次
+            executed=[record.model_dump() for record in result.toolCalls if record.ok and not _is_deferred_write(record)],
+            content=result.content,
+            plan_id=result.planId,
+            steps=result.steps,
+            tool_calls=[record.model_dump() for record in result.toolCalls],
+            reflections=[event.model_dump() for event in result.reflections],
+        )
+        result.checkpointId = checkpoint.checkpointId
+
+    async def _record_failure(
+        self, request: CheckpointRequest, *, session_id: str, owner: str, error: str
+    ) -> None:
+        """编排失败时落一个 ``failed`` 台账：同一请求可在修复后**按原请求重跑**。
+
+        注意：这里**不写入任何明细**（无待确认动作、无工具记录），只保留原始请求——
+        失败轮次的半成品状态没有继续确认的意义，重跑才是唯一正确的续跑语义。
+        """
+        if self._checkpoints is None:
+            return
+        with suppress(Exception):
+            await self._checkpoints.create(
+                session_id=session_id,
+                owner=owner,
+                kind=request.kind,
+                request=request,
+                status=CHECKPOINT_STATUS_FAILED,
+                content="",
+                error=error[:500],
+            )
 
     async def confirm_actions(
         self, session_id: str, action_ids: list[str] | None = None, *, reject: bool = False
@@ -748,6 +876,30 @@ class AgentRunner:
             await self._append_execution_history(session_id, selected, records)
             METRICS.inc_counter("agent_confirm_total", {"outcome": "executed" if records else "empty"})
             return records, remaining, plan_id
+
+    async def execute_actions(
+        self, session_id: str, actions: list[PendingAction]
+    ) -> tuple[list[ToolCallRecord], str | None]:
+        """执行**显式给定**的待确认动作（不读会话存储）——供检查点断点续跑使用。
+
+        与 :meth:`confirm_actions` 的差别只在「动作从哪来」：会话路径从会话存储读，
+        续跑路径从**持久化检查点**读。执行语义（加会话锁、串行、单条失败不中断其余、
+        失败降级为错误记录）完全一致，避免两条链路出现「重启后确认不写历史」这类漂移。
+        """
+        if not actions:
+            return [], None
+        async with self._store.lock(session_id):
+            records: list[ToolCallRecord] = []
+            plan_id: str | None = None
+            for item in actions:
+                record, produced = await self._execute_action(item)
+                records.append(record)
+                plan_id = produced or item.planId or plan_id
+                if not record.ok:
+                    logger.warning("检查点续跑动作执行失败：%s · %s", item.tool, record.error)
+            await self._append_execution_history(session_id, actions, records)
+            METRICS.inc_counter("agent_confirm_total", {"outcome": "resumed"})
+            return records, plan_id
 
     async def reset_session(self, session_id: str) -> bool:
         """清空指定会话（含待确认动作），返回是否存在。"""
@@ -830,6 +982,7 @@ class AgentRunner:
         false_claim_fixes = 0
         state_grounding_fixes = 0
         write_intent_fixes = 0
+        tracker = ReflectionTracker(max_retries=self._reflect_max_retries, enabled=self._reflect_enabled)
 
         for step in range(1, self._max_steps + 1):
             self._enforce_budget(messages)
@@ -963,6 +1116,7 @@ class AgentRunner:
                         toolCalls=records,
                         steps=step,
                         pendingActions=pending,
+                        reflections=tracker.events,
                     ),
                 }
                 return
@@ -976,8 +1130,10 @@ class AgentRunner:
             outcomes = await asyncio.gather(
                 *(self._run_tool_call(index, call, defer_writes) for index, call in enumerate(tool_calls))
             )
+            step_records: list[ToolCallRecord] = []
             for record, tool_message, produced_plan_id, pending_action in outcomes:
                 records.append(record)
+                step_records.append(record)
                 plan_id = produced_plan_id or plan_id
                 if tool_message is not None:
                     messages.append(tool_message)
@@ -991,8 +1147,17 @@ class AgentRunner:
                         "arguments": record.arguments,
                         "ok": record.ok,
                         "error": record.error,
+                        "code": record.code,
                     },
                 }
+
+            # 自反思自愈：对**本步**的失败 / 空结果做确定性归因，超限即熔断降级。
+            # 提示以 user 消息回填（与其它纠偏提示同构），模型据此换参 / 换工具 / 如实收尾。
+            hints, reflections = tracker.observe_step(step, step_records)
+            for reflection in reflections:
+                yield {"event": SSE_REFLECT, "data": reflection.model_dump()}
+            for hint in hints:
+                messages.append({"role": "user", "content": hint})
 
             if pending:
                 # 已登记写操作：**不结束本回合**。用户可能一次提出多处改动，必须让模型有机会
@@ -1013,6 +1178,7 @@ class AgentRunner:
                     toolCalls=records,
                     steps=self._max_steps,
                     pendingActions=pending,
+                    reflections=tracker.events,
                 ),
             }
             return
@@ -1194,7 +1360,7 @@ class AgentRunner:
     ) -> tuple[ToolCallRecord, dict[str, Any]]:
         """构造一条错误工具结果（回填给模型，供其纠偏）。"""
         METRICS.inc_counter("agent_tool_calls_total", {"tool": name or "unknown", "ok": "false"})
-        record = ToolCallRecord(name=name, arguments=arguments, ok=False, error=message)
+        record = ToolCallRecord(name=name, arguments=arguments, ok=False, error=message, code=code)
         payload = json.dumps({"error": code, "message": message}, ensure_ascii=False)
         return record, {"role": "tool", "tool_call_id": call_id, "content": payload}
 
@@ -1215,12 +1381,21 @@ class AgentRunner:
             result = await self._dispatcher.dispatch(action.tool, action.arguments)
         except ApiError as exc:
             METRICS.inc_counter("agent_tool_calls_total", {"tool": action.tool, "ok": "false"})
-            return ToolCallRecord(name=action.tool, arguments=action.arguments, ok=False, error=exc.message), None
+            return (
+                ToolCallRecord(name=action.tool, arguments=action.arguments, ok=False, error=exc.message, code=exc.code),
+                None,
+            )
         except Exception as exc:  # noqa: BLE001 - 兜底：单个动作失败不应影响其余动作
             logger.exception("待确认动作执行异常：%s", action.tool)
             METRICS.inc_counter("agent_tool_calls_total", {"tool": action.tool, "ok": "false"})
             return (
-                ToolCallRecord(name=action.tool, arguments=action.arguments, ok=False, error=f"工具执行异常：{exc}"),
+                ToolCallRecord(
+                    name=action.tool,
+                    arguments=action.arguments,
+                    ok=False,
+                    error=f"工具执行异常：{exc}",
+                    code="TOOL_EXECUTION_ERROR",
+                ),
                 None,
             )
         METRICS.inc_counter("agent_tool_calls_total", {"tool": action.tool, "ok": "true"})

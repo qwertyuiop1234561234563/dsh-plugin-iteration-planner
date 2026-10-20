@@ -168,6 +168,52 @@ class Settings(BaseSettings):
     #: 单次仿真最多接受的「任务级扰动」条数（防止把临时计划改得面目全非而失去可比性）
     whatif_max_task_edits: int = 10
 
+    # ------------------------ MCP Server（把内部能力暴露为标准 MCP 工具） ------------------------
+    #: 是否挂载 Streamable HTTP 传输端点（``/api/mcp``）。stdio 传输由
+    #: ``python -m app.mcp.stdio`` 独立进程显式启动，不受本开关影响。
+    mcp_enabled: bool = True
+    #: MCP 服务名（``initialize`` 响应回显，供客户端识别）
+    mcp_server_name: str = "iteration-planner"
+    #: MCP 专用访问令牌（Bearer）。留空则回落 ``API_TOKEN``；两者都为空且
+    #: ``AUTH_ENABLED=false`` 时才允许无凭据访问（仅本地开发）。
+    #: 首部令牌采用**常量时间比较**，避免时序侧信道猜解。
+    mcp_token: str = ""
+    #: 单次 ``tools/call`` 结果体积上限（字符）：MCP 客户端多为本地进程，超大结果
+    #: 会撑爆其上下文与内存，超限时截断并标注（不改变工具本身的业务结果）。
+    mcp_max_result_chars: int = 200_000
+    #: MCP 传输的单个请求体上限（字节）：MCP 端点不经业务 body 中间件的语义校验，
+    #: 必须显式设限，防止无界 JSON-RPC 载荷打爆内存。
+    mcp_max_body_bytes: int = 2 * 1024 * 1024
+
+    # ------------------------ 持久化检查点 + 断点续跑 ------------------------
+    #: 检查点存储后端：auto（有 REDIS_URL 且依赖可用则 Redis，否则进程内存）| memory | redis。
+    #: 多副本 / API_WORKERS>1 必须用 redis，否则「重启后继续确认」只在本副本可见。
+    checkpoint_store: str = "auto"
+    #: 检查点保留时长（秒）：需覆盖「编排 → 用户确认」的最长间隔（默认 7 天）
+    checkpoint_ttl_seconds: float = 7 * 86400.0
+    #: 进程内存检查点存储的 LRU 上限（条）
+    checkpoint_max_entries: int = 2048
+    #: 单个检查点的续跑（重跑）次数上限：超过即拒绝，避免「失败 → 无限续跑」放大故障
+    checkpoint_max_attempts: int = 3
+
+    # ------------------------ Agent Evals 评测台 ------------------------
+    #: 是否启用评测台端点（``/api/evals/**``）与 CLI 门禁
+    evals_enabled: bool = True
+    #: 是否启用 LLM-as-judge 评分轨（关闭或模型不可用时退化为纯确定性打分）
+    evals_judge_enabled: bool = True
+    #: 单次评测最多执行的用例数（防止一次请求打爆引擎 / 模型配额）
+    evals_max_cases: int = 100
+    #: CI 门禁阈值：通过率下限（低于即判定门禁失败）
+    evals_gate_pass_rate: float = 0.8
+    #: CI 门禁阈值：综合平均分下限
+    evals_gate_min_score: float = 0.7
+
+    # ------------------------ 自反思自愈执行循环 ------------------------
+    #: 是否启用结构化反思阶段（关闭则退回「只回填错误、不主动纠偏」的传统循环）
+    agent_reflect_enabled: bool = True
+    #: 同一「工具 + 归因类别」签名的反思重试次数上限（超过即熔断降级）
+    agent_reflect_max_retries: int = 2
+
     # ------------------------------ 缓存（可选加速） ------------------------------
     #: 缓存后端：auto（配置了 REDIS_URL 且依赖可用则用 Redis，否则进程内存）| memory | redis
     cache_backend: str = "auto"

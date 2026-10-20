@@ -19,8 +19,10 @@ import AuditView from '@/views/AuditView.vue'
 import BaselineView from '@/views/BaselineView.vue'
 import BurndownAnalysisView from '@/views/BurndownAnalysisView.vue'
 import CalendarView from '@/views/CalendarView.vue'
+import CheckpointsView from '@/views/CheckpointsView.vue'
 import DagView from '@/views/DagView.vue'
 import DashboardView from '@/views/DashboardView.vue'
+import EvalsView from '@/views/EvalsView.vue'
 import FlowView from '@/views/FlowView.vue'
 import GanttView from '@/views/GanttView.vue'
 import KanbanView from '@/views/KanbanView.vue'
@@ -122,6 +124,18 @@ const router = createRouter({
           name: 'memory',
           component: MemoryView,
           meta: { title: '长期记忆', sheet: 'E-02', permission: 'memory:read', writable: true },
+        },
+        {
+          path: 'agent/checkpoints',
+          name: 'checkpoints',
+          component: CheckpointsView,
+          meta: { title: 'Agent 运行台账', sheet: 'E-03', permission: 'agent:chat', writable: true },
+        },
+        {
+          path: 'evals',
+          name: 'evals',
+          component: EvalsView,
+          meta: { title: 'Agent 评测台', sheet: 'E-04', permission: 'agent:chat' },
         },
         {
           path: 'admin/users',

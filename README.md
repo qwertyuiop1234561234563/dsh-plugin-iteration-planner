@@ -48,7 +48,7 @@ npx tsx demo/demo.ts 1> examples/sample-output.md 2> demo-stderr.txt
 dsh-plugin-iteration-planner/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml               # 【CI 门禁】引擎单测 / Python 单测（含真实 Redis 服务）/ 控制台类型检查
+│       └── ci.yml               # 【CI 门禁】引擎单测 / Python 单测（含真实 Redis 服务）/ Agent 评测门禁 / 控制台类型检查
 ├── src/
 │   ├── index.ts                 # 【插件入口】Cordis 插件：name / inject / apply
 │   ├── constants/
@@ -114,9 +114,12 @@ dsh-plugin-iteration-planner/
 │   │   ├── models.py            # Agent 原生端点请求 / 响应模型
 │   │   ├── state.py             # 运行时上下文（配置 / 引擎 / Agent / WS）
 │   │   ├── ws.py                # WebSocket 广播 + 引擎事件流桥接
-│   │   ├── agent/               # 【Agent 编排层】提示词 / 工具定义与调度 / LLM 客户端 / function calling 循环 / 长期记忆
+│   │   ├── checkpoints.py       # 【运行台账】持久化检查点存储（内存 / Redis 可插拔，状态数据不 fail-open）
+│   │   ├── mcp/                 # 【MCP Server】协议实现（stdio 传输 + Streamable HTTP 传输 + 工具注册）
+│   │   ├── evals/               # 【评测台】黄金集 / 确定性断言 / LLM 评委 / CI 门禁 CLI（python -m app.evals.gate）
+│   │   ├── agent/               # 【Agent 编排层】提示词 / 工具定义与调度 / LLM 客户端 / function calling 循环 / 长期记忆 / 自反思自愈（reflect.py）/ 检查点续跑（resume.py）
 │   │   ├── kb/                  # 【知识库 RAG】向量化 / Chroma 向量库 / 递归分块 / 文档解析 / 混合检索（BM25 + RRF）
-│   │   └── routes/              # 系统路由 / Agent / 知识库 / 长期记忆 / 治理工作区 / 网关透传（SPA 托管）
+│   │   └── routes/              # 系统路由 / Agent / 知识库 / 长期记忆 / 治理工作区 / 作业 / 运行台账 / 评测台 / MCP / 网关透传（SPA 托管）
 │   ├── tests/                   # pytest（Mock 引擎 + 脚本化 LLM + 桩向量化，覆盖转发/错误/鉴权/Agent/知识库/记忆）
 │   ├── requirements.txt         # 运行时依赖
 │   ├── requirements-dev.txt     # 开发测试依赖
@@ -139,8 +142,8 @@ dsh-plugin-iteration-planner/
 │   ├── src/
 │   │   ├── api/                 # 前端 API 客户端 + 领域类型契约
 │   │   ├── stores/              # Pinia 状态（计划 / 偏好设置）
-│   │   ├── views/               # 页面（计划 / 治理 / 分析 / 知识库 / 长期记忆 / 审计）
-│   │   ├── components/          # KPI 卡片 / 燃尽图 / 风险面板 / 任务编辑弹窗
+│   │   ├── views/               # 页面（计划 / 治理 / 分析 / 知识库 / 长期记忆 / 运行台账 / 评测台 / 审计）
+│   │   ├── components/          # KPI 卡片 / 燃尽图 / 风险面板 / 任务编辑弹窗 / 反思轨迹 / AI 助手抽屉
 │   │   ├── layouts/             # 控制台主布局（导航 + 计划切换 + WS 状态）
 │   │   └── utils/               # 枚举文案映射与格式化
 │   └── vite.config.ts
@@ -487,6 +490,16 @@ docker compose up -d --build
 | `PATROL_ESCALATE_SEVERITY` | `critical` | 达到该严重度即视为「需立即处理」并升级通知：`info` \| `warning` \| `critical` |
 | `RETRO_WRITE_MEMORY` / `RETRO_MAX_MEMORIES` | `true` / `4` | 复盘结论是否写回长期记忆（闭环学习）/ 单次最多写回条数 |
 | `WHATIF_MAX_TASK_EDITS` | `10` | What-if 沙盘单次最多接受的任务级扰动条数（防止临时计划失去可比性） |
+| `MCP_ENABLED` / `MCP_SERVER_NAME` | `true` / `iteration-planner` | 是否挂载 MCP Streamable HTTP 传输端点（`/api/mcp`） / MCP 服务名（`initialize` 回显）；stdio 传输由 `python -m app.mcp.stdio` 独立进程启动，不受本开关影响 |
+| `MCP_TOKEN` | 空 | MCP 专用 Bearer 令牌；**留空回落 `API_TOKEN`**，两者皆空且 `AUTH_ENABLED=false` 时才允许无凭据访问（仅本地开发）。令牌按**常量时间比较** |
+| `MCP_MAX_RESULT_CHARS` / `MCP_MAX_BODY_BYTES` | `200000` / `2097152` | 单次 `tools/call` 结果字符上限（超限截断并标注）/ MCP 传输的单请求体字节上限（不经业务 body 中间件，必须显式设限） |
+| `CHECKPOINT_STORE` | `auto` | 运行台账后端：`auto`（有 `REDIS_URL` 且依赖可用则 Redis）\| `memory` \| `redis`。**台账是状态而非缓存**：存储故障显式失败（`503 CHECKPOINT_STORE_UNAVAILABLE`），不 fail-open；`API_WORKERS>1` / 多副本必须 `redis` |
+| `CHECKPOINT_TTL_SECONDS` / `CHECKPOINT_MAX_ENTRIES` | `604800` / `2048` | 台账保留时长（秒，需覆盖「编排 → 用户确认」最长间隔）/ 进程内存台账 LRU 上限（条） |
+| `CHECKPOINT_MAX_ATTEMPTS` | `3` | 单个台账的续跑（重跑）次数上限；超过即拒绝，避免「失败 → 无限续跑」放大故障 |
+| `EVALS_ENABLED` / `EVALS_JUDGE_ENABLED` | `true` / `true` | 评测台端点与 CLI 门禁开关 / LLM-as-judge 评分轨开关（关闭或模型不可用时退化为纯确定性打分） |
+| `EVALS_MAX_CASES` | `100` | 单次评测最多执行的用例数（防止一次请求打爆引擎 / 模型配额） |
+| `EVALS_GATE_PASS_RATE` / `EVALS_GATE_MIN_SCORE` | `0.8` / `0.7` | CI 门禁阈值：通过率下限 / 综合平均分下限（`python -m app.evals.gate` 据此返回退出码 `0`/`1`） |
+| `AGENT_REFLECT_ENABLED` / `AGENT_REFLECT_MAX_RETRIES` | `true` / `2` | 自反思自愈循环开关 / 同一「工具 + 归因类别」签名的重试上限（超过即熔断降级） |
 
 ### 9.6 开放 API 一览
 
@@ -508,12 +521,18 @@ docker compose up -d --build
 | `GET` | `/api/jobs/:jobId` | 异步写作业快照（状态 / 进度 / 结果）；**仅属主可读，否则 404**（详见 §10.12） |
 | `GET` | `/api/jobs/:jobId/stream` | 作业进度 SSE 流（`progress` → `done`/`error`，15s 心跳） |
 | `POST` | `/api/jobs/:jobId/cancel` | 取消作业（置终态，不保证中断引擎侧同步计算） |
+| `*` | `/api/mcp` | **MCP Streamable HTTP 传输**（单端点：`POST` 走 JSON-RPC，`DELETE` 终止会话，`GET` 回 405）。自带 Bearer 令牌鉴权（不经会话 Cookie），详见 §10.13 |
+| `GET` | `/api/agent/checkpoints` | 运行台账列表（本主体最近的待确认 / 可续跑运行，摘要不含正文） |
+| `GET` / `DELETE` | `/api/agent/checkpoints/:checkpointId` | 台账快照（请求 / 待确认动作 / 执行结果 / 反思轨迹）/ 作废并移除（**只丢弃，不执行**任何写入） |
+| `POST` | `/api/agent/checkpoints/:checkpointId/resume` | 断点续跑：`confirm` 确认落库（可只确认选中项）/ `reject` 驳回 / `retry` 按**台账保存的原始请求**重跑 / `auto` 自动分流。确认**幂等**（重复确认回放上次结果并标记 `replayed`） |
+| `GET` / `POST` | `/api/evals` | 评测台自述（黄金集清单 / 门禁阈值 / 评委开关）/ 触发评测运行（同步返回，或 `enqueue=true` 转为异步作业） |
 | `WS` | `/ws` | 计划创建/更新/删除事件推送（含 30s 心跳）。**握手需鉴权**：浏览器自动携带会话 Cookie（同源）；机器 / CI 用 `?token=<API_TOKEN>`（`WebSocket` 构造函数无法自定义请求头）。未通过即在握手阶段被拒（close code `1008`，HTTP 403），不下发任何事件。**访客（guest）只收到被指派计划的事件**，其余事件在扇出前即被过滤 |
 
 成功响应统一为 `{ "data": ... }`；错误统一为 `{ "code", "message", "details" }`，并映射到稳定错误码：
 `CYCLE_DEPENDENCY`(409)、`VALIDATION_ERROR`(400)、`LLM_FORMAT_ERROR`(422)、`STORAGE_UNAVAILABLE`(503)、`UNAUTHORIZED`(401)、`FORBIDDEN`(403)、
 `ENGINE_TIMEOUT`(504，可达但超时，带 `Proxy-Status: iteration_planner; error="http_response_timeout"`)、`ENGINE_UNAVAILABLE`(502，连不上)、
-`JOB_NOT_FOUND`(404)、`JOB_CONFLICT`(409)、`JOB_STORE_UNAVAILABLE`(503)、`IDEMPOTENCY_IN_PROGRESS`(409，带 `Retry-After`)、`IDEMPOTENCY_KEY_REUSE`(422)、`PAYLOAD_TOO_LARGE`(413)。
+`JOB_NOT_FOUND`(404)、`JOB_CONFLICT`(409)、`JOB_STORE_UNAVAILABLE`(503)、`CHECKPOINT_NOT_FOUND`(404，含非属主访问，不区分「格式错」与「不存在」)、
+`CHECKPOINT_NOT_RESUMABLE`(409，终态 / 超出重跑上限)、`CHECKPOINT_STORE_UNAVAILABLE`(503)、`EVALS_DISABLED`(503)、`IDEMPOTENCY_IN_PROGRESS`(409，带 `Retry-After`)、`IDEMPOTENCY_KEY_REUSE`(422)、`PAYLOAD_TOO_LARGE`(413)。
 
 ### 9.7 控制台页面功能
 
@@ -527,6 +546,8 @@ docker compose up -d --build
 | 知识库 | 文档清单（格式 / 分块数 / 字符数 / 标签）、上传文件或粘贴文本入库、分块预览、删除；检索试跑展示命中片段与得分，并可切换混合 / 纯向量模式 |
 | 长期记忆 | 记忆清单（类型 / 重要度 / 状态 / 来源 / 最近使用）、按状态与类型过滤、关键词搜索、启用停用、删除与清空、手工新增（写入前自动去重）；语义召回试跑展示相似度排序 |
 | AI 助手 | 全局悬浮球 + 会话抽屉（SSE 逐字流式、工具调用明细、知识库引用与召回记忆卡片、写操作两阶段确认）；顶部可在**对话 / 多角色协作 / What-if 沙盘 / 迭代复盘 / 主动巡检**之间切换，后四者见 §10.3.1 |
+| Agent 运行台账 | 持久化检查点的治理视图：台账列表（状态 / 待确认数 / 尝试次数 / 关联计划）、详情（请求原文 / 待确认动作勾选 / 已执行调用 / 结论 / **反思轨迹**）、**确认落库 / 驳回选中 / 按原请求重跑 / 作废移除**（见 §10.13） |
+| Agent 评测台 | 黄金集清单（用例类型 / 依赖 / 确定性断言 / 评委维度）+ 运行评测（按类型或指定用例的快速回归、评委开关、**异步作业 + 实时进度流**）+ 结果表（结论 / 确定性分 / 评委分 / 加权得分 / 步数 / 工具链 / 产出计划 / 耗时，展开看断言明细与 Agent 结论）+ **门禁通过 / 未通过横幅与原因**（见 §10.13） |
 | 审计日志 | 按计划过滤、条数上限、成功/失败与耗时统计、展开查看入参与返回值完整 JSON |
 | 账号与权限 | **仅管理员可见**：账号清单（角色 / 状态 / 最近登录）、新建账号、变更角色与状态、重置口令、删除；为访客（guest）指派可见计划白名单 |
 | 登录页 | 账号口令登录；登录态为服务端会话 Cookie，成功后跳回被守卫拦下的目标页 |
@@ -740,16 +761,21 @@ Python 新增：`ENGINE_UNAVAILABLE`(502，引擎不可达)、`ENGINE_CIRCUIT_OP
 npm run py:test          # 等价于 python -m pytest -c python/pyproject.toml
 ```
 
-382 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
+475 个用例（Mock 引擎 + 脚本化 LLM + 桩向量化，全程无外部依赖）：信封透传与错误码保持、鉴权、静态 SPA 回落、
 Agent 工具调度、工具失败容忍、会话上下文、步数上限，企业级加固能力（限流 / 请求体上限 / 安全头 / 关联 ID /
 指标 / 就绪探针 / 断路器 / 重试 / 并行工具调用 / 上下文裁剪 / 会话存储 / LLM 调用重试 / WS 断线重放 /
 工具异常兜底 / 错误响应脱敏 / 输入边界包裹 / 会话 ID 白名单），**访问控制全链路**（scrypt 口令 / 角色权限矩阵 /
 账号 CRUD 与最后管理员保护 / 会话创建吊销过期 / 改角色与停用即时踢下线 / 访客计划作用域 404 与列表过滤 /
 WS 握手 Cookie 鉴权与广播过滤），以及**知识库全链路**（分块 / 文档解析 /
 BM25 / RRF / 向量库增删查 / 入库-检索-删除 REST）与**长期记忆**（候选解析 / 去重 / 语义召回 / 停用治理 /
-自动提取 / 后台提取失败消费 / agentic RAG 工具），以及**进阶 Agent 能力**（协作步骤流与无 LLM 降级 /
+自动提取 / 后台提取失败消费 / agentic RAG 工具），**进阶 Agent 能力**（协作步骤流与无 LLM 降级 /
 估算建议两阶段不落库 / 沙盘规则与 LLM 解析路径 + 临时计划回收 + 非法扰动丢弃 / 巡检增量·冷却·恢复·引擎故障不影响 /
-复盘规则降级 + 记忆写回与检索校验 + 无实际工时标记不可用）。
+复盘规则降级 + 记忆写回与检索校验 + 无实际工时标记不可用），以及**工程化四件套**（MCP：
+`tools/list` 与 `TOOL_SPECS` 逐项一致 / stdio 只输出协议帧 / 写工具只登记不放宽确认 / 截断与体积上限 / 会话隔离；
+运行台账：主体与会话索引 / 幂等重放 / 部分失败保留动作 / 驳回子集 / 重跑有界 / 属主隔离 404 / Redis 缺参启动失败；
+评测台：未知断言显式失败 / 谎报完成与真实产出豁免 / 评委缺席记 null / 退化为纯确定性分 / 门禁红绿与原因 /
+依赖链传递 / error 不入分母 / 作业属主隔离；自反思：错误码归因与未知回落 / 熔断降级 / 签名隔离 /
+SSE `reflect` 帧与终态回填 / 关闭反思时轨迹为空）。
 
 ### 10.7 Docker Compose（Python 对外，引擎内网）
 
@@ -992,6 +1018,110 @@ curl -X POST http://localhost:8081/api/jobs/3f2a…/cancel
 `kv_store_operations_total{store,operation,outcome}`；审计日志含 `requestId/user/planId/jobId/key/durationMs`，
 控制台「新建计划 / 重规划」在提交后会显示**进度条 + 已运行时长 + 取消按钮**。
 
+### 10.13 Agent 工程化四件套（MCP / 运行台账 / 评测台 / 自反思自愈）
+
+> 这一节回答的是「这个 Agent 到底**能不能被交给别人用、能不能证明它没变坏**」。
+> 四项能力全部落在 `python/**`，**零改动** TS 算法引擎与既有业务层，算法仍是唯一事实来源。
+
+#### ① MCP Server（把内部能力暴露为标准工具）
+
+把 Agent 既有的工具定义（`app/agent/schemas.py` 的 `TOOL_SPECS`）与派发逻辑（`dispatch`）**原样**
+注册为 MCP 工具，不另起一套定义 —— 因此 Web 端与 MCP 端的工具名称、参数结构、返回语义完全一致，
+不会出现「两个入口两套口径」的漂移（测试中对 `tools/list` 与 `TOOL_SPECS` 逐项断言）。
+
+| 传输 | 入口 | 说明 |
+|---|---|---|
+| stdio | `python -m app.mcp.stdio` | 换行分隔的 JSON-RPC；**stdout 只输出协议帧**，日志一律走 stderr，否则会污染客户端解析 |
+| Streamable HTTP | `POST /api/mcp`（协议版本 `2024-11-05`） | 单端点 JSON-RPC；`initialize` 下发 `mcp-session-id` 首部，`DELETE` 终止会话，`GET` 明确回 `405`（本实现不提供服务端推送流） |
+
+**写语义不放宽**：写工具（`plan_iteration` / `replan_all` / `task_add` / `task_update` / `task_delete`）
+在 MCP 侧同样走**两阶段确认** —— 调用只登记待确认动作并回 `status=pending_confirmation`，不落库。
+因 MCP 客户端没有 Web 端的确认卡片，另补两个**传输层专属工具**（`list_pending_actions` /
+`confirm_pending_actions`，且**始终可用**，不受可用工具集过滤影响）供客户端完成批复。
+
+**鉴权**：`Authorization: Bearer <MCP_TOKEN>`（留空回落 `API_TOKEN`），**只认首部**，不接受 Cookie 与
+`X-API-Token`；比较走常量时间，失败回 `401` + `WWW-Authenticate: Bearer realm="mcp"`。会话 ID 为 32 位
+十六进制，会话间彼此隔离。传输层另有两道硬限：单请求体上限（超限 `413 PAYLOAD_TOO_LARGE`）与单次
+`tools/call` 结果字符上限（超限截断并在结果里标注「已截断」）。
+
+> stdio 传输**不装配**知识库与记忆工具：Chroma 本地持久化客户端不支持多进程并发访问同一目录，
+> 因此 stdio 的工具集为 `TOOL_SPECS - RETRIEVAL_TOOLS`（核心工具 + 全部写工具）。
+
+#### ② 运行台账（持久化检查点 + 断点续跑）
+
+两阶段写确认的第一阶段产物（待确认动作）过去只活在**进程内存的会话槽位**里：服务重启、副本切换、
+用户关掉浏览器，这份「半成品」就没了，用户只能把需求重新描述一遍。现在它是**持久化台账**：
+
+```
+running → awaiting_approval → executed | completed | rejected | aborted | failed
+```
+
+- **`awaiting_approval`**：已产出待确认动作，等待批复 —— 可确认落库、可驳回部分、可作废；
+- **`failed` / `running`**：编排中断 —— 可**按台账里保存的原始请求**重跑（用户不必重新描述需求），
+  次数上限由 `CHECKPOINT_MAX_ATTEMPTS` 收敛，避免「失败 → 无限续跑」放大故障；
+- 只给「有待确认动作 / 编排失败」建台账：只读问答没有可续跑的半成品，不制造噪声；
+- 确认是**幂等**的：已终态台账重复确认回放上次结果并标记 `replayed=true`，不会二次写库；
+  确认同时同步清理会话槽位，否则会话路径 `/api/agent/confirm` 会重复执行同一批动作；
+- **属主隔离**：非属主访问一律 `404`（与作业、计划越权同口径），不借状态码差异探测存在性；
+- **存储语义**：台账是**状态数据**而不是缓存，因此它 **不 fail-open** —— 后端故障抛
+  `503 CHECKPOINT_STORE_UNAVAILABLE`，绝不静默降级成「查不到」（那会被误判为动作已丢）。
+  `API_WORKERS>1` / 多副本必须 `CHECKPOINT_STORE=redis`。
+
+#### ③ 评测台（黄金集 + 双轨打分 + CI 门禁）
+
+| 轨道 | 权重 | 判定依据 |
+|---|---|---|
+| **确定性断言（硬门槛）** | 0.6 | 对**可观测事实**断言：必须调用了哪些工具、困难路径是否出现、是否**谎报完成**（声明已完成但无真实产出）、是否产出了真实计划 ID、反思是否发生且已恢复、依赖链是否传递 …… 任一硬门槛不过即判例失败 |
+| **LLM-as-judge（补充）** | 0.4 | 只做质量补充评分；**评委缺席（未配置 / 输出不可解析）记为 `null` 而不是 `0` 分** —— 否则「没接模型」会被误读成「质量很差」 |
+
+两个必须说清的展示口径：
+
+- **`error` 用例不进通过率分母**：环境不具备（例如没接 LLM）≠ Agent 退化，否则没配模型的环境必然红灯，
+  门禁会被团队直接无视；
+- **硬门槛优先于评委**：模型自评容易被「像模像样的空话」骗过，只有确定性断言能可靠判定事实。
+
+三种用例类型：`plan`（端到端建计划）/ `chat`（会话任务，含写确认 / 关键路径 / 风险问答）/
+`reflection`（**确定性自愈演练，无需 LLM**，因此在离线环境也能跑出门禁结论）。
+支持依赖链（前一用例产出的计划 ID 注入后一用例）、临时计划回收、按类型或指定用例 id 的快速回归。
+
+```bash
+# CI 直接消费退出码（装配与线上同一套组件，但不过 HTTP 层）
+python -m app.evals.gate                 # 0 = 门禁通过，1 = 未通过
+python -m app.evals.gate --kind reflection --no-judge --json
+```
+
+HTTP 侧另有 `GET /api/evals`（自述）与 `POST /api/evals`；长耗时评测建议 `enqueue=true` 转为
+**异步作业**（复用 §10.12 的作业资源与 SSE 进度流），避免中间层超时后出现「客户端看到失败、
+评测其实已跑完」的**假失败**。作业结果超出上限时**只丢明细、保留汇总与门禁结论**并追加说明。
+
+#### ④ 自反思自愈执行循环（plan → act → observe → reflect）
+
+工具失败或检索空结果时，不再只是把错误字符串丢回给模型，而是走一个**结构化反思阶段**：
+
+1. **确定性归因**：按**稳定错误码**映射类别（`invalid_arguments` / `not_found` / `dependency_cycle` /
+   `engine_unavailable` / `format_error` / `empty_result` / `unknown`），**不依赖模型自述** —— 否则
+   「反思」退化成又一段文字，不可复算、不可断言；
+2. **策略选择**：`retry_with_args`（换一组参数，例如把猜测的 ID 换成真实 ID）/ `reroute_tool`
+   （改走另一个工具，例如按 ID 取不到就改用列表检索）/ `degrade`（熔断降级为「如实说明未取得结果」）/
+   `ask_user`（归因不明，交回用户补充信息，**不猜**）；
+3. **同签名有界重试**：签名 = `工具 + 类别`，超过 `AGENT_REFLECT_MAX_RETRIES` 即熔断降级，
+   不出现「同一个错无限重试」；
+4. **可观测轨迹**：每次反思产出 `ReflectionEvent`（步号 / 工具 / 类别 / 策略 / 第几次 / 是否已恢复），
+   经 SSE 的 `reflect` 事件**即时**下发（用户能看到「Agent 正在自己纠正」），终态在 `final` 里
+   按后续调用结果**回填** `recovered`，前端在对话气泡、台账详情、评测结果三处统一展示。
+
+> **边界**：`risk_scan` 的空结果**不算失败** —— 空风险是好结果，纳入反思会诱导模型反复空扫浪费步数。
+> 关闭 `AGENT_REFLECT_ENABLED` 后退回「只回填错误、不主动纠偏」的传统循环，轨迹为空。
+
+**可观测**：`eval_runs_total{gate}`（门禁通过 / 未通过分开计数，可直接配「连续未通过」告警）、
+`eval_pass_rate`（通过率分布直方图）、`eval_judge_total{outcome}`（评委 `ok` / `unparsable` / 各错误码，
+`unparsable` 持续增长说明评委 Prompt 需要调整）、`checkpoint_operations_total{operation,status}`
+（`status` 区分 `hit` / `miss` / `corrupt`，可对「台账批量 miss」告警）、
+`checkpoint_resume_total{action,outcome}`（确认重放 / 重跑 / 重跑超限分开计数）、
+`agent_reflect_total{category,outcome}` 与 `agent_reflect_tripped_total{signature}`
+（反思恢复与熔断降级分开计数，熔断增长说明某条纠偏路径已失效）；SSE 的 `reflect` 事件与
+评测结果中的 `reflections` 断言共同构成「自愈是否真的发生」的证据链。
+
 ---
 
 ## 十一、已知边界
@@ -1017,3 +1147,17 @@ curl -X POST http://localhost:8081/api/jobs/3f2a…/cancel
   便于直接对「RAG 静默降级」告警。
   触发条件严格限定于该错误特征，其它向量库错误一律原样上抛；重建前先完成向量化，
   中途失败不会删除原集合。
+- **MCP 传输为「工具暴露」而非「协议全实现」**：仅实现 `initialize` / `initialized` / `ping` /
+  `tools/list` / `tools/call`（协议版本 `2024-11-05`），**不含 resources / prompts / roots /
+  sampling**；Streamable HTTP 为单端点 POST，`GET` 明确回 `405`（不提供服务端推送流）。
+  stdio 传输不装配知识库与记忆工具（Chroma 本地库不支持多进程并发访问同一目录，详见 §10.13）。
+- **运行台账的「续跑」有界且不自作主张**：重跑上限 `CHECKPOINT_MAX_ATTEMPTS`（默认 3），超限直接
+  `409 CHECKPOINT_NOT_RESUMABLE`，不做无限重试；台账内容与主体绑定，**非属主一律 404**。
+  台账是**状态数据**，存储故障 `503 CHECKPOINT_STORE_UNAVAILABLE`（不 fail-open，避免被误判为动作已丢）；
+  内存后端为单进程语义，`API_WORKERS>1` / 多副本必须 `CHECKPOINT_STORE=redis`。
+- **评测台的覆盖率上限**：黄金集当前覆盖「端到端建计划 / 会话任务 / 自愈演练」三类共十余例，
+  是**回归门禁**而非完备质量证明；`EVALS_MAX_CASES` 限制单次运行规模。LLM 评委的分数本身带噪声
+  （评委缺席记 `null`、不折成 0 分），因此**硬门槛始终由确定性断言判定**，评委只做补充排序。
+- **自反思的归因是规则而非推断**：类别由稳定错误码映射，未知错误码 / 未预期措辞一律回落
+  `unknown` → `ask_user`（**不猜**）；熔断降级后输出「如实说明未取得结果」，不会用编造内容填补。
+  因此它解决的是「可复算的纠偏」，**不覆盖语义级误解**（例如需求本身理解错）。

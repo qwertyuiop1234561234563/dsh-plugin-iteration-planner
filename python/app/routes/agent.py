@@ -71,6 +71,16 @@ def _require_agent(ctx: AppContext):
     return ctx.runner
 
 
+def _owner_of(request: Request) -> str:
+    """当前主体标识：作为检查点台账的归属键，决定「谁能看到 / 续跑这条台账」。
+
+    不传 owner 会让台账落到 ``anonymous``，用户之后在自己的列表里根本看不到它——
+    断点续跑就退化成了「只有重启前那一个进程能看见」。
+    """
+    principal = getattr(request.state, "principal", None)
+    return principal.user_id if principal is not None else ""
+
+
 def _sanitized_input(raw: str, *, field: str) -> str:
     """消毒用户输入；只含空白 / 不可见字符时**明确拒绝**。
 
@@ -185,6 +195,7 @@ def build_agent_router(base: str) -> APIRouter:
             iteration_deadline=payload.iterationDeadline,
             iteration_start_date=payload.iterationStartDate,
             dev_member_count=payload.devMemberCount,
+            owner=_owner_of(request),
         )
         return {"data": result.model_dump()}
 
@@ -198,6 +209,7 @@ def build_agent_router(base: str) -> APIRouter:
             _sanitized_input(payload.message, field="消息内容"),
             defer_writes=payload.deferWrites,
             plan_id=sanitize_plan_id(payload.planId),
+            owner=_owner_of(request),
         )
         response = AgentChatResponse(sessionId=session_id, **result.model_dump())
         return {"data": response.model_dump()}
@@ -220,7 +232,7 @@ def build_agent_router(base: str) -> APIRouter:
         # 把编排生成器包成 Task：心跳超时只发送注释行，绝不取消进行中的一步编排
         # （取消会中断 LLM / 引擎调用并提前释放会话锁，属于错误行为）。
         pipeline = runner.run_chat_stream(
-            session_id, message, defer_writes=payload.deferWrites, plan_id=plan_id
+            session_id, message, defer_writes=payload.deferWrites, plan_id=plan_id, owner=_owner_of(request)
         )
         return _stream_response(pipeline, log_label=f"会话 {session_id}")
 

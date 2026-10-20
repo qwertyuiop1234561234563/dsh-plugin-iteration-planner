@@ -336,6 +336,132 @@ DEFAULT_PROFILE = "default"
 WORKSPACE_STORE_VERSION = 1
 
 
+# ------------------------ MCP Server（把内部能力暴露为标准 MCP 工具） ------------------------
+# 设计口径（对齐 MCP 2024-11-05 规范）：JSON-RPC 2.0 单一入口，``tools/list`` 声明能力、
+# ``tools/call`` 触发执行；传输支持 **stdio**（本地进程集成）与 **Streamable HTTP**
+# （远程集成，单端点 POST / JSON-RPC 或 SSE）。工具定义**直接复用** Agent 的 ``TOOL_SPECS``，
+# 避免「MCP 一套、Agent 一套」两处口径漂移。
+
+MCP_JSONRPC = "2.0"
+MCP_PROTOCOL_VERSION = "2024-11-05"
+MCP_METHOD_INITIALIZE = "initialize"
+MCP_METHOD_INITIALIZED = "notifications/initialized"
+MCP_METHOD_TOOLS_LIST = "tools/list"
+MCP_METHOD_TOOLS_CALL = "tools/call"
+MCP_METHOD_PING = "ping"
+#: JSON-RPC 标准错误码
+MCP_ERR_PARSE = -32700
+MCP_ERR_INVALID_REQUEST = -32600
+MCP_ERR_METHOD_NOT_FOUND = -32601
+MCP_ERR_INVALID_PARAMS = -32602
+MCP_ERR_INTERNAL = -32603
+#: 承载 MCP 会话的请求首部（Streamable HTTP 传输约定）
+MCP_SESSION_HEADER = "mcp-session-id"
+#: MCP 独有的写确认工具名：读工具即时执行，写工具登记待确认，再由这两个工具查看 / 落库
+MCP_TOOL_LIST_PENDING = "list_pending_actions"
+MCP_TOOL_CONFIRM_PENDING = "confirm_pending_actions"
+#: MCP 会话 ID 前缀（与 Agent 会话隔离，避免两套会话键互相污染）
+MCP_SESSION_PREFIX = "mcp-"
+
+# ------------------------ 持久化检查点 + 断点续跑 ------------------------
+# 「两阶段写确认」的第一阶段产物原本只活在会话存储里（进程重启即丢）。检查点把它升级为
+# **持久化运行台账**：记录一次编排的请求、待确认动作与终态，支持进程重启后继续确认
+# （断点续跑）与幂等重放。
+
+CHECKPOINT_KIND_PLAN = "plan"  #: 端到端规划（/agent/plan）
+CHECKPOINT_KIND_CHAT = "chat"  #: 会话式对话（/agent/chat）
+CHECKPOINT_KINDS: tuple[str, ...] = (CHECKPOINT_KIND_PLAN, CHECKPOINT_KIND_CHAT)
+
+CHECKPOINT_STATUS_RUNNING = "running"  #: 编排进行中（进程崩溃后会停留在此状态，可据此续跑）
+CHECKPOINT_STATUS_AWAITING = "awaiting_approval"  #: 已登记待确认写操作，等待用户确认
+CHECKPOINT_STATUS_EXECUTED = "executed"  #: 待确认动作已被确认落库
+CHECKPOINT_STATUS_COMPLETED = "completed"  #: 续跑完成且**无需确认**（产出的是只读结论）
+CHECKPOINT_STATUS_REJECTED = "rejected"  #: 用户驳回，未执行任何写操作
+CHECKPOINT_STATUS_ABORTED = "aborted"  #: 主动作废
+CHECKPOINT_STATUS_FAILED = "failed"  #: 编排失败（可续跑重试）
+CHECKPOINT_STATUSES: tuple[str, ...] = (
+    CHECKPOINT_STATUS_RUNNING,
+    CHECKPOINT_STATUS_AWAITING,
+    CHECKPOINT_STATUS_EXECUTED,
+    CHECKPOINT_STATUS_COMPLETED,
+    CHECKPOINT_STATUS_REJECTED,
+    CHECKPOINT_STATUS_ABORTED,
+    CHECKPOINT_STATUS_FAILED,
+)
+#: 终态集合：进入后不再接受续跑（续跑只会产生新的检查点）
+CHECKPOINT_TERMINAL_STATUSES = frozenset(
+    {
+        CHECKPOINT_STATUS_EXECUTED,
+        CHECKPOINT_STATUS_COMPLETED,
+        CHECKPOINT_STATUS_REJECTED,
+        CHECKPOINT_STATUS_ABORTED,
+    }
+)
+#: 可续跑状态：待确认（继续确认落库）/ 运行中与失败（带原请求重跑）
+CHECKPOINT_RESUMABLE_STATUSES = frozenset(
+    {CHECKPOINT_STATUS_AWAITING, CHECKPOINT_STATUS_RUNNING, CHECKPOINT_STATUS_FAILED}
+)
+#: 键值存储前缀（与作业 / 幂等键物理隔离）
+CHECKPOINT_PREFIX = "iteration_planner:checkpoint:"
+
+# ------------------------ Agent Evals 评测台（回归门禁） ------------------------
+# 双轨打分：**确定性断言**（工具链 / 是否有计划 / 是否登记待确认 / 是否谎报完成）是硬门槛，
+# **LLM-as-judge** 只对自然语言结论质量给 0~1 分（模型不可用时仅确定性轨，仍可回归）。
+# 任一确定性断言不过 → 该用例判失败，杜绝「用模型给自己打分放水」。
+
+EVAL_OUTCOME_PASS = "pass"
+EVAL_OUTCOME_FAIL = "fail"
+EVAL_OUTCOME_ERROR = "error"  #: 用例执行本身异常（引擎 / 模型不可用），不计入通过率分子
+EVAL_OUTCOMES: tuple[str, ...] = (EVAL_OUTCOME_PASS, EVAL_OUTCOME_FAIL, EVAL_OUTCOME_ERROR)
+
+#: 综合分权重：确定性轨权重更高（模型评分只作补充）
+EVAL_WEIGHT_DETERMINISTIC = 0.6
+EVAL_WEIGHT_JUDGE = 0.4
+#: LLM-as-judge 评分分档（用于把 0~1 连续分映射为可读等级）
+EVAL_JUDGE_LEVELS: tuple[tuple[str, float], ...] = (
+    ("excellent", 0.9),
+    ("good", 0.75),
+    ("fair", 0.5),
+    ("poor", 0.0),
+)
+
+# ------------------------ 自反思自愈执行循环（reflect） ------------------------
+# 传统 function calling 循环只会「把错误回填给模型」，是否纠偏、如何纠偏全凭模型心情。
+# 本能力增加**结构化反思阶段**：对失败 / 空结果做确定性归因（分类 + 恢复策略），按
+# 「同一错误签名」计数做有界重试，超限即熔断并降级为确定性说明，全过程产出可观测轨迹。
+
+SSE_REFLECT = "reflect"  #: 反思事件（前端据此渲染「自我诊断 → 恢复动作」时间线）
+
+#: 反思归因类别（确定性规则产出，不由模型臆造）
+REFLECT_CATEGORY_INVALID_ARGS = "invalid_arguments"  #: 入参缺失 / 类型错（可换参重试）
+REFLECT_CATEGORY_NOT_FOUND = "not_found"  #: 目标不存在（需先查真实 ID）
+REFLECT_CATEGORY_CYCLE = "dependency_cycle"  #: 依赖成环（需改依赖结构）
+REFLECT_CATEGORY_ENGINE = "engine_unavailable"  #: 引擎 / 依赖不可达（重试 + 降级）
+REFLECT_CATEGORY_FORMAT = "format_error"  #: 模型输出格式错（回填纠偏）
+REFLECT_CATEGORY_EMPTY = "empty_result"  #: 工具成功但结果为空（换工具 / 换参数）
+REFLECT_CATEGORY_UNKNOWN = "unknown"
+REFLECT_CATEGORIES: tuple[str, ...] = (
+    REFLECT_CATEGORY_INVALID_ARGS,
+    REFLECT_CATEGORY_NOT_FOUND,
+    REFLECT_CATEGORY_CYCLE,
+    REFLECT_CATEGORY_ENGINE,
+    REFLECT_CATEGORY_FORMAT,
+    REFLECT_CATEGORY_EMPTY,
+    REFLECT_CATEGORY_UNKNOWN,
+)
+#: 恢复策略（决定回填给模型的纠偏指令形态）
+REFLECT_STRATEGY_RETRY = "retry_with_args"  #: 换 / 补参数后重试同一工具
+REFLECT_STRATEGY_REROUTE = "switch_tool"  #: 改调其它工具（如先 get_plan 再 update）
+REFLECT_STRATEGY_DEGRADE = "degrade"  #: 熔断：不再重试，给出确定性降级说明
+REFLECT_STRATEGY_ASK = "ask_user"  #: 信息不足，向用户澄清
+REFLECT_STRATEGIES: tuple[str, ...] = (
+    REFLECT_STRATEGY_RETRY,
+    REFLECT_STRATEGY_REROUTE,
+    REFLECT_STRATEGY_DEGRADE,
+    REFLECT_STRATEGY_ASK,
+)
+
+
 def default_store_path() -> str:
     """默认工作区存储文件位置（可用环境变量 ``WORKSPACE_STORE_PATH`` 覆盖）。
 
@@ -467,6 +593,57 @@ __all__ = [
     "JOB_MAX_REQUEST_BYTES",
     "JOB_MAX_RESULT_BYTES",
     "JOB_MAX_PROGRESS_ITEMS",
+    "MCP_JSONRPC",
+    "MCP_PROTOCOL_VERSION",
+    "MCP_METHOD_INITIALIZE",
+    "MCP_METHOD_INITIALIZED",
+    "MCP_METHOD_TOOLS_LIST",
+    "MCP_METHOD_TOOLS_CALL",
+    "MCP_METHOD_PING",
+    "MCP_ERR_PARSE",
+    "MCP_ERR_INVALID_REQUEST",
+    "MCP_ERR_METHOD_NOT_FOUND",
+    "MCP_ERR_INVALID_PARAMS",
+    "MCP_ERR_INTERNAL",
+    "MCP_SESSION_HEADER",
+    "MCP_TOOL_LIST_PENDING",
+    "MCP_TOOL_CONFIRM_PENDING",
+    "MCP_SESSION_PREFIX",
+    "CHECKPOINT_KIND_PLAN",
+    "CHECKPOINT_KIND_CHAT",
+    "CHECKPOINT_KINDS",
+    "CHECKPOINT_STATUS_RUNNING",
+    "CHECKPOINT_STATUS_AWAITING",
+    "CHECKPOINT_STATUS_EXECUTED",
+    "CHECKPOINT_STATUS_COMPLETED",
+    "CHECKPOINT_STATUS_REJECTED",
+    "CHECKPOINT_STATUS_ABORTED",
+    "CHECKPOINT_STATUS_FAILED",
+    "CHECKPOINT_STATUSES",
+    "CHECKPOINT_TERMINAL_STATUSES",
+    "CHECKPOINT_RESUMABLE_STATUSES",
+    "CHECKPOINT_PREFIX",
+    "EVAL_OUTCOME_PASS",
+    "EVAL_OUTCOME_FAIL",
+    "EVAL_OUTCOME_ERROR",
+    "EVAL_OUTCOMES",
+    "EVAL_WEIGHT_DETERMINISTIC",
+    "EVAL_WEIGHT_JUDGE",
+    "EVAL_JUDGE_LEVELS",
+    "SSE_REFLECT",
+    "REFLECT_CATEGORY_INVALID_ARGS",
+    "REFLECT_CATEGORY_NOT_FOUND",
+    "REFLECT_CATEGORY_CYCLE",
+    "REFLECT_CATEGORY_ENGINE",
+    "REFLECT_CATEGORY_FORMAT",
+    "REFLECT_CATEGORY_EMPTY",
+    "REFLECT_CATEGORY_UNKNOWN",
+    "REFLECT_CATEGORIES",
+    "REFLECT_STRATEGY_RETRY",
+    "REFLECT_STRATEGY_REROUTE",
+    "REFLECT_STRATEGY_DEGRADE",
+    "REFLECT_STRATEGY_ASK",
+    "REFLECT_STRATEGIES",
     "default_store_path",
     "default_auth_store_path",
 ]

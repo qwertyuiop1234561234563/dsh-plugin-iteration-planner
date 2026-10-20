@@ -91,6 +91,8 @@ const activeMenu = computed(() => {
   if (routeName.value === 'portfolio') return 'portfolio'
   if (routeName.value === 'knowledge') return 'knowledge'
   if (routeName.value === 'memory') return 'memory'
+  if (routeName.value === 'checkpoints') return 'checkpoints'
+  if (routeName.value === 'evals') return 'evals'
   if (routeName.value === 'audit') return 'audit'
   if (routeName.value === 'admin-users') return 'admin-users'
   return 'plan-list'
@@ -180,6 +182,8 @@ function go(name: string): void {
     portfolio: '/portfolio',
     knowledge: '/knowledge',
     memory: '/memory',
+    checkpoints: '/agent/checkpoints',
+    evals: '/evals',
     audit: '/audit',
     'admin-users': '/admin/users',
   }
@@ -477,6 +481,15 @@ onBeforeUnmount(() => {
           </template>
           <el-menu-item v-if="auth.can('kb:read')" index="knowledge">知识库（RAG）</el-menu-item>
           <el-menu-item v-if="auth.can('memory:read')" index="memory">长期记忆</el-menu-item>
+        </el-sub-menu>
+        <el-sub-menu v-if="auth.can('agent:chat')" index="agent">
+          <template #title>
+            <el-icon><Cpu /></el-icon><span>Agent 能力</span>
+          </template>
+          <!-- 运行台账：写操作确认前后的持久化轨迹，可在重启 / 换副本后继续跑 -->
+          <el-menu-item index="checkpoints">运行台账（断点续跑）</el-menu-item>
+          <!-- 评测台：黄金集 + 双轨打分 + CI 门禁，回答「改了之后是变好还是变坏」 -->
+          <el-menu-item index="evals">评测台（Evals）</el-menu-item>
         </el-sub-menu>
         <el-sub-menu index="current" :disabled="!currentPlanId">
           <template #title>

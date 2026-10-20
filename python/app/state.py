@@ -28,6 +28,9 @@ from .ws import EngineEventBridge, WsBroadcaster
 
 if TYPE_CHECKING:
     from .agent.tools import ToolDispatcher
+    from .checkpoints import CheckpointStore
+    from .evals.service import EvalService
+    from .mcp.server import McpServer
 
 
 @dataclass
@@ -64,6 +67,12 @@ class AppContext:
     jobs: "JobStore | None" = None
     #: 幂等键守卫：让「超时重试」不再变成「重复写」
     idempotency: "IdempotencyGuard | None" = None
+    #: 持久化检查点台账（两阶段写确认的耐用化 + 断点续跑）；``None`` 表示未启用
+    checkpoints: "CheckpointStore | None" = None
+    #: Agent 评测台（golden 集 + 双轨打分 + CI 门禁）
+    evals: "EvalService | None" = None
+    #: MCP 服务端（把内部能力暴露为标准 MCP 工具：stdio + Streamable HTTP）
+    mcp: "McpServer | None" = None
     #: 在跑的作业任务句柄（jobId → Task）：仅本副本可见，跨副本取消依靠作业状态位
     job_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     #: 优雅关机标志：置位后 /readyz 返回未就绪，拒绝新请求（在途请求自然排空）

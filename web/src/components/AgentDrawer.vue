@@ -20,8 +20,16 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ApiClientError, api } from '@/api/client'
-import type { AgentHealth, AgentPendingAction, AgentToolCallRecord, KbHit, MemoryItem } from '@/api/types'
+import type {
+  AgentHealth,
+  AgentPendingAction,
+  AgentReflection,
+  AgentToolCallRecord,
+  KbHit,
+  MemoryItem,
+} from '@/api/types'
 import AgentWorkbench, { type WorkbenchMode } from '@/components/AgentWorkbench.vue'
+import ReflectionTrace from '@/components/ReflectionTrace.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useNotifyStore } from '@/stores/notify'
 import { usePlanStore } from '@/stores/plan'
@@ -70,6 +78,15 @@ interface ChatMessage {
   mode?: 'llm' | 'rule' | 'error'
   /** 本轮工具调用明细（只读工具即时执行的结果回填记录） */
   toolCalls?: AgentToolCallRecord[]
+  /**
+   * 本轮自我诊断轨迹：工具失败 / 检索空结果时 Agent 的确定性与纠偏动作。
+   *
+   * 与 `toolCalls` 分开呈现 —— 工具失败是「发生了什么」，反思是「Agent 判断为什么、
+   * 打算怎么改、改成功没有」。把后者显式画出来，才看得出这是自愈闭环而不是干等重试。
+   */
+  reflections?: AgentReflection[]
+  /** 本轮对应的运行台账 ID：有待确认动作或编排失败时出现，可在「运行台账」页继续/重跑 */
+  checkpointId?: string
   /** 待用户确认的写操作 */
   pending?: AgentPendingAction[]
   /** 结果关联的计划（可一键跳转） */
@@ -228,6 +245,10 @@ async function send(raw?: string): Promise<void> {
         onToolResult: (record) => {
           assistant.toolCalls = [...(assistant.toolCalls ?? []), record]
         },
+        onReflect: (reflection) => {
+          // 即时追加：用户能看到「Agent 正在自己纠正」，而不是等最终结果才知道发生过失败
+          assistant.reflections = [...(assistant.reflections ?? []), reflection]
+        },
         onPending: (actions) => {
           if (actions.length > 0) assistant.pending = actions
         },
@@ -239,6 +260,9 @@ async function send(raw?: string): Promise<void> {
           if (result.content) assistant.content = result.content
           assistant.toolCalls = result.toolCalls.length > 0 ? result.toolCalls : assistant.toolCalls
           assistant.pending = result.pendingActions.length > 0 ? result.pendingActions : undefined
+          // 反思轨迹以终态为准：服务端在收敛时已把「是否恢复」按后续调用结果回填完毕
+          assistant.reflections = result.reflections && result.reflections.length > 0 ? result.reflections : assistant.reflections
+          assistant.checkpointId = result.checkpointId ?? undefined
           assistant.planId = result.planId ?? undefined
           if (result.references && result.references.length > 0) assistant.references = result.references
           if (result.memories && result.memories.length > 0) assistant.memories = result.memories
@@ -395,6 +419,12 @@ function hasFailedCall(message: ChatMessage): boolean {
   return (message.toolCalls ?? []).some((record) => !record.ok)
 }
 
+/** 跳转运行台账页（断点续跑）：台账是持久化的，关掉抽屉 / 重启服务后依然可在此继续 */
+function openCheckpoints(): void {
+  void router.push({ name: 'checkpoints' })
+  visible.value = false
+}
+
 onMounted(() => {
   void loadHealth()
 })
@@ -530,6 +560,20 @@ watch(visible, (open) => {
                   </div>
                 </el-collapse-item>
               </el-collapse>
+
+              <!-- 自我诊断轨迹：Agent 自己发现失败原因并纠偏的过程（确定性归因，非模型自述） -->
+              <ReflectionTrace
+                v-if="message.reflections && message.reflections.length > 0"
+                :reflections="message.reflections"
+                :title="`reflect-${message.id}`"
+              />
+
+              <!-- 本轮已登记运行台账：可在「运行台账」页断点续跑（重启 / 换副本后依然在） -->
+              <div v-if="message.checkpointId" class="ip-agent__ledger">
+                <el-icon><Files /></el-icon>
+                <span>本次运行已登记台账</span>
+                <el-button size="small" text type="primary" @click="openCheckpoints">去续跑</el-button>
+              </div>
             </div>
             <div class="ip-agent__role">{{ message.role === 'user' ? '我' : 'AI 助手' }}</div>
           </div>
@@ -821,6 +865,20 @@ watch(visible, (open) => {
 
 .ip-agent__call-err {
   color: var(--ip-danger);
+}
+
+/* 台账提示条：本轮有待确认动作 / 编排失败时出现，引导去「运行台账」页续跑 */
+.ip-agent__ledger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border: 1px dashed var(--ip-border);
+  border-radius: var(--ip-radius);
+  background: var(--ip-surface-sunk);
+  font-size: 12px;
+  color: var(--ip-text-muted);
 }
 
 .ip-agent__typing {

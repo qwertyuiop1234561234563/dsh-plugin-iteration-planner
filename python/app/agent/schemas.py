@@ -143,6 +143,12 @@ TOOL_NAMES: list[str] = [spec["function"]["name"] for spec in TOOL_SPECS]
 WRITE_TOOL_NAMES: tuple[str, ...] = ("plan_iteration", "replan_all", "task_add", "task_update", "task_delete")
 WRITE_TOOLS: frozenset[str] = frozenset(WRITE_TOOL_NAMES)
 
+#: 检索类工具名（直连本进程知识库 / 长期记忆，不经上游引擎）。集中登记的唯一目的：
+#: 让「未启用向量化能力」的运行时（如 MCP stdio 子进程、无向量库的测试环境）能**准确裁剪**
+#: 工具清单，而不是向调用方声明一个必定报「未启用」的工具。
+RETRIEVAL_TOOL_NAMES: tuple[str, ...] = ("kb_search", "kb_list_documents", "memory_search")
+RETRIEVAL_TOOLS: frozenset[str] = frozenset(RETRIEVAL_TOOL_NAMES)
+
 #: 写工具「仅登记、尚未落库」时回填的记录状态：用于区分**真正落库**与**待确认**——
 #: 两者都返回 ``ok=True``（调用本身都被成功受理），因此不能只凭 ``ok`` 判断数据是否已写入。
 TOOL_RESULT_PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
@@ -212,6 +218,8 @@ __all__ = [
     "TOOL_NAMES",
     "WRITE_TOOL_NAMES",
     "WRITE_TOOLS",
+    "RETRIEVAL_TOOL_NAMES",
+    "RETRIEVAL_TOOLS",
     "TOOL_RESULT_PENDING_CONFIRMATION",
     "TOOL_ACTION_LABELS",
     "REPLAN_FIELD_LABELS",
